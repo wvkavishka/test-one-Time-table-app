@@ -14,6 +14,19 @@ const ROLES = new Set(["admin", "teacher", "staff"]);
 const clean = (value, max = 160) => String(value || "").trim().slice(0, max);
 const cleanEmail = value => clean(value, 254).toLowerCase();
 const isOwner = auth => !!auth && auth.uid === SUPER_UID;
+/* The database rules grant platform-wide access to any account whose record says
+   role: "super"/"superadmin", and the client shows those accounts the whole admin
+   console. If the functions only accepted the hard-coded owner UID, a delegated
+   admin would see every button and have all of them fail with permission-denied.
+   This mirrors the rules exactly — owner UID, or users/{uid}.role in (super,
+   superadmin) with active === true. */
+async function isPlatformAdmin(auth) {
+  if (!auth) return false;
+  if (auth.uid === SUPER_UID) return true;
+  const snap = await getDatabase().ref(`users/${auth.uid}`).get();
+  const user = snap.val();
+  return !!user && user.active === true && (user.role === "super" || user.role === "superadmin");
+}
 /* RTDB push keys and Auth UIDs only use these characters. Anything else (including an
    empty string) would make a path such as "schools/" or "members/" point at a whole parent
    node, which the Admin SDK happily removes. Always validate IDs before building a path. */
@@ -58,7 +71,7 @@ async function deleteAuthUsers(uids) {
 async function assertSchoolManager(auth, schoolId) {
   requireId(schoolId, "School");
   const db = getDatabase();
-  if (isOwner(auth)) {
+  if (await isPlatformAdmin(auth)) {
     const exists = await db.ref(`schools/${schoolId}/profile`).get();
     if (!exists.exists()) throw new HttpsError("not-found", "That school no longer exists.");
     return { owner: true };
@@ -80,7 +93,7 @@ async function assertSchoolManager(auth, schoolId) {
 
 exports.provisionSchool = onCall({ region: REGION, timeoutSeconds: 60, memory: "256MiB" }, async request => {
   const caller = requireSignedIn(request);
-  if (!isOwner(caller)) throw new HttpsError("permission-denied", "Only the platform owner can create schools.");
+  if (!(await isPlatformAdmin(caller))) throw new HttpsError("permission-denied", "Only a platform admin can create schools.");
 
   const data = request.data || {};
   const name = clean(data.name, 120);
@@ -185,7 +198,7 @@ exports.replaceMemberLogin = onCall({ region: REGION, timeoutSeconds: 60, memory
      username account cannot receive reset emails, and a principal replacing their own
      username sign-in (the app's own copy tells them to do it from the Team screen).
      Blocking those made the button fail with "cannot be replaced here". */
-  if (member.role === "principal" && !isOwner(caller) && caller.uid !== oldUid) {
+  if (member.role === "principal" && !(await isPlatformAdmin(caller)) && caller.uid !== oldUid) {
     throw new HttpsError("permission-denied", "Only the platform owner can replace another principal's sign-in.");
   }
 
@@ -234,7 +247,7 @@ exports.removeMemberAccount = onCall({ region: REGION, timeoutSeconds: 60, memor
   const db = getDatabase();
   const snap = await db.ref(`schools/${schoolId}/members/${memberUid}`).get();
   const member = snap.val();
-  if (member && member.role === "principal" && !isOwner(caller)) {
+  if (member && member.role === "principal" && !(await isPlatformAdmin(caller))) {
     throw new HttpsError("permission-denied", "The principal account is protected.");
   }
   /* Auth first: if it fails the database still shows the member, so the removal can be
@@ -249,7 +262,7 @@ exports.removeMemberAccount = onCall({ region: REGION, timeoutSeconds: 60, memor
 
 exports.deleteSchoolAccount = onCall({ region: REGION, timeoutSeconds: 120, memory: "256MiB" }, async request => {
   const caller = requireSignedIn(request);
-  if (!isOwner(caller)) throw new HttpsError("permission-denied", "Only the platform owner can delete a school.");
+  if (!(await isPlatformAdmin(caller))) throw new HttpsError("permission-denied", "Only a platform admin can delete a school.");
   const schoolId = requireId(clean(request.data?.schoolId, 80), "School");
   const db = getDatabase();
   const snap = await db.ref(`schools/${schoolId}`).get();
