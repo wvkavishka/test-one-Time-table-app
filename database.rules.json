@@ -1,0 +1,72 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+
+    "site": {
+      "config": {
+        ".read": true,
+        ".write": "auth != null && (auth.uid === 'FI059sTQ5hXFSAYEqKefDyk3kBw2' || (auth.token.email === 'w.v.k.kalhara@gmail.com' && auth.token.email_verified === true) || root.child('users/' + auth.uid + '/role').val() === 'super' || root.child('users/' + auth.uid + '/role').val() === 'superadmin')",
+        "phone": { ".validate": "newData.isString() && newData.val().length <= 30" },
+        "whatsapp": { ".validate": "newData.isString() && newData.val().length <= 16" },
+        "waMsg": { ".validate": "newData.isString() && newData.val().length <= 200" },
+        "heroTitle": { ".validate": "newData.isString() && newData.val().length <= 140" },
+        "heroSubtitle": { ".validate": "newData.isString() && newData.val().length <= 320" },
+        "trialDays": { ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 365" },
+        "planName": { ".validate": "newData.isString() && newData.val().length <= 40" },
+        "planPrice": { ".validate": "newData.isString() && newData.val().length <= 60" },
+        "features": { ".validate": "newData.numChildren() <= 12" }
+      }
+    },
+
+    "schools": {
+      ".read": "auth != null && (auth.uid === 'FI059sTQ5hXFSAYEqKefDyk3kBw2' || (auth.token.email === 'w.v.k.kalhara@gmail.com' && auth.token.email_verified === true) || root.child('users/' + auth.uid + '/role').val() === 'super' || root.child('users/' + auth.uid + '/role').val() === 'superadmin')",
+      ".write": "auth != null && (auth.uid === 'FI059sTQ5hXFSAYEqKefDyk3kBw2' || (auth.token.email === 'w.v.k.kalhara@gmail.com' && auth.token.email_verified === true) || root.child('users/' + auth.uid + '/role').val() === 'super' || root.child('users/' + auth.uid + '/role').val() === 'superadmin')",
+
+      "$schoolId": {
+        "profile": {
+          ".read": "auth != null && (auth.uid === 'FI059sTQ5hXFSAYEqKefDyk3kBw2' || (auth.token.email === 'w.v.k.kalhara@gmail.com' && auth.token.email_verified === true) || root.child('users/' + auth.uid + '/role').val() === 'super' || root.child('users/' + auth.uid + '/role').val() === 'superadmin' || root.child('schools/' + $schoolId + '/members/' + auth.uid + '/active').val() === true)",
+          ".write": "auth != null && (auth.uid === 'FI059sTQ5hXFSAYEqKefDyk3kBw2' || (auth.token.email === 'w.v.k.kalhara@gmail.com' && auth.token.email_verified === true) || root.child('users/' + auth.uid + '/role').val() === 'super' || root.child('users/' + auth.uid + '/role').val() === 'superadmin')",
+          "name": {
+            ".write": "auth != null && (auth.uid === 'FI059sTQ5hXFSAYEqKefDyk3kBw2' || (auth.token.email === 'w.v.k.kalhara@gmail.com' && auth.token.email_verified === true) || root.child('users/' + auth.uid + '/role').val() === 'super' || root.child('users/' + auth.uid + '/role').val() === 'superadmin' || root.child('schools/' + $schoolId + '/members/' + auth.uid + '/role').val() === 'principal')",
+            ".validate": "newData.isString() && newData.val().length > 0 && newData.val().length < 120"
+          },
+          "logo": {
+            ".write": "auth != null && (auth.uid === 'FI059sTQ5hXFSAYEqKefDyk3kBw2' || (auth.token.email === 'w.v.k.kalhara@gmail.com' && auth.token.email_verified === true) || root.child('users/' + auth.uid + '/role').val() === 'super' || root.child('users/' + auth.uid + '/role').val() === 'superadmin' || root.child('schools/' + $schoolId + '/members/' + auth.uid + '/role').val() === 'principal')",
+            ".validate": "newData.isString() && newData.val().length < 400000 && (newData.val() === '' || newData.val().beginsWith('data:image/png;base64,') || newData.val().beginsWith('data:image/jpeg;base64,') || newData.val().beginsWith('data:image/webp;base64,') || newData.val().beginsWith('data:image/gif;base64,'))"
+          },
+          "principalUid": {
+            ".validate": "auth.uid === 'FI059sTQ5hXFSAYEqKefDyk3kBw2' || (auth.token.email === 'w.v.k.kalhara@gmail.com' && auth.token.email_verified === true) || root.child('users/' + auth.uid + '/role').val() === 'super' || root.child('users/' + auth.uid + '/role').val() === 'superadmin' || newData.val() === data.val()"
+          }
+        },
+
+        "state": {
+          ".read": "auth != null && (auth.uid === 'FI059sTQ5hXFSAYEqKefDyk3kBw2' || (auth.token.email === 'w.v.k.kalhara@gmail.com' && auth.token.email_verified === true) || root.child('users/' + auth.uid + '/role').val() === 'super' || root.child('users/' + auth.uid + '/role').val() === 'superadmin' || (root.child('schools/' + $schoolId + '/profile/status').val() !== 'disabled' && (root.child('schools/' + $schoolId + '/profile/status').val() !== 'trial' || !root.child('schools/' + $schoolId + '/profile/trialEnds').exists() || root.child('schools/' + $schoolId + '/profile/trialEnds').val() >= now) && root.child('schools/' + $schoolId + '/members/' + auth.uid + '/active').val() === true))",
+          ".write": "auth != null && (auth.uid === 'FI059sTQ5hXFSAYEqKefDyk3kBw2' || (auth.token.email === 'w.v.k.kalhara@gmail.com' && auth.token.email_verified === true) || root.child('users/' + auth.uid + '/role').val() === 'super' || root.child('users/' + auth.uid + '/role').val() === 'superadmin' || (root.child('schools/' + $schoolId + '/profile/status').val() !== 'disabled' && (root.child('schools/' + $schoolId + '/profile/status').val() !== 'trial' || !root.child('schools/' + $schoolId + '/profile/trialEnds').exists() || root.child('schools/' + $schoolId + '/profile/trialEnds').val() >= now) && root.child('schools/' + $schoolId + '/members/' + auth.uid + '/active').val() === true && (root.child('schools/' + $schoolId + '/members/' + auth.uid + '/role').val() === 'principal' || root.child('schools/' + $schoolId + '/members/' + auth.uid + '/permissions/editWorkspace').val() === true)))",
+          "settings": {
+            ".validate": "auth.uid === 'FI059sTQ5hXFSAYEqKefDyk3kBw2' || (auth.token.email === 'w.v.k.kalhara@gmail.com' && auth.token.email_verified === true) || root.child('users/' + auth.uid + '/role').val() === 'super' || root.child('users/' + auth.uid + '/role').val() === 'superadmin' || root.child('schools/' + $schoolId + '/members/' + auth.uid + '/role').val() === 'principal' || newData.val() === data.val()"
+          }
+        },
+
+        "members": {
+          ".read": "auth != null && (auth.uid === 'FI059sTQ5hXFSAYEqKefDyk3kBw2' || (auth.token.email === 'w.v.k.kalhara@gmail.com' && auth.token.email_verified === true) || root.child('users/' + auth.uid + '/role').val() === 'super' || root.child('users/' + auth.uid + '/role').val() === 'superadmin' || (root.child('schools/' + $schoolId + '/profile/status').val() !== 'disabled' && (root.child('schools/' + $schoolId + '/profile/status').val() !== 'trial' || !root.child('schools/' + $schoolId + '/profile/trialEnds').exists() || root.child('schools/' + $schoolId + '/profile/trialEnds').val() >= now) && root.child('schools/' + $schoolId + '/members/' + auth.uid + '/active').val() === true && (root.child('schools/' + $schoolId + '/members/' + auth.uid + '/role').val() === 'principal' || root.child('schools/' + $schoolId + '/members/' + auth.uid + '/permissions/viewUsers').val() === true)))",
+          "$memberUid": {
+            ".read": "auth != null && (auth.uid === 'FI059sTQ5hXFSAYEqKefDyk3kBw2' || (auth.token.email === 'w.v.k.kalhara@gmail.com' && auth.token.email_verified === true) || root.child('users/' + auth.uid + '/role').val() === 'super' || root.child('users/' + auth.uid + '/role').val() === 'superadmin' || auth.uid === $memberUid)",
+            ".write": "auth != null && (auth.uid === 'FI059sTQ5hXFSAYEqKefDyk3kBw2' || (auth.token.email === 'w.v.k.kalhara@gmail.com' && auth.token.email_verified === true) || root.child('users/' + auth.uid + '/role').val() === 'super' || root.child('users/' + auth.uid + '/role').val() === 'superadmin' || (root.child('schools/' + $schoolId + '/members/' + auth.uid + '/active').val() === true && root.child('schools/' + $schoolId + '/members/' + auth.uid + '/role').val() === 'principal' && $memberUid !== auth.uid && (!newData.exists() || (newData.child('role').val() !== 'principal' && newData.child('role').val() !== 'superadmin'))))",
+            ".validate": "!newData.exists() || (newData.hasChildren(['name','email','role','active']) && (newData.child('role').val() === 'principal' || newData.child('role').val() === 'admin' || newData.child('role').val() === 'teacher' || newData.child('role').val() === 'staff'))"
+          }
+        }
+      }
+    },
+
+    "users": {
+      ".read": "auth != null && (auth.uid === 'FI059sTQ5hXFSAYEqKefDyk3kBw2' || (auth.token.email === 'w.v.k.kalhara@gmail.com' && auth.token.email_verified === true) || root.child('users/' + auth.uid + '/role').val() === 'super' || root.child('users/' + auth.uid + '/role').val() === 'superadmin')",
+      ".write": "auth != null && (auth.uid === 'FI059sTQ5hXFSAYEqKefDyk3kBw2' || (auth.token.email === 'w.v.k.kalhara@gmail.com' && auth.token.email_verified === true) || root.child('users/' + auth.uid + '/role').val() === 'super' || root.child('users/' + auth.uid + '/role').val() === 'superadmin')",
+      "$uid": {
+        ".read": "auth != null && (auth.uid === 'FI059sTQ5hXFSAYEqKefDyk3kBw2' || (auth.token.email === 'w.v.k.kalhara@gmail.com' && auth.token.email_verified === true) || root.child('users/' + auth.uid + '/role').val() === 'super' || root.child('users/' + auth.uid + '/role').val() === 'superadmin' || auth.uid === $uid)",
+        ".write": "auth != null && (auth.uid === 'FI059sTQ5hXFSAYEqKefDyk3kBw2' || (auth.token.email === 'w.v.k.kalhara@gmail.com' && auth.token.email_verified === true) || root.child('users/' + auth.uid + '/role').val() === 'super' || root.child('users/' + auth.uid + '/role').val() === 'superadmin' || (root.child('users/' + auth.uid + '/active').val() === true && root.child('users/' + auth.uid + '/role').val() === 'principal' && $uid !== auth.uid && root.child('users/' + auth.uid + '/schoolId').val() !== null && (!data.exists() || (data.child('schoolId').val() === root.child('users/' + auth.uid + '/schoolId').val() && data.child('role').val() !== 'principal')) && root.child('users/' + auth.uid + '/schoolId').val() === (newData.exists() ? newData.child('schoolId').val() : data.child('schoolId').val()) && (!newData.exists() || (newData.child('role').val() === 'admin' || newData.child('role').val() === 'teacher' || newData.child('role').val() === 'staff'))))",
+        ".validate": "!newData.exists() || (newData.hasChildren(['name','email','role','schoolId','active']) && (newData.child('role').val() === 'principal' || newData.child('role').val() === 'admin' || newData.child('role').val() === 'teacher' || newData.child('role').val() === 'staff'))"
+      }
+    }
+  }
+}

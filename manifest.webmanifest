@@ -1,0 +1,14 @@
+{
+  "name": "CampusFlow — School Management OS",
+  "short_name": "CampusFlow",
+  "description": "Multi-school management, smart timetabling and relief coordination. Local-first, cloud-synced.",
+  "start_url": ".",
+  "scope": ".",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#fafafa",
+  "theme_color": "#059669",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
