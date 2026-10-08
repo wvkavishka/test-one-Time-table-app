@@ -365,7 +365,7 @@
 <div id="modal-root"></div>
 <div id="toast-root"></div>
 <div id="print-root"></div>
-<input type="file" id="import-file" accept="application/json,.json" class="hidden" data-change="import-file">
+<input type="file" id="import-file" accept="application/json,.json,.xlsx,.xlsm,.xls,.csv,.tsv,.ods,text/csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" class="hidden" data-change="import-file">
 <input type="file" id="logo-file" accept="image/*" class="hidden" data-change="logo-file">
 <input type="file" id="scan-cam" accept="image/*" capture="environment" class="hidden" data-change="scan-file">
 <input type="file" id="scan-lib" accept="image/*,application/pdf,.pdf,.xlsx,.xlsm,.xls,.csv,.tsv,.ods,text/csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" class="hidden" data-change="scan-file">
@@ -1939,12 +1939,18 @@ function renderDatabase(){
       <div class="space-y-4">
         <div class="card p-5">
           <h3 class="font-display font-bold text-[15px] tracking-tight flex items-center gap-2 mb-1"><i class="ph-fill ph-vault text-sky-500"></i>Backup &amp; restore</h3>
-          <p class="text-xs text-zinc-500 leading-relaxed mb-4">Cloud-sync keeps every device live, but a local copy is peace of mind. Imports auto-detect
-            <b> CampusFlow backups</b> and <b>legacy timetable exports</b> (the <span class="font-mono text-[11px]">db / schedule</span> format) — teachers, subjects, classes,
-            full timetables and relief history are converted for you, with a preview before anything changes.</p>
+          <p class="text-xs text-zinc-500 leading-relaxed mb-3">Cloud-sync keeps every device live, but a local copy is peace of mind. One import button reads
+            whatever your old system left behind — a <b>CampusFlow backup</b> from any version, a <b>Firebase database export</b>, an
+            <b>older timetable export</b> (the <span class="font-mono text-[11px]">db / schedule</span> format), a <b>spreadsheet</b> (.xlsx/.xls/.csv) with a sheet per class,
+            or a plain <b>list of lessons</b> (class, day, period, subject, teacher).</p>
+          <div class="text-[11px] text-zinc-500 bg-zinc-50 border border-zinc-200/70 rounded-xl p-3 mb-4 leading-relaxed flex items-start gap-2">
+            <i class="ph-fill ph-eye text-sky-500 mt-0.5 flex-none"></i>
+            <span>Every import shows what was understood <b>before</b> anything changes, and then gives you the choice: <b>Merge</b> (adds only what is missing, never overwrites a lesson) or <b>Replace everything</b>. Ctrl+Z undoes either one.</span>
+          </div>
           <div class="flex flex-wrap gap-2.5">
             <button class="btn btn-ghost" data-action="export-json"><i class="ph ph-download-simple"></i>Export backup</button>
-            <button class="btn btn-soft" data-action="import-trigger"><i class="ph ph-upload-simple"></i>Import / convert backup</button>
+            <button class="btn btn-ghost" data-action="export-workbook"><i class="ph ph-file-xls"></i>Export readable workbook</button>
+            <button class="btn btn-soft" data-action="import-trigger"><i class="ph ph-upload-simple"></i>Import / convert data</button>
             <button class="btn btn-ghost" data-action="sign-out"><i class="ph ph-sign-out"></i>Sign out</button>
           </div>
         </div>
@@ -4144,6 +4150,39 @@ function scanParseTimetable(text){
    WHERE words sit rather than from line breaks. Everything runs from files saved
    in ./vendor, so a school with no internet can still import its timetable.
    ================================================================================= */
+/* ---------------------------------------------------------------------------
+   Can THIS device read pictures at all?
+   A low-end phone (little memory, one or two slow cores, an old browser without
+   WebAssembly) cannot run the on-device reader: it will either crawl or fail
+   halfway. Saying so up front is far kinder than a spinner that never ends — and
+   the file paths that need no reader at all (Excel, CSV, a PDF with text) keep
+   working on those devices.
+   --------------------------------------------------------------------------- */
+let scanPower=null;
+function scanCapability(){
+  if(scanPower) return scanPower;
+  const blockers=[], notes=[];
+  let wasm=false, canvas=false, blob=false;
+  try{ wasm=typeof WebAssembly==="object"&&typeof WebAssembly.instantiate==="function"; }catch(_){}
+  try{ canvas=!!document.createElement("canvas").getContext; }catch(_){}
+  try{ blob=typeof Blob!=="undefined"&&typeof URL!=="undefined"&&!!URL.createObjectURL; }catch(_){}
+  if(!wasm) blockers.push("this browser is too old to run the on-device reader (it has no WebAssembly)");
+  if(!canvas||!blob) blockers.push("this browser cannot prepare pictures for reading");
+  const mem=(typeof navigator!=="undefined"&&navigator.deviceMemory)?+navigator.deviceMemory:null;
+  const cores=(typeof navigator!=="undefined"&&navigator.hardwareConcurrency)?+navigator.hardwareConcurrency:null;
+  const conn=(typeof navigator!=="undefined"&&navigator.connection)||{};
+  if(mem!=null&&mem<=2) notes.push("only about "+mem+" GB of memory");
+  if(cores!=null&&cores<=2) notes.push(cores+" processor core"+(cores===1?"":"s"));
+  if(conn.saveData) notes.push("data saving is switched on");
+  scanPower={ ocr:blockers.length===0, slow:notes.length>0, blockers, notes, mem, cores };
+  return scanPower;
+}
+/* Pictures can still be sent to the AI reader when the device can't read them
+   itself — that path only needs a canvas, not the local engine. */
+function scanCanImage(){
+  const cap=scanCapability();
+  return cap.ocr || (Scan.engine==="ai" && !!(Scan.aiKey||"").trim());
+}
 let scannerPromise=null;
 function ensureScanner(){
   if(typeof Scanner!=="undefined") return Promise.resolve();
@@ -4201,6 +4240,8 @@ async function scanLoadDoc(file,kind){
 async function scanPdfOcr(){
   const d=Scan.doc;
   if(!d||!d.pdfDoc) return null;
+  if(!scanCapability().ocr)
+    throw new Error("That PDF is a scan — it is a picture, and this device can't read pictures. Upload the timetable as Excel or CSV instead, or use a PDF where the text can be selected.");
   const total=Math.min(3,d.numPages);
   let best=null;
   for(let n=1;n<=total;n++){
@@ -4370,6 +4411,13 @@ async function scanRunPhoto(file){
   Scan.doc=null; Scan.docName=file.name||"photo"; Scan.report=null;
   Scan.status="Reading the photo…"; Store.requestRender();
   try{
+    const cap=scanCapability();
+    if(!cap.ocr&&!(Scan.engine==="ai"&&(Scan.aiKey||"").trim())){
+      Scan.busy=false; Scan.step="capture";
+      Scan.error="This device can't read photos or scanned paper — "+(cap.blockers[0]||cap.notes[0]||"it is too limited for the reader")+
+        ". You can still upload an Excel, CSV or PDF file: those are read without any picture reading.";
+      Store.requestRender(); return;
+    }
     await ensureScanner();                 /* the geometry reader; cached after the first use */
     const img=await scanLoadImage(file);
     Scan.srcDataUrl="";
@@ -4654,9 +4702,11 @@ function renderScanner(){
     <div class="card p-4 sm:p-5 mt-4">
       <label class="label">Reading engine</label>
       <div class="grid sm:grid-cols-2 gap-2">
-        <button class="text-left rounded-xl border p-3 transition-all ${Scan.engine==="local"?"border-emerald-400 bg-emerald-50/60":"border-zinc-200"}" data-action="scan-engine" data-engine="local">
+        <button class="text-left rounded-xl border p-3 transition-all ${Scan.engine==="local"?"border-emerald-400 bg-emerald-50/60":"border-zinc-200"} ${scanCapability().ocr?"":"opacity-60"}" data-action="scan-engine" data-engine="local">
           <div class="text-[13px] font-extrabold ${Scan.engine==="local"?"text-emerald-700":"text-zinc-700"}"><i class="ph-fill ph-device-mobile"></i> On this device</div>
-          <div class="text-[11px] text-zinc-500 leading-snug mt-1">Free, private, works offline. Strong on printed and neat writing; struggles with messy handwriting.</div></button>
+          <div class="text-[11px] text-zinc-500 leading-snug mt-1">${scanCapability().ocr
+            ? "Free, private, works offline. Strong on printed and neat writing; struggles with messy handwriting."
+            : "<b class=\"text-amber-700\">Not available on this device</b> — it needs WebAssembly and more memory than this phone has."}</div></button>
         <button class="text-left rounded-xl border p-3 transition-all ${Scan.engine==="ai"?"border-emerald-400 bg-emerald-50/60":"border-zinc-200"}" data-action="scan-engine" data-engine="ai">
           <div class="text-[13px] font-extrabold ${Scan.engine==="ai"?"text-emerald-700":"text-zinc-700"}"><i class="ph-fill ph-sparkle"></i> AI reader</div>
           <div class="text-[11px] text-zinc-500 leading-snug mt-1">Far better on bad handwriting and wall boards. Needs internet and your own free Google AI Studio key.</div></button>
@@ -4694,8 +4744,20 @@ function renderScanner(){
       </div>
       <div class="grid sm:grid-cols-2 gap-2.5 mt-4">
         <button class="btn btn-primary" data-action="scan-pick"><i class="ph ph-file-arrow-up"></i>Upload a file</button>
-        <button class="btn btn-ghost" data-action="scan-camera"><i class="ph ph-camera"></i>Use camera</button>
+        ${scanCanImage()
+          ? `<button class="btn btn-ghost" data-action="scan-camera"><i class="ph ph-camera"></i>Use camera</button>`
+          : `<button class="btn btn-ghost" disabled title="Not possible on this device"><i class="ph ph-camera-slash"></i>Camera not available</button>`}
       </div>
+      ${(!scanCapability().ocr)?`<div class="text-[11px] mt-3 rounded-xl p-3 leading-relaxed flex items-start gap-2 ${scanCanImage()
+          ?"text-sky-800 bg-sky-50 border border-sky-200/70"
+          :"text-amber-800 bg-amber-50 border border-amber-200/70"}">
+        <i class="ph-fill ${scanCanImage()?"ph-info":"ph-warning-circle"} ${scanCanImage()?"text-sky-500":"text-amber-500"} mt-0.5 flex-none"></i>
+        <span>${scanCanImage()
+          ? "<b>Photos can't be read on this device yourself</b> — the on-device reader needs more than it has ("+esc(scanCapability().blockers[0]||scanCapability().notes[0]||"it is too limited")+"). You can still <b>upload an Excel, CSV or PDF file</b>, or use the <b>AI reader</b> with your key."
+          : "<b>This device can't take or read photos</b> — "+esc(scanCapability().blockers[0]||scanCapability().notes[0]||"it is too limited for the reader")+". Timetables uploaded as <b>Excel, CSV or a text PDF</b> are read without any picture reading, so those still work here."}</span></div>`:""}
+      ${(scanCapability().ocr&&scanCapability().slow)?`<div class="text-[11px] mt-3 rounded-xl p-3 leading-relaxed flex items-start gap-2 text-amber-800 bg-amber-50 border border-amber-200/70">
+        <i class="ph-fill ph-warning text-amber-500 mt-0.5 flex-none"></i>
+        <span><b>This device is on the slow side</b> (${esc(scanCapability().notes.join(", "))}). Reading a photo can take a minute or more, and a very large one may fail. Excel, CSV and PDF files are quick here.</span></div>`:""}
       <p class="text-[11px] text-zinc-400 text-center mt-3">.xlsx · .xls · .csv · .ods · .pdf · .jpg · .png</p>
       <div class="grid sm:grid-cols-3 gap-2 mt-4 pt-4 border-t border-zinc-100 text-[11px] text-zinc-500">
         <div class="flex items-start gap-2"><i class="ph-fill ph-file-xls text-emerald-500 text-base mt-0.5"></i>
@@ -6240,7 +6302,14 @@ const actions={
 
   "export-json": ()=>{
     const {version,settings,subjects,teachers,classes,curriculum,timetable,absences}=state;
-    const payload={ format:"campusflow/3", app:"CampusFlow", exportedAt:new Date().toISOString(),
+    let lessons=0;
+    Object.values(timetable||{}).forEach(g=>(g||[]).forEach(r=>(r||[]).forEach(c=>{ lessons+=lessonsOf(c).length; })));
+    const payload={ format:BACKUP_FORMAT, app:"CampusFlow", exportedAt:new Date().toISOString(),
+      /* A manifest makes a backup self-describing: a school can open the file and
+         see what is inside, and an import can say what it found before changing
+         anything. */
+      manifest:{ school:settings.schoolName||"", format:BACKUP_FORMAT, app:"CampusFlow",
+        exportedAt:new Date().toISOString(), counts:{ teachers:teachers.length, subjects:subjects.length, classes:classes.length, lessons } },
       school: state.settings.schoolName, version, settings, subjects, teachers, classes, curriculum, timetable, absences };
     const blob=new Blob([JSON.stringify(payload,null,2)],{type:"application/json"});
     const a=document.createElement("a"); a.href=URL.createObjectURL(blob);
@@ -6249,6 +6318,27 @@ const actions={
     toast("success","Backup exported","Everything is in that file — keep it somewhere safe.");
   },
   "import-trigger": ()=>{ if(needSettings()) $("#import-file").click(); },
+  "import-apply": el=>{
+    const P=importPending; Modal.close(); if(!P) return;
+    importPending=null;
+    if(el.dataset.mode==="merge"){
+      const r=mergeImported(P.conv);
+      toast("success","Merged into your workspace",
+        `${r.addedT} teacher(s), ${r.addedS} subject(s) and ${r.addedC} class(es) added · ${r.filled} lesson(s) placed` +
+        (r.kept?` · ${r.kept} slot(s) already had a lesson and were left exactly as they were`:"")+".");
+    } else {
+      applyConverted(P.conv.data);
+      toast("success","Backup restored",
+        `${P.conv.stats.teachers} teachers · ${P.conv.stats.classes} classes · ${P.conv.stats.lessons} lessons — synced to the cloud.`);
+    }
+  },
+  "export-workbook": async ()=>{
+    if(!needSettings()) return;
+    try{
+      const r=await exportWorkbook();
+      toast("success","Workbook exported",`${r.classes} class timetable(s), ${r.teachers} teachers and ${r.subjects} subjects. Open it in Excel — and it can be imported straight back.`);
+    }catch(err){ toast("error","Export failed",(err&&err.message)||"The workbook could not be built."); }
+  },
   "reset-workspace": async ()=>{
     if(!needSettings()) return;
     const ok=await confirmDialog({ title:"Reset to an empty workspace?",
@@ -6454,7 +6544,14 @@ const actions={
   },
   /* ---- scanner ---- */
   "scan-mode": el=>{ Scan.mode=el.dataset.mode; Scan.error=""; Store.requestRender(); },
-  "scan-engine": el=>{ Scan.engine=el.dataset.engine; Scan.error=""; Store.requestRender(); },
+  "scan-engine": el=>{
+    if(el.dataset.engine==="local"&&!scanCapability().ocr){
+      toast("error","Not possible on this device",
+        "The on-device reader needs WebAssembly and more memory than this device has. Excel, CSV and PDF files still import here — or use the AI reader with your key.");
+      return;
+    }
+    Scan.engine=el.dataset.engine; Scan.error=""; Store.requestRender();
+  },
   "scan-lang": el=>{ Scan.langs=el.dataset.lang; Scan.error="";
     try{ localStorage.setItem("cf.scanLangs",Scan.langs); }catch(_){}
     Store.requestRender(); },
@@ -6539,6 +6636,564 @@ function uniqueCode(base, used){
   used.add(code); return code;
 }
 const subjCodeOf = name => { const w=name.trim().split(/\s+/); return w.length===1 ? w[0].slice(0,4) : w.map(x=>x[0]).join(""); };
+
+/* ==================================================================================
+   BACKUP & RESTORE — one door for every shape a school's data arrives in
+   ----------------------------------------------------------------------------------
+   A school replacing an old system has its data in whatever that system exported:
+   our own backup from an older release, a Firebase Realtime Database export, a
+   spreadsheet the office kept, or a plain list of lessons. All of those are read
+   here, shown as a preview of what was actually understood, and applied either as
+   a full replace or as a merge that never overwrites what is already there.
+   ================================================================================== */
+const BACKUP_FORMAT = "campusflow/4";
+let importPending = null;        /* the analysed file waiting for a decision */
+
+const isWorkspace = o => !!o && typeof o === "object" &&
+  Array.isArray(o.teachers) && Array.isArray(o.subjects) && Array.isArray(o.classes);
+
+/* A Realtime Database export holds everything under schools/<id>/state, but an
+   older app may have written the workspace straight onto the school node. */
+function findWorkspaceNode(p) {
+  if (!p || typeof p !== "object") return null;
+  if (isWorkspace(p)) return p;
+  if (isWorkspace(p.state)) return p.state;
+  if (isWorkspace(p.data)) return p.data;
+  const schools = (p.schools && typeof p.schools === "object") ? p.schools : p;
+  for (const k of Object.keys(schools || {})) {
+    const node = schools[k];
+    if (!node || typeof node !== "object") continue;
+    if (isWorkspace(node.state)) return node.state;
+    if (isWorkspace(node.data)) return node.data;
+    if (isWorkspace(node)) return node;
+    /* A school record often nests one more level (profile/state/workspace). */
+    for (const inner of ["workspace", "timetable", "settings"]) {
+      if (isWorkspace(node[inner])) return node[inner];
+    }
+  }
+  return null;
+}
+
+/* A flat list of lesson rows, however it was wrapped. */
+function flatRowList(p) {
+  if (Array.isArray(p)) return p.filter(r => r && typeof r === "object" && !Array.isArray(r));
+  if (!p || typeof p !== "object") return null;
+  for (const k of ["lessons", "rows", "entries", "records", "data", "items", "schedule"]) {
+    const v = p[k];
+    if (Array.isArray(v) && v.length && v[0] && typeof v[0] === "object" && !Array.isArray(v[0])) return v;
+  }
+  const groups = Object.entries(p).filter(([, v]) => Array.isArray(v) && v.length && v[0] && typeof v[0] === "object" && !Array.isArray(v[0]));
+  if (groups.length && groups.length >= Object.keys(p).length) {
+    const out = [];
+    groups.forEach(([name, arr]) => arr.forEach(r => out.push({ __class: name, ...r })));
+    return out;
+  }
+  return null;
+}
+
+/* Column names differ from system to system, so they are matched loosely. */
+const ROW_KEYS = {
+  className: [/^class/i, /^grade/i, /^section/i, /^division/i, /^group/i, /^form/i],
+  day: [/^day/i, /weekday/i, /^dow\b/i],
+  period: [/^period/i, /^slot/i, /^hour/i, /^p\b/i, /^lesson/i],
+  time: [/^time/i, /^start/i, /from/i],
+  subject: [/^sub/i, /^course/i, /^paper/i, /^module/i],
+  teacher: [/^teach/i, /^staff/i, /^faculty/i, /^instructor/i, /master/i],
+  room: [/^room/i, /^hall/i, /^venue/i]
+};
+const pickBy = (row, pats) => {
+  const keys = Object.keys(row || {});
+  for (const p of pats) { const k = keys.find(k => p.test(String(k).trim())); if (k != null) return k; }
+  return null;
+};
+const rowVal = (row, key) => (key == null ? "" : Scanner.squash(row[key]));
+
+/* Turn "Class | Day | Period | Subject | Teacher" rows into lessons. */
+function convertLessonRows(rows) {
+  const probe = rows[0] || {};
+  const k = {
+    className: pickBy(probe, ROW_KEYS.className), day: pickBy(probe, ROW_KEYS.day),
+    period: pickBy(probe, ROW_KEYS.period), time: pickBy(probe, ROW_KEYS.time),
+    subject: pickBy(probe, ROW_KEYS.subject), teacher: pickBy(probe, ROW_KEYS.teacher),
+    room: pickBy(probe, ROW_KEYS.room)
+  };
+  if (!(k.day || k.period || k.time) || !(k.subject || k.teacher)) return null;
+
+  const notes = [], lessons = [], timesByClass = {};
+  let unresolved = 0, timed = 0;
+  rows.forEach(row => {
+    const className = rowVal(row, k.className) || Scanner.squash(row.__class) || "Imported class";
+    let d = Scanner.dayIndexFromText(rowVal(row, k.day));
+    if (d === -1) {
+      const n = parseInt(rowVal(row, k.day), 10);
+      if (n >= 1 && n <= 7) d = n - 1;                 /* 1 = Monday */
+    }
+    let p = 0;
+    const per = Scanner.periodInfoFromText(rowVal(row, k.period));
+    if (per && per.period) p = per.period;
+    else {
+      const n = parseInt(rowVal(row, k.period), 10);
+      if (n >= 1 && n <= 20) p = n;
+    }
+    if (!p) {
+      const t = rowVal(row, k.time) || (per && per.time) || "";
+      if (t) {                                          /* a time column: order gives the periods */
+        (timesByClass[className] = timesByClass[className] || new Set()).add(t);
+        row.__time = t; timed++;
+      }
+    }
+    const subject = rowVal(row, k.subject), teacher = rowVal(row, k.teacher);
+    if (!subject && !teacher) { unresolved++; return; }
+    lessons.push({ className, d, p, time: row.__time || "", subject, teacher, room: rowVal(row, k.room) });
+  });
+  /* Times become period numbers in the order they happen. */
+  Object.entries(timesByClass).forEach(([className, set]) => {
+    const order = Array.from(set).sort();
+    lessons.filter(L => L.className === className && !L.p && L.time)
+      .forEach(L => { L.p = order.indexOf(L.time) + 1; });
+  });
+  lessons.forEach(L => { if (!L.p) L.p = 1; });
+  if (timed) notes.push("Period numbers came from the order of the times in each class.");
+  if (unresolved) notes.push(unresolved + " row(s) had no subject or teacher and were skipped.");
+  return lessons.length ? { lessons, notes } : null;
+}
+
+/* Build a complete workspace out of plain lessons. */
+function buildFromLessons(o) {
+  const subjects = [], teachers = [], classes = [], notes = o.notes || [];
+  const subjByName = {}, teachByName = {}, classByName = {};
+  const usedSC = new Set(), usedTC = new Set();
+  const ensureSubject = raw => {
+    const nm = Scanner.squash(raw); if (!nm || nm.length < 2) return null;
+    const key = normName(nm);
+    if (subjByName[key]) return subjByName[key];
+    const rec = { id: uid("s"), name: nm, code: uniqueCode(subjCodeOf(nm), usedSC), color: SUBJ_COLORS[subjects.length % SUBJ_COLORS.length] };
+    subjects.push(rec); subjByName[key] = rec; return rec;
+  };
+  const ensureTeacher = raw => {
+    const nm = Scanner.squash(raw); if (!nm || nm.length < 2) return null;
+    const key = normName(nm);
+    if (teachByName[key]) return teachByName[key];
+    const rec = { id: uid("t"), name: nm, code: uniqueCode(initials(nm), usedTC), color: PALETTE[teachers.length % PALETTE.length], subjectIds: [] };
+    teachers.push(rec); teachByName[key] = rec; return rec;
+  };
+  const ensureClass = raw => {
+    const nm = Scanner.squash(raw) || "Imported class";
+    const key = normName(nm);
+    if (classByName[key]) return classByName[key];
+    const rec = { id: uid("c"), name: nm };
+    classes.push(rec); classByName[key] = rec; return rec;
+  };
+  (o.teacherList || []).forEach(t => {
+    const rec = ensureTeacher(t.name); if (!rec) return;
+    if (t.phone) rec.phone = t.phone;
+    (t.subjects || []).forEach(sn => { const s = ensureSubject(sn); if (s && !rec.subjectIds.includes(s.id)) rec.subjectIds.push(s.id); });
+  });
+  (o.subjectList || []).forEach(nm => ensureSubject(nm));
+
+  let maxD = 0, maxP = 0, placed = 0, streams = 0, skipped = 0;
+  const cells = {};                                   /* className → d → p → [{subjectId,teacherId}] */
+  o.lessons.forEach(L => {
+    const subj = ensureSubject(L.subject), teach = ensureTeacher(L.teacher);
+    if (!subj && !teach) return;
+    if (L.d < 0 || L.p < 1 || L.p > 20) { skipped++; return; }
+    const cls = ensureClass(L.className);
+    maxD = Math.max(maxD, L.d); maxP = Math.max(maxP, L.p);
+    const key = cls.id;
+    cells[key] = cells[key] || {};
+    (cells[key][L.d] = cells[key][L.d] || {});
+    const slot = (cells[key][L.d][L.p] = cells[key][L.d][L.p] || []);
+    if (slot.length) streams++;
+    slot.push({ subjectId: subj ? subj.id : null, teacherId: teach ? teach.id : null });
+    placed++;
+  });
+
+  const days = clamp(maxD >= 5 ? 6 : 5, 5, 6);
+  const periods = clamp(maxP || 8, 4, 10);
+  const timetable = {};
+  classes.forEach(c => {
+    const grid = Array.from({ length: days }, () => Array(periods).fill(null));
+    const byClass = cells[c.id] || {};
+    Object.keys(byClass).forEach(dk => {
+      const d = +dk; if (d >= days) { skipped += Object.values(byClass[d]).reduce((n, a) => n + a.length, 0); return; }
+      Object.keys(byClass[d]).forEach(pk => {
+        const p = +pk;
+        if (p > periods) { skipped += byClass[d][p].length; return; }
+        grid[d][p - 1] = byClass[d][p];
+      });
+    });
+    timetable[c.id] = grid;
+  });
+  if (skipped) notes.push(skipped + " lesson(s) fell outside a 6 × 10 grid and were left out.");
+
+  return {
+    kind: o.kind || "lessons", source: o.source || "Lesson list",
+    data: { settings: { daysPerWeek: days, periodsPerDay: periods, maxLoad: 28, loadCap: 35, ...(o.settingsPatch || {}) },
+      teachers, subjects, classes, curriculum: [], timetable, absences: {} },
+    stats: { teachers: teachers.length, subjects: subjects.length, classes: classes.length,
+      lessons: placed, reliefAssigned: 0, days, periods, streams, unresolved: skipped },
+    notes
+  };
+}
+
+/* Read a spreadsheet dump from an old system: one sheet per class, a teacher
+   list, a subject list, or a flat table of lessons. */
+async function parseBackupWorkbook(file) {
+  await ensureScanner();
+  const book = await Scanner.readSheetFile(file);
+  const notes = [], lessons = [], teacherList = [], subjectList = [];
+  const settingsPatch = {};
+  let classSheets = 0, skippedSheets = 0;
+  /* In a workbook the parts of "Maths · Mr Perera" are unambiguous: a part with a
+     title or initials is a teacher, everything else is a subject. Matching both
+     ways at once would turn every subject into a teacher and every teacher into a
+     subject, which is how one modest staff list became eight names. */
+  const TEACHERISH = /^(mr|mrs|ms|miss|mstr|master|dr|rev|sir|madam|teacher|ven|prof)\.?\s/i;
+  const looksLikeTeacher = s => TEACHERISH.test(s) || /^[A-Z]{1,3}\.?\s+[A-Z]/.test(s) || /\b(?:mrs?|ms|miss|dr)\.?\s/i.test(s);
+  const anySub = t => {
+    const nm = Scanner.squash(t);
+    if (!nm || nm.length < 2 || /^\d+$/.test(nm) || looksLikeTeacher(nm)) return { item: null, score: 0 };
+    return { item: { id: "s:" + nm, name: nm }, score: 1 };
+  };
+  const anyTch = t => {
+    const nm = Scanner.squash(t);
+    if (!nm || nm.length < 2 || !looksLikeTeacher(nm)) return { item: null, score: 0 };
+    return { item: { id: "t:" + nm, name: nm }, score: 1 };
+  };
+
+  for (const sh of book.sheets) {
+    const matrix = (sh.matrix || []).map(r => r.map(v => Scanner.squash(v)));
+    const allCells = matrix.slice(0, 5).flat();
+    const lower = allCells.map(s => s.toLowerCase());
+    const has = re => lower.some(s => re.test(s));
+    const dayRow = matrix.find(r => r.filter(c => Scanner.dayIndexFromText(c) !== -1).length >= 2);
+
+    /* 1. The sheet our own export writes. */
+    if (/^(school|info|about|setup)$/i.test(sh.name) || lower.includes("school name")) {
+      matrix.forEach(row => {
+        const key = (row[0] || "").toLowerCase(), val = row[1] || "";
+        if (/school name/.test(key) && val) settingsPatch.schoolName = val;
+        if (/days per week/.test(key)) { const n = parseInt(val, 10); if (n >= 4 && n <= 6) settingsPatch.daysPerWeek = n; }
+        if (/periods per day/.test(key)) { const n = parseInt(val, 10); if (n >= 4 && n <= 10) settingsPatch.periodsPerDay = n; }
+      });
+      continue;
+    }
+
+    /* 2. A flat table of lessons. */
+    if ((has(/^class/) || has(/^grade/)) && (has(/^day/) || has(/^period/) || has(/^time/)) && (has(/^sub/) || has(/^teach/))) {
+      const rows = [];
+      const header = matrix[0] || [];
+      matrix.slice(1).forEach(r => {
+        if (r.every(c => !c)) return;
+        const obj = {}; header.forEach((h, i) => { if (h) obj[h] = r[i] || ""; });
+        rows.push(obj);
+      });
+      const conv = convertLessonRows(rows);
+      if (conv) {
+        conv.lessons.forEach(L => lessons.push(L));
+        conv.notes.forEach(n => notes.push(n));
+        notes.push("Sheet “" + sh.name + "” was read as a table of lessons.");
+        continue;
+      }
+    }
+
+    /* 3. A class timetable. */
+    if (dayRow) {
+      const model = Scanner.interpretGrid(sh.grid, { daysPerWeek: 7 });
+      if (model.recognised) {
+        const out = Scanner.gridToTimetable(model, { periodsPerDay: 12, daysPerWeek: 7, matchSubject: anySub, matchTeacher: anyTch });
+        let label = "";
+        matrix.slice(0, 3).some(r => r.some(c => {
+          const m = c.match(/(?:class|grade|section)\s*[:\-]?\s*(.+)$/i);
+          if (m && m[1] && m[1].length < 20) { label = m[1]; return true; }
+          return false;
+        }));
+        const clsName = (label || sh.name.replace(/\b(timetable|schedule|time ?table|class|sheet)\b/gi, "").trim() || sh.name);
+        out.report.cells.forEach(cell => {
+          const p = (model.periodByRow[cell.r] && model.periodByRow[cell.r].period) || cell.slot + 1;
+          const parsed = cell.parsed || {};
+          lessons.push({ className: clsName, d: cell.d, p,
+            subject: parsed.subject ? parsed.subject.name : "", teacher: parsed.teacher ? parsed.teacher.name : "",
+            room: parsed.room || "" });
+        });
+        classSheets++;
+        continue;
+      }
+    }
+
+    /* 4. Teachers, with the subjects they take. */
+    if (has(/teacher|staff|faculty/) || /teacher|staff/i.test(sh.name)) {
+      const head = matrix[0] || [];
+      const nameCol = Math.max(0, head.findIndex(h => /name/i.test(h)));
+      const subjCol = head.findIndex(h => /sub/i.test(h));
+      const phoneCol = head.findIndex(h => /phone|mobile|contact/i.test(h));
+      matrix.slice(head.some(h => /name/i.test(h)) ? 1 : 0).forEach(r => {
+        const nm = Scanner.squash(r[nameCol]); if (!nm || nm.length < 2 || /^(name|teacher)$/i.test(nm)) return;
+        teacherList.push({ name: nm, phone: phoneCol >= 0 ? Scanner.squash(r[phoneCol]) : "",
+          subjects: subjCol >= 0 ? Scanner.squash(r[subjCol]).split(/[,;|/]+/).map(s => s.trim()).filter(Boolean) : [] });
+      });
+      notes.push("Sheet “" + sh.name + "” was read as a teacher list (" + teacherList.length + " so far).");
+      continue;
+    }
+
+    /* 5. A plain list of subjects. */
+    if (has(/subject|course/) || /subject/i.test(sh.name)) {
+      const head = matrix[0] || [];
+      const col = Math.max(0, head.findIndex(h => /subject|name|course/i.test(h)));
+      matrix.forEach((r, i) => {
+        const nm = Scanner.squash(r[col]);
+        if (!nm || nm.length < 2 || (i === 0 && /subject|name|course/i.test(nm))) return;
+        subjectList.push(nm);
+      });
+      notes.push("Sheet “" + sh.name + "” was read as a subject list.");
+      continue;
+    }
+
+    skippedSheets++;
+    notes.push("Sheet “" + sh.name + "” had no timetable, teacher or subject list in it, so it was ignored.");
+  }
+
+  if (!lessons.length && !teacherList.length && !subjectList.length) return null;
+  const conv = buildFromLessons({ lessons, teacherList, subjectList, settingsPatch, notes,
+    kind: "workbook", source: "Workbook — " + classSheets + " class timetable sheet(s)" + (book.sheets.length > classSheets ? " of " + book.sheets.length : "") });
+  return conv;
+}
+
+/* One entry point for a JSON file of any age or shape. */
+function parseBackupJson(parsed) {
+  if (!parsed || typeof parsed !== "object") return null;
+  if (Array.isArray(parsed) || flatRowList(parsed)) {
+    const rows = Array.isArray(parsed) ? parsed : flatRowList(parsed);
+    const conv = convertLessonRows(rows || []);
+    if (conv) return buildFromLessons({ lessons: conv.lessons, notes: conv.notes, kind: "lessons", source: "List of lessons" });
+  }
+  const node = findWorkspaceNode(parsed);
+  if (node) {
+    const conv = convertNativeBackup({
+      settings: node.settings, teachers: node.teachers || [], subjects: node.subjects || [], classes: node.classes || [],
+      curriculum: node.curriculum, timetable: node.timetable || {}, absences: node.absences || {}
+    });
+    conv.kind = "workspace";
+    conv.source = (parsed.format || "").startsWith("campusflow") ? "CampusFlow backup (" + parsed.format + ")"
+      : /^{?"?schools"?/.test(JSON.stringify(parsed).slice(0, 40)) ? "Firebase database export" : "Workspace data";
+    if (parsed.exportedAt) conv.exportedAt = parsed.exportedAt;
+    return conv;
+  }
+  if (parsed.db && (parsed.schedule || parsed.db.subjects)) {
+    const conv = convertLegacyBackup(parsed);
+    conv.source = "Older timetable export (db / schedule)";
+    return conv;
+  }
+  return null;
+}
+
+/* What the file would do to the workspace that is already here. */
+function analyseImport(conv) {
+  const cur = Store.raw;
+  const count = (list, pool) => list.reduce((n, x) => n + (pool.some(y => normName(y.name) === normName(x.name)) ? 0 : 1), 0);
+  const have = (list, pool) => list.length - count(list, pool);
+  const out = {
+    newTeachers: count(conv.data.teachers, cur.teachers), haveTeachers: have(conv.data.teachers, cur.teachers),
+    newSubjects: count(conv.data.subjects, cur.subjects), haveSubjects: have(conv.data.subjects, cur.subjects),
+    newClasses: count(conv.data.classes, cur.classes), haveClasses: have(conv.data.classes, cur.classes),
+    fill: 0, busy: 0, outside: 0
+  };
+  const days = cur.settings.daysPerWeek, periods = cur.settings.periodsPerDay;
+  const byName = {};
+  (conv.data.classes || []).forEach(c => { byName[normName(c.name)] = c.id; });
+  Object.entries(conv.data.timetable || {}).forEach(([cid, grid]) => {
+    const src = (conv.data.classes || []).find(c => c.id === cid);
+    const target = src ? cur.classes.find(c => normName(c.name) === normName(src.name)) : null;
+    (grid || []).forEach((row, d) => (row || []).forEach((cell, p) => {
+      const n = lessonsOf(cell).length; if (!n) return;
+      if (d >= days || p >= periods) { out.outside += n; return; }
+      const there = target ? lessonsOf(target && cur.timetable[target.id] && cur.timetable[target.id][d] ? cur.timetable[target.id][d][p] : null).length : 0;
+      if (there) out.busy += n; else out.fill += n;
+    }));
+  });
+  return out;
+}
+
+/* Merge: add what is missing, never overwrite what exists. Timetable cells are
+   only filled where the class has nothing in that slot. */
+function mergeImported(conv) {
+  const next = JSON.parse(JSON.stringify({ teachers: Store.raw.teachers, subjects: Store.raw.subjects,
+    classes: Store.raw.classes, curriculum: Store.raw.curriculum || [], timetable: Store.raw.timetable || {},
+    absences: Store.raw.absences || {}, settings: Store.raw.settings }));
+  const sMap = {}, tMap = {}, cMap = {};
+  let addedT = 0, addedS = 0, addedC = 0, filled = 0, kept = 0;
+
+  (conv.data.subjects || []).forEach(s => {
+    const ex = next.subjects.find(x => normName(x.name) === normName(s.name));
+    if (ex) { sMap[s.id] = ex.id; return; }
+    const fresh = { ...s, id: uid("s") };
+    next.subjects.push(fresh); sMap[s.id] = fresh.id; addedS++;
+  });
+  (conv.data.teachers || []).forEach(t => {
+    const ex = next.teachers.find(x => normName(x.name) === normName(t.name));
+    if (ex) {
+      tMap[t.id] = ex.id;
+      const subj = (t.subjectIds || []).map(id => sMap[id]).filter(Boolean);
+      subj.forEach(id => { if (!Array.isArray(ex.subjectIds)) ex.subjectIds = []; if (!ex.subjectIds.includes(id)) ex.subjectIds.push(id); });
+      if (!ex.phone && t.phone) ex.phone = t.phone;
+      return;
+    }
+    const fresh = { ...t, id: uid("t"), subjectIds: (t.subjectIds || []).map(id => sMap[id]).filter(Boolean) };
+    next.teachers.push(fresh); tMap[t.id] = fresh.id; addedT++;
+  });
+  (conv.data.classes || []).forEach(c => {
+    const ex = next.classes.find(x => normName(x.name) === normName(c.name));
+    if (ex) { cMap[c.id] = ex.id; return; }
+    const fresh = { ...c, id: uid("c") };
+    next.classes.push(fresh); cMap[c.id] = fresh.id; addedC++;
+  });
+
+  /* Growing the week is safe; shrinking would delete lessons, so it never happens here. */
+  let needD = 0, needP = 0;
+  Object.values(conv.data.timetable || {}).forEach(grid => (grid || []).forEach((row, d) => (row || []).forEach((cell, p) => {
+    if (lessonsOf(cell).length) { needD = Math.max(needD, d + 1); needP = Math.max(needP, p + 1); }
+  })));
+  next.settings = { ...next.settings };
+  next.settings.daysPerWeek = Math.max(next.settings.daysPerWeek || 5, needD || 5);
+  next.settings.periodsPerDay = Math.max(next.settings.periodsPerDay || 8, needP || 8);
+
+  Object.entries(conv.data.timetable || {}).forEach(([oldCid, grid]) => {
+    const target = cMap[oldCid]; if (!target) return;
+    if (!next.timetable[target]) next.timetable[target] = Array.from({ length: next.settings.daysPerWeek }, () => Array(next.settings.periodsPerDay).fill(null));
+    (grid || []).forEach((row, d) => (row || []).forEach((cell, p) => {
+      const ls = lessonsOf(cell); if (!ls.length) return;
+      if (d >= next.settings.daysPerWeek || p >= next.settings.periodsPerDay) { kept++; return; }
+      if (!next.timetable[target][d]) next.timetable[target][d] = [];
+      if (lessonsOf(next.timetable[target][d][p]).length) { kept++; return; }
+      next.timetable[target][d][p] = ls.map(L => ({ subjectId: sMap[L.subjectId] || null, teacherId: tMap[L.teacherId] || null })).filter(L => L.subjectId || L.teacherId);
+      filled += ls.length;
+    }));
+  });
+
+  next.ui = Store.raw.ui;
+  Store.replaceData(next);
+  Store.raw.ui.dbTab = "teachers";
+  Store.flush();
+  if (Sync.active) { Sync._lastSig = null; Sync.pushNow(); }
+  return { addedT, addedS, addedC, filled, kept };
+}
+
+/* The preview. Nothing is written until the user picks a button here, and the
+   two honest choices are spelled out: replace everything, or merge without
+   overwriting a single existing record. */
+function openImportModal(){
+  Modal.open(()=>{
+    const P=importPending;
+    if(!P) return `<div class="p-6"><p class="text-sm text-zinc-600">Nothing left to import.</p>
+      <button class="btn btn-primary w-full mt-4" data-action="modal-close">Close</button></div>`;
+    const c=P.conv, st=c.stats, a=P.analysed;
+    const tile=(v,l)=>`<div class="bg-zinc-50 border border-zinc-200/70 rounded-xl py-2.5">
+      <div class="font-display font-bold text-lg leading-none tabular-nums">${v}</div>
+      <div class="text-[10px] font-bold uppercase tracking-wide text-zinc-400 mt-1">${l}</div></div>`;
+    const mixed=(total,fresh)=>total?`<span class="text-[10px] text-zinc-400">${fresh} new</span>`:"";
+    return `<div class="p-5 sm:p-6 max-h-[85vh] overflow-auto">
+      <div class="flex items-start gap-3">
+        <div class="tile bg-sky-500/10 text-sky-600 flex-none"><i class="ph-fill ph-vault text-xl"></i></div>
+        <div class="min-w-0">
+          <h3 class="font-display font-bold text-[16px]">Read “${esc(P.fileName)}”</h3>
+          <p class="text-[12px] text-zinc-500 mt-0.5 leading-relaxed">Recognised as <b>${esc(c.source||"school data")}</b>${c.exportedAt?` · exported ${esc(String(c.exportedAt).slice(0,10))}`:""}. Nothing has changed yet.</p>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-3 gap-2 my-4 text-center">
+        ${tile(st.teachers,"Teachers")}${tile(st.subjects,"Subjects")}${tile(st.classes,"Classes")}
+        ${tile(st.lessons,"Lessons")}${tile(st.reliefAssigned||0,"Relief covers")}${tile(st.days+" × "+st.periods,"Grid")}
+      </div>
+
+      <div class="rounded-xl border border-zinc-200 p-3 mb-3">
+        <div class="text-[11px] font-extrabold uppercase tracking-wide text-zinc-400 mb-2">What each choice does</div>
+        <div class="text-[12px] text-zinc-600 leading-relaxed space-y-1.5">
+          <div><b>Replace everything</b> — your workspace becomes exactly this file: ${st.teachers} teachers, ${st.subjects} subjects, ${st.classes} classes, ${st.lessons} lessons. Current data is removed (Undo restores it).</div>
+          <div><b>Merge</b> — keeps everything you have and adds what is missing: ${a.newTeachers} new teacher(s) ${mixed(st.teachers,a.newTeachers)}, ${a.newSubjects} new subject(s), ${a.newClasses} new class(es), and ${a.fill} lesson(s) placed in empty slots${a.busy?` (${a.busy} slot(s) already have a lesson and stay exactly as they are)`:""}.</div>
+        </div>
+      </div>
+
+      ${(c.notes&&c.notes.length)?`<div class="text-[11px] text-zinc-500 bg-zinc-50 border border-zinc-200/70 rounded-xl p-3 mb-3 leading-relaxed">
+        ${c.notes.map(n=>`<div class="flex items-start gap-1.5"><i class="ph-fill ph-info text-sky-400 mt-0.5 flex-none"></i><span>${esc(n)}</span></div>`).join("")}
+      </div>`:""}
+      ${a.outside?`<div class="text-[11px] text-amber-800 bg-amber-50 border border-amber-200/70 rounded-xl p-3 mb-3 leading-relaxed">
+        <b>${a.outside} lesson(s)</b> in this file sit outside your school's ${state.settings.daysPerWeek}-day, ${state.settings.periodsPerDay}-period week. Replace imports them as far as the grid allows; Merge grows the week so nothing is lost.</div>`:""}
+      ${(st.streams>0)?`<div class="text-[11px] text-emerald-800 bg-emerald-50 border border-emerald-200/70 rounded-xl p-3 mb-3 leading-relaxed">
+        ${st.streams} slot(s) hold more than one subject group; every group is imported.</div>`:""}
+      ${(st.unresolved>0)?`<div class="text-[11px] text-zinc-500 mb-3">${st.unresolved} record(s) could not be used and were skipped.</div>`:""}
+
+      <div class="flex flex-wrap gap-2.5 mt-4">
+        <button class="btn btn-soft" data-action="import-apply" data-mode="merge"><i class="ph ph-git-merge"></i>Merge into my workspace</button>
+        <button class="btn btn-danger" data-action="import-apply" data-mode="replace"><i class="ph ph-arrows-clockwise"></i>Replace everything</button>
+        <button class="btn btn-ghost" data-action="modal-close">Cancel</button>
+      </div>
+      <p class="text-[11px] text-zinc-400 mt-3 leading-relaxed">Ctrl+Z undoes the import either way.</p>
+    </div>`;
+  });
+}
+
+/* The spreadsheet writer, from the same vendored copy the reader uses. */
+let xlsxWriterPromise = null;
+function ensureXlsx(){
+  if (window.XLSX) return Promise.resolve(window.XLSX);
+  if (!xlsxWriterPromise) xlsxWriterPromise = loadScriptOnce("vendor/xlsx.full.min.js", () => !!window.XLSX)
+    .then(() => window.XLSX)
+    .catch(e => { xlsxWriterPromise = null; throw new Error("The spreadsheet writer could not start. " + e.message); });
+  return xlsxWriterPromise;
+}
+
+/* An .xlsx a school can open, read, edit and hand back to us. */
+async function exportWorkbook() {
+  const XLSX = await ensureXlsx();
+  const wb = XLSX.utils.book_new();
+  const s = state.settings;
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([
+    ["School name", s.schoolName || "School"], ["Days per week", s.daysPerWeek], ["Periods per day", s.periodsPerDay],
+    ["Format", BACKUP_FORMAT], ["Exported", new Date().toISOString().slice(0, 16).replace("T", " ")]
+  ]), "School");
+
+  const used = new Set(["school"]);
+  state.classes.forEach(c => {
+    const rows = [["Period", ...DAYS_SHORT.slice(0, s.daysPerWeek)]];
+    for (let p = 0; p < s.periodsPerDay; p++) {
+      const row = ["P" + (p + 1)];
+      for (let d = 0; d < s.daysPerWeek; d++) {
+        const ls = lessonsOf(state.timetable[c.id] && state.timetable[c.id][d] ? state.timetable[c.id][d][p] : null);
+        row.push(ls.map(L => {
+          const su = S(L.subjectId), te = T(L.teacherId);
+          return [su ? su.name : "", te ? te.name : ""].filter(Boolean).join(" · ");
+        }).join(" / "));
+      }
+      rows.push(row);
+    }
+    let name = String(c.name || "class").replace(/[\\/?*[\]:]/g, " ").slice(0, 28) || "class";
+    while (used.has(name.toLowerCase())) name = name.slice(0, 25) + " (2)";
+    used.add(name.toLowerCase());
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(rows), name);
+  });
+
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([["Name", "Code", "Subjects", "Phone"],
+    ...state.teachers.map(t => [t.name, t.code || "", (t.subjectIds || []).map(id => S(id) ? S(id).name : "").filter(Boolean).join(", "), t.phone || ""])]), "Teachers");
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([["Name", "Code"],
+    ...state.subjects.map(x => [x.name, x.code || ""])]), "Subjects");
+
+  const relief = [];
+  Object.entries(state.absences || {}).forEach(([date, rec]) => {
+    Object.entries(rec.relief || {}).forEach(([key, teacherId]) => {
+      const [cid, p] = key.split("|");
+      relief.push([date, (rec.teachers || []).map(id => T(id) ? T(id).name : "").filter(Boolean).join(", "),
+        C(cid) ? C(cid).name : cid, "P" + (parseInt(p, 10) + 1), T(teacherId) ? T(teacherId).name : ""]);
+    });
+  });
+  if (relief.length) XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([["Date", "Absent", "Class", "Period", "Covered by"], ...relief]), "Relief");
+
+  const buf = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([buf], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }));
+  a.download = (s.schoolName || "school").replace(/[^a-z0-9]+/gi, "-").toLowerCase() + "-timetable-" + localISO() + ".xlsx";
+  a.click(); URL.revokeObjectURL(a.href);
+  return { classes: state.classes.length, teachers: state.teachers.length, subjects: state.subjects.length };
+}
 
 function convertLegacyBackup(p){
   /* subjects: plain name strings → entities */
@@ -6770,37 +7425,30 @@ const changeHandlers={
   },
   "pdoc-target": el=>{ state.ui.print.targetId=el.value; },
   "pdoc-paper": el=>{ state.ui.print.paper=el.value; setPaper(el.value); },
-  "import-file": el=>{
+  "import-file": async el=>{
     if(!canEditSettings()) return;
     const f=el.files?.[0]; el.value=""; if(!f) return;
-    const rd=new FileReader();
-    rd.onload=()=>{ try{
-        const parsed=JSON.parse(rd.result);
-        let conv=null;
-        if (parsed && parsed.db && (parsed.schedule || parsed.db.subjects)) conv=convertLegacyBackup(parsed); // legacy timetable export
-        else if (Array.isArray(parsed.teachers) && Array.isArray(parsed.subjects) && Array.isArray(parsed.classes)) conv=convertNativeBackup(parsed); // campusflow v1/v2
-        if (!conv) throw new Error("unrecognized");
-        const st=conv.stats;
-        confirmDialog({
-          title: conv.legacy ? "Legacy backup detected" : "Restore this backup?",
-          icon: conv.legacy ? "ph-arrows-clockwise" : "ph-vault",
-          tone: "primary",
-          confirmLabel: conv.legacy ? "Convert & import" : "Import",
-          message:
-            `<div class="grid grid-cols-3 gap-2 my-3 text-center">
-              ${[[st.teachers,"Teachers"],[st.subjects,"Subjects"],[st.classes,"Classes"],[st.lessons,"Lessons"],[st.reliefAssigned,"Relief covers"],[st.days+" × "+st.periods,"Grid"]].map(([v,l])=>
-              `<div class="bg-zinc-50 border border-zinc-200/70 rounded-xl py-2.5"><div class="font-display font-bold text-lg leading-none tabular-nums">${v}</div><div class="text-[10px] font-bold uppercase tracking-wide text-zinc-400 mt-1">${l}</div></div>`).join("")}
-            </div>
-            ${conv.legacy?`This file uses the <b>older timetable format</b> — it will be converted automatically. ${st.streams?`<br><span class="text-emerald-700 font-semibold">${st.streams} parallel subject-group slot(s) imported with every stream preserved.</span>`:""}${st.unresolved?`<br><span class="text-amber-700 font-semibold">${st.unresolved} lesson(s) referenced unknown names and were skipped.</span>`:""}<br>`:""}
-            This <b>replaces</b> all current teachers, subjects, classes, timetables &amp; absence history (school name, logo and user accounts are untouched).`
-        }).then(ok=>{
-          if (!ok) return;
-          applyConverted(conv.data);
-          toast("success", conv.legacy?"Legacy backup converted":"Backup restored",
-            `${st.teachers} teachers · ${st.classes} classes · ${st.lessons} lessons — synced to the cloud.`);
-        });
-      }catch(e){ toast("error","Import failed","That file isn't a recognized CampusFlow or legacy timetable backup."); } };
-    rd.readAsText(f);
+    try{
+      /* JSON backups are read with the same day/period/normalisation helpers the
+         scanner uses, so make sure that module is present (it ships offline). */
+      await ensureScanner();
+      let conv=null;
+      if(/\.(xlsx|xlsm|xls|csv|tsv|ods)$/i.test(f.name)) conv=await parseBackupWorkbook(f);
+      else {
+        const text=await f.text();
+        let parsed=null;
+        try{ parsed=JSON.parse(text); }catch(_){ parsed=null; }
+        conv = parsed ? parseBackupJson(parsed) : await parseBackupWorkbook(f).catch(()=>null);
+      }
+      if(!conv||(!conv.data.teachers.length&&!conv.data.subjects.length&&!conv.data.classes.length)) throw new Error("unrecognised");
+      importPending={ conv, analysed:analyseImport(conv), fileName:f.name };
+      openImportModal();
+    }catch(err){
+      toast("error","Import failed",
+        (err && err.message==="unrecognised")
+          ? "That file isn't a CampusFlow backup, a database export, a timetable spreadsheet or a list of lessons."
+          : "That file could not be read"+(err&&err.message?" — "+err.message:"")+".");
+    }
   },
   "logo-file": el=>{
     if(!canEditSettings()) return;
