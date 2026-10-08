@@ -1,0 +1,24 @@
+# Dependency directories
+node_modules/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Runtime data
+pids/
+*.pid
+*.seed
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Firebase deploy cache
+.firebase/
+.runtimeconfig.json
+
+# Editor / OS noise
+.DS_Store
