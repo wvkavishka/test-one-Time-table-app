@@ -368,7 +368,7 @@
 <input type="file" id="import-file" accept="application/json,.json" class="hidden" data-change="import-file">
 <input type="file" id="logo-file" accept="image/*" class="hidden" data-change="logo-file">
 <input type="file" id="scan-cam" accept="image/*" capture="environment" class="hidden" data-change="scan-file">
-<input type="file" id="scan-lib" accept="image/*" class="hidden" data-change="scan-file">
+<input type="file" id="scan-lib" accept="image/*,application/pdf,.pdf,.xlsx,.xlsm,.xls,.csv,.tsv,.ods,text/csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" class="hidden" data-change="scan-file">
 
 <script>
 /* =====================================================================================
@@ -3797,7 +3797,10 @@ const Scan={
   srcDataUrl:"", prepDataUrl:"", rawText:"",
   rows:[], grid:null, classId:null, orientation:"days-cols",
   stats:null, aiKey:localStorage.getItem("cf.aiKey")||"",
-  variants:[]
+  variants:[],
+  /* documents (PDF / Excel / CSV) and the on-device reader's language set */
+  doc:null, docName:"", page:1, sheetIndex:0, report:null,
+  langs:localStorage.getItem("cf.scanLangs")||"eng", usedEngine:""
 };
 const SCAN_MODES=[
   ["teachers","ph-chalkboard-teacher","Teacher list","Names and the subjects each teacher takes"],
@@ -3815,11 +3818,56 @@ function loadScriptOnce(src,test){
     s.onload=resolve;s.onerror=()=>reject(new Error("The required reader was blocked or could not download."));document.head.appendChild(s);
   });
 }
+/* The reader ships with the app in ./vendor and is cached by the service worker,
+   so this no longer needs a connection — the old build pulled the engine, its
+   core and every language pack from a CDN, which is why scanning failed offline. */
 function ensureTesseract(){
   if(typeof Tesseract!=="undefined") return Promise.resolve();
-  if(!tesseractPromise) tesseractPromise=loadScriptOnce("https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js",()=>typeof Tesseract!=="undefined")
-    .catch(error=>{tesseractPromise=null;throw new Error(navigator.onLine?"The on-device OCR reader was blocked. Disable the content blocker for this site, or use the AI reader.":"The OCR reader has not been downloaded on this device yet. Connect once, then retry.");});
+  if(!tesseractPromise) tesseractPromise=loadScriptOnce("vendor/tesseract.min.js",()=>typeof Tesseract!=="undefined")
+    .catch(error=>{tesseractPromise=null;throw new Error("The on-device reader could not start. "+(error?.message||"")+(navigator.onLine?"":" It has not been saved on this device yet — open the app once with a connection."));});
   return tesseractPromise;
+}
+/* One worker is created per language set and then reused. The previous code called
+   Tesseract.recognize() for every image variant, which rebuilt the worker — and
+   re-downloaded the language data — for each attempt. */
+let ocrWorker=null, ocrWorkerLangs=null, ocrWorkerPromise=null;
+const absUrl = p => new URL(p,document.baseURI).href;
+async function ensureOcrWorker(langs){
+  const want=langs||"eng";
+  if(ocrWorker&&ocrWorkerLangs===want) return ocrWorker;
+  if(ocrWorkerPromise&&ocrWorkerLangs===want) return ocrWorkerPromise;
+  await ensureTesseract();
+  if(ocrWorker){ try{ await ocrWorker.terminate(); }catch(_){} ocrWorker=null; }
+  ocrWorkerLangs=want;
+  /* scanner.js knows its own folder, which is where these files live. */
+  await ensureScanner();
+  const vsrc=f=>typeof Scanner!=="undefined"&&Scanner.asset?Scanner.asset(f):absUrl("vendor/"+f);
+  ocrWorkerPromise=Tesseract.createWorker(want,1,{
+    workerPath:vsrc("tesseract-worker.min.js"),
+    corePath:vsrc("tesseract-core-simd-lstm.wasm.js"),
+    langPath:vsrc("tessdata"),
+    cacheMethod:"none",                  /* our own copy of the data is already local */
+    workerBlobURL:true,
+    logger:()=>{},
+    /* Tables lose their columns without this: the reader then keeps the gaps
+       between words instead of collapsing them into single spaces. */
+    params:{preserve_interword_spaces:"1", tessedit_pageseg_mode:"6"}
+  }).then(w=>{ ocrWorker=w; return w; })
+    .catch(error=>{ ocrWorkerPromise=null; ocrWorkerLangs=null; throw new Error("The on-device reader could not prepare "+(want==="eng"?"English":want)+". "+(error?.message||"")); });
+  return ocrWorkerPromise;
+}
+/* Words with positions, not just a wall of text: the grid engine needs to know
+   WHERE each word sits before it can rebuild rows and columns.
+   data.words IS the flattened tree, so walking the blocks as well would count
+   every word twice — which doubles the text and destroys the geometry. */
+function ocrWords(data){
+  const out=[];
+  const push=w=>{ if(!w) return; const t=String(w.text||"").trim(); if(!t) return;
+    const b=w.bbox||{}; if(b.x1==null) return;
+    out.push({text:t,x0:b.x0,y0:b.y0,x1:b.x1,y1:b.y1,conf:(w.confidence==null?80:w.confidence)/100}); };
+  if(Array.isArray(data?.words)&&data.words.length){ data.words.forEach(push); return out; }
+  (data?.blocks||[]).forEach(block=>(block.paragraphs||[]).forEach(par=>(par.lines||[]).forEach(line=>(line.words||[]).forEach(push))));
+  return out;
 }
 
 /* ---------- image repair: the part that actually rescues bad photos ---------- */
@@ -3980,11 +4028,11 @@ const scanMatchTeacher = txt => scanBestMatch(txt,state.teachers,t=>[t.name,t.co
 
 /* ---------- OCR engines ---------- */
 async function scanOcrLocal(canvas,onProgress){
-  await ensureTesseract();
-  const res=await Tesseract.recognize(canvas,"eng",{
-    logger:m=>{ if(m.status==="recognizing text"&&onProgress) onProgress(m.progress); }
-  });
-  return { text:res?.data?.text||"", conf:(res?.data?.confidence||0)/100 };
+  const worker=await ensureOcrWorker(Scan.langs||"eng");
+  if(onProgress) worker._onProgress=onProgress;
+  const res=await worker.recognize(canvas);
+  const data=res?.data||{};
+  return { text:data.text||"", conf:(data.confidence||0)/100, words:ocrWords(data) };
 }
 /* Gemini model identifier lives in configuration, not buried in request code. Google
    retires model versions on a schedule (2.0 Flash shut down June 2026), so the app asks
@@ -4086,9 +4134,237 @@ function scanParseTimetable(text){
   return { grid, used };
 }
 
+/* =================================================================================
+   Offline document reader — vendor/scanner.js
+   Spreadsheets are read as real cells (no OCR at all), PDFs with a text layer are
+   read from their own text with positions, and rows/columns are recovered from
+   WHERE words sit rather than from line breaks. Everything runs from files saved
+   in ./vendor, so a school with no internet can still import its timetable.
+   ================================================================================= */
+let scannerPromise=null;
+function ensureScanner(){
+  if(typeof Scanner!=="undefined") return Promise.resolve();
+  if(!scannerPromise) scannerPromise=loadScriptOnce("vendor/scanner.js",()=>typeof Scanner!=="undefined")
+    .catch(err=>{ scannerPromise=null; throw new Error("The file reader could not start on this device. "+(err?.message||"")); });
+  return scannerPromise;
+}
+function scanCtx(){
+  return {
+    periodsPerDay:state.settings.periodsPerDay,
+    daysPerWeek:state.settings.daysPerWeek,
+    matchSubject:t=>{ const m=scanMatchSubject(t); return {item:m.item,score:m.score}; },
+    matchTeacher:t=>{ const m=scanMatchTeacher(t); return {item:m.item,score:m.score}; }
+  };
+}
+function scanKindOf(file){
+  if(typeof Scanner==="undefined"){           /* engine not loaded yet: classify by name */
+    const n=(file?.name||"").toLowerCase();
+    if(/\.pdf$/.test(n)) return "pdf";
+    if(/\.(xlsx|xlsm|xls|csv|tsv|ods)$/.test(n)) return "sheet";
+    if((file?.type||"").startsWith("image/")) return "image";
+    return "unknown";
+  }
+  return Scanner.classifyFile(file);
+}
+/* One page of a PDF, drawn to a canvas — only needed when the PDF is a scan. */
+async function scanRenderPdfPage(pdfDoc,num){
+  const page=await pdfDoc.getPage(num);
+  const base=page.getViewport({scale:1});
+  const scale=Math.min(3,Math.max(2,1650/(base.width||700)));
+  const viewport=page.getViewport({scale});
+  const canvas=document.createElement("canvas");
+  canvas.width=Math.ceil(viewport.width); canvas.height=Math.ceil(viewport.height);
+  const g=canvas.getContext("2d",{willReadFrequently:true});
+  await page.render({canvasContext:g,viewport}).promise;
+  return canvas;
+}
+async function scanLoadDoc(file,kind){
+  await ensureScanner();
+  if(kind==="sheet"){
+    const book=await Scanner.readSheetFile(file);
+    if(!book.sheets.length) throw new Error("That spreadsheet looks empty — no readable cells were found in any sheet.");
+    return { kind:"sheet", name:file.name, sheets:book.sheets, sheetIndex:0 };
+  }
+  Scan.status="Opening the PDF…"; Store.requestRender();
+  const pdf=await Scanner.readPdfFile(file,(p,total)=>{
+    Scan.status=`Reading page ${p} of ${total}…`;
+    Scan.progress=Math.min(72,8+(p/(total||1))*64); Store.requestRender();
+  });
+  return { kind:"pdf", name:file.name, pdfDoc:pdf.document, pages:pdf.pages,
+    numPages:pdf.numPages, needsOcr:pdf.needsOcr,
+    page:pdf.best?pdf.best.page:(pdf.pages[0]?.page||1) };
+}
+/* A scanned PDF has no text layer at all, so draw its pages and read the pixels. */
+async function scanPdfOcr(){
+  const d=Scan.doc;
+  if(!d||!d.pdfDoc) return null;
+  const total=Math.min(3,d.numPages);
+  let best=null;
+  for(let n=1;n<=total;n++){
+    Scan.status=`That PDF is a scan — reading page ${n} of ${total} as a picture…`;
+    Scan.progress=Math.min(78,40+n*(36/total)); Store.requestRender();
+    let here=null;
+    try{
+      const page=await scanRenderPdfPage(d.pdfDoc,n);
+      /* A scanned page is just a photo of paper, so it gets the same repair
+         (deskew, contrast, upscale) as a camera photo — and, exactly like the
+         camera path, several versions are read and the one that produces the
+         most REAL lessons wins. Characters alone are a poor judge: binarising a
+         faint scan often yields more text and less truth. */
+      const built=scanBuildVariants(page);
+      Scan.prepDataUrl=built.preview.toDataURL("image/jpeg",0.7);
+      const tries=[{label:"original",canvas:page},built.variants[2],built.variants[1],built.variants[0]];
+      for(const v of tries){
+        if(!v||!v.canvas) continue;
+        Scan.status=`Reading page ${n} of ${total} as a picture (${v.label})…`;
+        Store.requestRender();
+        const res=await scanOcrLocal(v.canvas,()=>{});
+        const w=Scanner.cleanOcrWords(res.words||[]).filter(x=>x.text);
+        if(w.length<6) continue;
+        const grid=Scanner.buildGridFromBoxes(w,{});
+        const model=grid?Scanner.interpretGrid(grid,{daysPerWeek:state.settings.daysPerWeek}):null;
+        const out=model&&model.recognised?Scanner.gridToTimetable(model,scanCtx()):null;
+        const cand={ kind:"ocr", page:n, words:w, text:res.text||"", grid, conf:res.conf,
+          matched:out?out.report.matched:0, chars:w.reduce((a,x)=>a+x.text.length,0) };
+        if(!here||cand.matched>here.matched||(cand.matched===here.matched&&cand.chars>here.chars)) here=cand;
+        if(here.matched>=15) break;
+      }
+    }catch(err){ if(n===1) throw err; continue; }
+    if(!here) continue;
+    if(!best||here.matched>best.matched||(here.matched===best.matched&&here.chars>best.chars)) best=here;
+  }
+  return best;
+}
+/* The grid currently selected in the review step (a sheet or a PDF page). */
+function scanPickedGrid(){
+  const d=Scan.doc; if(!d) return null;
+  if(d.kind==="sheet") return (d.sheets[d.sheetIndex||0]||d.sheets[0]||{}).grid||null;
+  if(d.kind==="pdf"){ const p=d.pages.find(x=>x.page===d.page)||d.pages[0]; return p?p.grid:null; }
+  if(d.kind==="ocr") return d.grid||null;
+  return null;
+}
+function scanDocLines(){
+  const d=Scan.doc; if(!d) return Scan.rawText||"";
+  if(d.kind==="sheet"){
+    const g=scanPickedGrid();
+    return g?Scanner.linesFromGrid(g).join("\n"):"";
+  }
+  if(d.kind==="pdf"||d.kind==="ocr"){
+    if(d.words||d.kind==="ocr") return d.text||"";
+    return d.pages.map(p=>Scanner.linesFromGrid(p.grid||{cells:[]}).join("\n")).filter(Boolean).join("\n");
+  }
+  return Scan.rawText||"";
+}
+/* How many distinct day names appear in a grid? A sheet that never mentions a
+   day is not a timetable, and guessing one would be worse than saying so. */
+function scanDayHits(grid,text){
+  const seen=new Set();
+  const scan=t=>{ const d=Scanner.dayIndexFromText(t); if(d!==-1) seen.add(d); };
+  if(grid&&grid.cells) grid.cells.forEach(row=>row.forEach(scan));
+  else String(text||"").split(/[\n|,;\t]/).forEach(scan);
+  return seen.size;
+}
+/* Lessons currently sitting in the review grid (edited by hand or read). */
+function scanFilled(){
+  let n=0; (Scan.grid||[]).forEach(row=>row.forEach(c=>{ if(c&&c.subjectId) n++; })); return n;
+}
+/* A blank timetable grid sized to the school's own settings. */
+function scanBlankGrid(){
+  return Array.from({length:state.settings.periodsPerDay},()=>Array.from({length:state.settings.daysPerWeek},()=>null));
+}
+/* Re-read the loaded document through the chosen mode. Used on import and also
+   when the user switches sheet or page in the review step. */
+function scanConvert(){
+  Scan.rows=[]; Scan.grid=null; Scan.report=null;
+  if(Scan.mode==="teachers"){ Scan.rawText=scanDocLines()||""; Scan.rows=scanParseTeachers(Scan.rawText); return; }
+  if(Scan.mode==="subjects"){ Scan.rawText=scanDocLines()||""; Scan.rows=scanParseSubjects(Scan.rawText); return; }
+  if(Scan.mode!=="timetable"){ Scan.rawText=scanDocLines()||""; return; }
+
+  if(!Scan.classId||!C(Scan.classId)) Scan.classId=state.ui.activeClassId||state.classes[0]?.id||null;
+  const grid=scanPickedGrid();
+  const model=grid?Scanner.interpretGrid(grid,{daysPerWeek:state.settings.daysPerWeek}):null;
+  const out=model&&model.recognised?Scanner.gridToTimetable(model,scanCtx()):null;
+  if(out&&out.report.matched>0){
+    Scan.grid=out.grid; Scan.report=out.report; Scan.orientation=model.orientation;
+    Scan.rawText=Scanner.linesFromGrid(grid).join("\n"); return;
+  }
+  const text=scanDocLines()||"";
+  Scan.rawText=text;
+  /* Days but no usable geometry: the old line-by-line reading still helps. */
+  if(scanDayHits(grid,text)>=3){
+    const r=scanParseTimetable(text);
+    if(r.used>0){
+      Scan.grid=r.grid; Scan.orientation="days-cols";
+      Scan.report={placed:r.used,matched:r.used,unmatched:[],fallback:true}; return;
+    }
+  }
+  /* Nothing that looks like a week: show the text and say so, do not invent a grid. */
+  Scan.grid=out?out.grid:scanBlankGrid();
+  Scan.report={placed:0,matched:0,unmatched:[],noTimetable:true};
+}
 /* ---------- orchestration ---------- */
 async function scanRun(file){
+  if(!file) return;
+  const kind=scanKindOf(file);
+  if(kind==="unknown"){
+    Scan.error="I can't read that kind of file. Use a photo, a PDF, or an Excel / CSV / ODS sheet.";
+    Store.requestRender(); return;
+  }
+  if(kind==="image") return scanRunPhoto(file);
+  return scanRunDoc(file,kind);
+}
+async function scanRunDoc(file,kind){
+  Scan.busy=true; Scan.error=""; Scan.progress=3; Scan.step="processing";
+  Scan.doc=null; Scan.docName=file.name||"file"; Scan.page=1; Scan.sheetIndex=0;
+  Scan.rows=[]; Scan.grid=null; Scan.report=null; Scan.rawText=""; Scan.prepDataUrl="";
+  Scan.status=kind==="sheet"?"Reading the spreadsheet…":"Reading the PDF…";
+  Store.requestRender();
+  try{
+    Scan.doc=await scanLoadDoc(file,kind);
+    if(kind==="pdf"&&Scan.doc.needsOcr){
+      const ocr=await scanPdfOcr();
+      if(ocr){
+        Scan.doc.kind="ocr"; Scan.doc.page=ocr.page; Scan.doc.grid=ocr.grid;
+        Scan.doc.words=ocr.words; Scan.doc.text=ocr.text; Scan.confidence=ocr.conf;
+        Scan.usedEngine="ocr";
+      } else {
+        Scan.usedEngine="text";
+        throw new Error("That PDF has no text in it and nothing readable could be found on its pages. Try a clearer scan or upload pictures of the timetable instead.");
+      }
+    } else {
+      Scan.usedEngine=kind==="sheet"?"sheet":"text";
+    }
+    Scan.status="Working out the layout…"; Scan.progress=82; Store.requestRender();
+    await new Promise(r=>setTimeout(r,16));
+    scanConvert();
+    Scan.progress=100; Scan.step=(Scan.mode==="text"&&!Scan.rawText.trim())?"capture":"review";
+    Scan.status=""; Scan.stats=null;
+  }catch(err){
+    Scan.error=err?.message||"That file could not be read."; Scan.step="capture";
+  }finally{
+    Scan.busy=false; Store.requestRender();
+  }
+}
+/* How many real lessons a reader result would place in the timetable. Used to
+   choose between repaired versions of the same photo. */
+function scanLessonsIn(res){
+  try{
+    const words=Scanner.cleanOcrWords(res.words||[]).filter(w=>w.text);
+    if(!res._lessons) res._lessons=0;
+    if(words.length<8) return res._lessons;
+    const g=Scanner.buildGridFromBoxes(words,{});
+    const model=g?Scanner.interpretGrid(g,{daysPerWeek:state.settings.daysPerWeek}):null;
+    if(!model||!model.recognised) return res._lessons;
+    const out=Scanner.gridToTimetable(model,scanCtx());
+    res._lessons=out.report.matched; res._grid=g;
+    return res._lessons;
+  }catch(_){ return 0; }
+}
+/* The camera path: repair the photo, run the on-device reader, then use word
+   positions to rebuild the timetable grid where possible. */
+async function scanRunPhoto(file){
   Scan.busy=true; Scan.error=""; Scan.progress=2; Scan.step="processing";
+  Scan.doc=null; Scan.docName=file.name||"photo"; Scan.report=null;
   Scan.status="Reading the photo…"; Store.requestRender();
   try{
     const img=await scanLoadImage(file);
@@ -4116,10 +4392,18 @@ async function scanRun(file){
           Store.requestRender();
         }); }catch(err){ if(i===0&&built.variants.length===1) throw err; continue; }
         tries++;
-        const score=res.conf*0.6 + Math.min(1,scanCleanLines(res.text).length/14)*0.4;
-        const bestScore=best.conf*0.6 + Math.min(1,scanCleanLines(best.text).length/14)*0.4;
+        /* Judged by what it actually achieves: for a timetable that means real
+           lessons, not characters or raw confidence. A brighter repair can read
+           more text and place fewer lessons, and the previous scoring picked it
+           every time. */
+        let score=res.conf*0.6 + Math.min(1,scanCleanLines(res.text).length/14)*0.4;
+        let bestScore=best.conf*0.6 + Math.min(1,scanCleanLines(best.text).length/14)*0.4;
+        if(Scan.mode==="timetable"&&typeof Scanner!=="undefined"){
+          score=scanLessonsIn(res)*10 + score;
+          bestScore=(best._lessons||0)*10 + bestScore;
+        }
         if(score>bestScore) best=res;
-        if(res.conf>0.86) break;                 /* already clean — stop burning battery */
+        if(res.conf>0.86 || (best._lessons||0)>=15) break;   /* already clean / complete */
       }
     }
     if(!best.text.trim()) throw new Error("Nothing readable was found. Try better light, hold straighter, or switch to the AI engine.");
@@ -4132,8 +4416,29 @@ async function scanRun(file){
     if(Scan.mode==="teachers") Scan.rows=scanParseTeachers(best.text);
     else if(Scan.mode==="subjects") Scan.rows=scanParseSubjects(best.text);
     else if(Scan.mode==="timetable"){
-      const r=scanParseTimetable(best.text); Scan.grid=r.grid;
       if(!Scan.classId||!C(Scan.classId)) Scan.classId=state.ui.activeClassId||state.classes[0]?.id||null;
+      /* Words with positions rebuild the grid properly; without them the old
+         line-by-line reading is still used. */
+      const words=Scanner.cleanOcrWords(best.words||[]).filter(w=>w.text);
+      let done=false;
+      if(words.length>=8&&typeof Scanner!=="undefined"){
+        try{
+          const g=Scanner.buildGridFromBoxes(words,{});
+          const model=g?Scanner.interpretGrid(g,{daysPerWeek:state.settings.daysPerWeek}):null;
+          if(model&&model.recognised){
+            const out=Scanner.gridToTimetable(model,scanCtx());
+            if(out.report.matched>0){
+              Scan.grid=out.grid; Scan.report=out.report; Scan.orientation=model.orientation;
+              Scan.doc={kind:"ocr",words,text:best.text,grid:g,conf:best.conf};
+              done=true;
+            }
+          }
+        }catch(err){ done=false; }
+      }
+      if(!done){
+        const r=scanParseTimetable(best.text); Scan.grid=r.grid;
+        Scan.report={placed:r.used,matched:r.used,unmatched:[],fallback:true};
+      }
     }
     Scan.confidence=best.conf;
     Scan.progress=100; Scan.step="review"; Scan.status="";
@@ -4194,6 +4499,7 @@ function scanApply(){
   if(cells) parts.push(cells+" lessons placed");
   toast(parts.length?"success":"info","Scan applied",parts.join(" · ")||"Nothing was selected to import.");
   Scan.step="capture"; Scan.rows=[]; Scan.grid=null; Scan.rawText=""; Scan.prepDataUrl="";
+  Scan.doc=null; Scan.docName=""; Scan.report=null; Scan.page=1; Scan.sheetIndex=0; Scan.stats=null;
 }
 
 /* ---------- scanner UI ---------- */
@@ -4217,18 +4523,42 @@ function renderScanner(){
       <p class="text-xs text-zinc-500 mt-1.5">${esc(Scan.status||"Processing…")}</p>
       <div class="h-2.5 rounded-full bg-zinc-100 overflow-hidden mt-5 max-w-sm mx-auto">
         <div class="h-full rounded-full bg-gradient-to-r from-emerald-500 to-teal-400 transition-all duration-300" style="width:${Math.round(Scan.progress)}%"></div></div>
-      <p class="text-[11px] text-zinc-400 mt-3">A careful scan can take 20–60 seconds on a phone. Leave this screen open.</p>
+      <p class="text-[11px] text-zinc-400 mt-3">${Scan.docName&&/\\.(xlsx|xlsm|xls|csv|tsv|ods|pdf)$/i.test(Scan.docName)?"Large files can take a moment. Leave this screen open.":"A careful scan can take 20–60 seconds on a phone. Leave this screen open."}</p>
       ${Scan.prepDataUrl?`<img src="${Scan.prepDataUrl}" alt="Repaired scan preview" class="mt-5 rounded-xl border border-zinc-200 max-h-64 mx-auto">`:""}
     </div>`;
   } else if(Scan.step==="review"){
+    /* Where the data came from, and — for a workbook or a long PDF — which sheet
+       or page is being read. One tab per grade plus a staff list at the end is
+       the normal shape of a school's spreadsheet. */
+    const src=Scan.doc;
+    const picker=src&&((src.kind==="sheet"&&src.sheets.length>1)||((src.kind==="pdf"||src.kind==="ocr")&&src.numPages>1))?`
+      <div class="card p-4 mt-4 rise">
+        <label class="label">${src.kind==="sheet"?"Which sheet should I use?":"Which page should I use?"}</label>
+        <div class="flex flex-wrap gap-2">
+          ${src.kind==="sheet"
+            ? src.sheets.map((sh,i)=>`<button class="btn ${(src.sheetIndex||0)===i?"btn-soft":"btn-ghost"} !min-h-[38px] !h-9 !px-3 !text-[12px]" data-action="scan-sheet" data-i="${i}">${esc(sh.name)}<span class="opacity-55 ml-1">${sh.filled}</span></button>`).join("")
+            : Array.from({length:src.numPages},(_,i)=>i+1).map(n=>`<button class="btn ${(src.page||1)===n?"btn-soft":"btn-ghost"} !min-h-[38px] !h-9 !px-3 !text-[12px]" data-action="scan-page" data-n="${n}">Page ${n}</button>`).join("")}
+        </div>
+        <p class="text-[11px] text-zinc-400 mt-2 leading-relaxed">${src.kind==="sheet"
+          ? "The number is how many filled cells that sheet has. The busiest sheet is chosen for you."
+          : "Pick the page that holds the timetable."}</p>
+      </div>`:"";
+    const found=Scan.report&&Scan.mode==="timetable"?(Scan.report.noTimetable
+      ? `<div class="text-[11px] text-amber-800 bg-amber-50 border border-amber-200/70 rounded-xl p-3 mt-3 leading-relaxed flex items-start gap-2">
+          <i class="ph-fill ph-warning text-amber-500 mt-0.5 flex-none"></i>
+          <span><b>No day names were found here</b>, so this does not look like a timetable. Pick another sheet above, or choose “Teacher list” / “Just read the text” instead. Nothing will be written to the timetable from this screen.</span></div>`
+      : `<p class="text-[11px] mt-2.5 leading-relaxed ${Scan.report.matched?"text-zinc-500":"text-rose-600 font-semibold"}">
+        ${Scan.report.matched} lesson(s) matched your subjects${Scan.report.unmatched&&Scan.report.unmatched.length?` · ${Scan.report.unmatched.length} cell(s) need a decision — they are marked “?” in the grid`:""}${Scan.report.fallback?" · read line by line, so check the days line up":""}.</p>`):"";
     const head=`<div class="card p-4 flex items-center gap-3 flex-wrap rise">
       <div class="tile bg-emerald-500/10 text-emerald-600"><i class="ph-fill ph-check-circle text-xl"></i></div>
       <div class="flex-1 min-w-[180px]">
-        <div class="font-bold text-sm">Read complete — check before importing</div>
-        <div class="text-[11px] text-zinc-500 mt-0.5">${Scan.stats?`straightened ${esc(Scan.stats.angle)}° · ${Scan.stats.tries} read attempt(s)${Scan.stats.dark?" · dark board mode":""}`:""} · nothing is saved until you press Import</div>
+        <div class="font-bold text-sm">${Scan.doc?"Read successfully — check before importing":"Read complete — check before importing"}</div>
+        <div class="text-[11px] text-zinc-500 mt-0.5">${Scan.doc
+          ? `${esc(Scan.docName)} · ${Scan.usedEngine==="sheet"?"read as a spreadsheet, no guessing":Scan.usedEngine==="ocr"?"scanned PDF, read from the picture":Scan.usedEngine==="text"?"read from the file's own text":"cleaned up and read on this device"}`
+          : Scan.stats?`straightened ${esc(Scan.stats.angle)}° · ${Scan.stats.tries} read attempt(s)${Scan.stats.dark?" · dark board mode":""}`:""} · nothing is saved until you press Import</div>
       </div>
       <button class="btn btn-ghost" data-action="scan-restart"><i class="ph ph-arrow-counter-clockwise"></i>Start over</button>
-    </div>`;
+    </div>${picker}`;
 
     if(Scan.mode==="text"){
       body=head+`<div class="card p-4 mt-4">
@@ -4248,6 +4578,7 @@ function renderScanner(){
         </select>
         <p class="text-[11px] text-amber-700 bg-amber-50 border border-amber-200/70 rounded-xl p-2.5 mt-3 leading-relaxed">
           Importing <b>replaces that class's whole week</b>. Undo (Ctrl+Z) restores it.</p>
+        ${found}
       </div>
       <div class="card overflow-hidden mt-4">
         <div class="overflow-auto" style="max-height:60vh"><table class="ttable">
@@ -4265,7 +4596,7 @@ function renderScanner(){
           </tr>`).join("")}</tbody></table></div>
       </div>
       <div class="flex flex-wrap gap-2.5 mt-4">
-        <button class="btn btn-primary" data-action="scan-apply" ${Scan.classId?"":"disabled"}><i class="ph ph-check"></i>Import into timetable</button>
+        <button class="btn btn-primary" data-action="scan-apply" ${Scan.classId&&scanFilled()?"":"disabled"}><i class="ph ph-check"></i>Import ${scanFilled()?scanFilled()+" lesson(s)":""} into timetable</button>
         <button class="btn btn-ghost" data-action="scan-restart">Cancel</button>
       </div>`;
     } else {
@@ -4349,14 +4680,35 @@ function renderScanner(){
       </div>`:""}
     </div>
 
-    <div class="card p-5 mt-4 text-center">
-      <div class="tile w-16 h-16 rounded-2xl bg-gradient-to-br from-emerald-500/12 to-teal-500/8 text-emerald-600 mx-auto mb-3"><i class="ph ph-camera text-3xl"></i></div>
-      <h3 class="font-display font-bold text-[15px]">Take the photo</h3>
-      <p class="text-xs text-zinc-500 mt-1 max-w-sm mx-auto leading-relaxed">Fill the frame with the chart. Keep the paper flat or stand square to the board. Avoid your own shadow.</p>
-      <div class="flex flex-wrap gap-2.5 justify-center mt-4">
-        <button class="btn btn-primary" data-action="scan-camera"><i class="ph ph-camera"></i>Use camera</button>
-        <button class="btn btn-ghost" data-action="scan-pick"><i class="ph ph-image-square"></i>Choose a photo</button>
+    <div class="card p-5 mt-4">
+      <div class="text-center">
+        <div class="tile w-16 h-16 rounded-2xl bg-gradient-to-br from-emerald-500/12 to-teal-500/8 text-emerald-600 mx-auto mb-3"><i class="ph ph-upload-simple text-3xl"></i></div>
+        <h3 class="font-display font-bold text-[15px]">Upload the file or take the photo</h3>
+        <p class="text-xs text-zinc-500 mt-1 max-w-md mx-auto leading-relaxed">
+          Excel, CSV, PDF, or a picture of the printed chart. The file is read on this device — nothing is uploaded,
+          and it works with no internet after the first visit.</p>
       </div>
+      <div class="grid sm:grid-cols-2 gap-2.5 mt-4">
+        <button class="btn btn-primary" data-action="scan-pick"><i class="ph ph-file-arrow-up"></i>Upload a file</button>
+        <button class="btn btn-ghost" data-action="scan-camera"><i class="ph ph-camera"></i>Use camera</button>
+      </div>
+      <p class="text-[11px] text-zinc-400 text-center mt-3">.xlsx · .xls · .csv · .ods · .pdf · .jpg · .png</p>
+      <div class="grid sm:grid-cols-3 gap-2 mt-4 pt-4 border-t border-zinc-100 text-[11px] text-zinc-500">
+        <div class="flex items-start gap-2"><i class="ph-fill ph-file-xls text-emerald-500 text-base mt-0.5"></i>
+          <span><b class="text-zinc-700">Spreadsheets are read exactly</b> — every sheet, merged cells, messy rows and all.</span></div>
+        <div class="flex items-start gap-2"><i class="ph-fill ph-file-pdf text-rose-500 text-base mt-0.5"></i>
+          <span><b class="text-zinc-700">PDFs</b> are read from their own text; a scanned PDF is recognised as a picture.</span></div>
+        <div class="flex items-start gap-2"><i class="ph-fill ph-image text-sky-500 text-base mt-0.5"></i>
+          <span><b class="text-zinc-700">Photos</b> are cleaned up first, then read on this device.</span></div>
+      </div>
+      ${Scan.mode==="timetable"?`<div class="mt-4 pt-4 border-t border-zinc-100">
+        <label class="label !mb-1.5">Languages on the timetable</label>
+        <div class="flex flex-wrap gap-2">
+          ${[["eng","English"],["eng+sin","English + සිංහල"],["eng+tam","English + தமிழ்"],["eng+sin+tam","All three"]]
+            .map(([id,lbl])=>`<button class="btn ${Scan.langs===id?"btn-soft":"btn-ghost"} !min-h-[38px] !h-9 !px-3 !text-[12px]" data-action="scan-lang" data-lang="${id}">${lbl}</button>`).join("")}
+        </div>
+        <p class="text-[11px] text-zinc-400 mt-2 leading-relaxed">Extra languages make reading slower. The packs are stored on this device, so this still works offline.</p>
+      </div>`:""}
     </div>
 
     <div class="card p-4 mt-4 flex items-start gap-3 bg-sky-50/60 !border-sky-200/70">
@@ -6099,10 +6451,16 @@ const actions={
   /* ---- scanner ---- */
   "scan-mode": el=>{ Scan.mode=el.dataset.mode; Scan.error=""; Store.requestRender(); },
   "scan-engine": el=>{ Scan.engine=el.dataset.engine; Scan.error=""; Store.requestRender(); },
+  "scan-lang": el=>{ Scan.langs=el.dataset.lang; Scan.error="";
+    try{ localStorage.setItem("cf.scanLangs",Scan.langs); }catch(_){}
+    Store.requestRender(); },
+  "scan-sheet": el=>{ if(!Scan.doc) return; Scan.doc.sheetIndex=+el.dataset.i; Scan.page=1; scanConvert(); Store.requestRender(); },
+  "scan-page": el=>{ if(!Scan.doc) return; Scan.doc.page=+el.dataset.n; scanConvert(); Store.requestRender(); },
   "scan-camera": ()=>{ if(needEdit()){ Scan.error=""; $("#scan-cam").click(); } },
   "scan-pick": ()=>{ if(needEdit()){ Scan.error=""; $("#scan-lib").click(); } },
   "scan-restart": ()=>{ Scan.step="capture"; Scan.rows=[]; Scan.grid=null; Scan.rawText="";
-    Scan.prepDataUrl=""; Scan.error=""; Scan.progress=0; Store.requestRender(); },
+    Scan.prepDataUrl=""; Scan.error=""; Scan.progress=0; Scan.doc=null; Scan.docName="";
+    Scan.report=null; Scan.page=1; Scan.sheetIndex=0; Scan.stats=null; Store.requestRender(); },
   "scan-apply": ()=>scanApply(),
   "scan-all": el=>{ const on=el.dataset.on==="1"; Scan.rows.forEach(r=>r.include=on); Store.requestRender(); },
   "scan-copy": async ()=>{
@@ -7284,9 +7642,7 @@ Object.assign(actions,{
   "finder-slot": el=>{ finder.day=+el.dataset.d; finder.period=+el.dataset.p; finder._init=true; openFinder(); }
 });
 Object.assign(changeHandlers,{
-  "scan-file": el=>{ const f=el.files?.[0]; el.value=""; if(!f) return;
-    if(!f.type.startsWith("image/")){ Scan.error="That file is not a photo."; Store.requestRender(); return; }
-    scanRun(f); },
+  "scan-file": el=>{ const f=el.files?.[0]; el.value=""; if(!f) return; scanRun(f); },
   "scan-class": el=>{ Scan.classId=el.value; Store.requestRender(); },
   "scan-row": el=>{ const r=Scan.rows[+el.dataset.i]; if(r){ r.include=el.checked; Store.requestRender(); } },
   "scan-cell": el=>{ const p=+el.dataset.p, d=+el.dataset.d;
