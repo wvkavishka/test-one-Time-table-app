@@ -9,7 +9,7 @@
       cached best-effort so a missing icon can never block the update.
    4. No skipWaiting/claim storm. The new worker waits deliberately; the page prompts for a
       controlled reload at a point that cannot interrupt unsaved work. */
-const VERSION = "cf-shell-v31";
+const VERSION = "cf-shell-v32";
 const CRITICAL = ["./", "./index.html", "./app.css"];
 const OPTIONAL = ["./manifest.webmanifest", "./icon.svg", "./icon"];
 const LIBS = [
@@ -30,8 +30,14 @@ self.addEventListener("install", e => {
   e.waitUntil((async () => {
     const cache = await caches.open(VERSION);
     for (const url of [...CRITICAL, ...LIBS]) {
-      const res = await cache.add(url);
-      if (!res || res.status >= 400) throw new Error("precache failed for " + url);
+      /* cache.add() resolves with undefined (it is Promise<void>) and rejects on a
+         non-2xx or failed fetch — so the status must be checked by catching, not by
+         looking at a return value. The old `if (!res || res.status >= 400)` test was
+         true for every URL, which threw on the first asset and meant this worker
+         never once reached "installed": no offline shell, and the update prompt
+         could never fire. */
+      try { await cache.add(url); }
+      catch (error) { throw new Error("precache failed for " + url + " — " + (error && error.message)); }
     }
     for (const url of OPTIONAL) {
       try { await cache.add(url); } catch (_) { /* optional: missing file must not block install */ }

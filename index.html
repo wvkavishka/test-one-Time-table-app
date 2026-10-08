@@ -5485,7 +5485,9 @@ async function replaceMemberDirect({schoolId,oldUid,email,password,member,form})
 /* The server removes the old Auth account too; the client path cannot, so it is a last resort. */
 async function replaceMemberSecure(args){
   try{
-    await callBackend("replaceMemberLogin",{schoolId:args.schoolId,oldUid:args.oldUid,email:args.email,password:args.password},45000);
+    /* 55s: the callable itself is capped at 60s server-side, so cutting in earlier than
+       that only produces a false timeout on a slow-but-successful replacement. */
+    await callBackend("replaceMemberLogin",{schoolId:args.schoolId,oldUid:args.oldUid,email:args.email,password:args.password},55000);
   }catch(e){
     if(!["functions/unavailable","functions/deadline-exceeded","functions/not-found"].includes(e?.code)) throw e;
     await replaceMemberDirect(args);
@@ -5937,8 +5939,14 @@ const actions={
       confirmLabel:"Remove user", icon:"ph-user-minus" });
     if(!ok) return;
     try{
-      try{ await callBackend("removeMemberAccount",{schoolId:Session.schoolId,memberUid:el.dataset.id},5000); }
-      catch(serverError){ if(!["functions/unavailable","functions/deadline-exceeded"].includes(serverError?.code)) throw serverError;
+      /* 60s, not 5s: a cold-started callable spends several seconds booting before the
+         handler runs, so the old 5s window timed out and fell back almost every time —
+         leaving the Auth account behind. A timeout is also NOT a fallback trigger any
+         more: "deadline-exceeded" means the server may still be finishing, and deleting
+         records on the client at the same moment is what orphaned sign-ins. Only
+         "not deployed" or "unreachable" take the database-only path. */
+      try{ await callBackend("removeMemberAccount",{schoolId:Session.schoolId,memberUid:el.dataset.id},60000); }
+      catch(serverError){ if(!["functions/not-found","functions/unavailable"].includes(serverError?.code)) throw serverError;
         /* Functions are optional hardening. Database removal still revokes all app access;
            the Auth shell can be cleaned later from Firebase Console. */
         const updates={};
@@ -6036,8 +6044,10 @@ const actions={
       confirmLabel:"Delete school", icon:"ph-bomb" });
     if(!ok) return;
     try{
-      try{ await callBackend("deleteSchoolAccount",{schoolId:el.dataset.id},8000); }
-      catch(serverError){ if(!["functions/unavailable","functions/deadline-exceeded"].includes(serverError?.code)) throw serverError;
+      /* Same reasoning as remove-member: 8s was shorter than a cold start, and a timeout
+         must not race the server's own deletion. 75s sits under the function's 120s cap. */
+      try{ await callBackend("deleteSchoolAccount",{schoolId:el.dataset.id},75000); }
+      catch(serverError){ if(!["functions/not-found","functions/unavailable"].includes(serverError?.code)) throw serverError;
         const updates={}; updates[`schools/${el.dataset.id}`]=null;
         memberUids.forEach(uid=>{ updates[`users/${uid}`]=null; });
         await FB.db.ref().update(updates);

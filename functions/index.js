@@ -180,7 +180,14 @@ exports.replaceMemberLogin = onCall({ region: REGION, timeoutSeconds: 60, memory
   const oldSnap = await db.ref(`schools/${schoolId}/members/${oldUid}`).get();
   const member = oldSnap.val();
   if (!member) throw new HttpsError("not-found", "That member no longer exists.");
-  if (member.role === "principal") throw new HttpsError("permission-denied", "The principal login cannot be replaced here.");
+  /* A school admin must not be able to hijack the principal's login, but two legitimate
+     cases exist and the client offers both: the platform owner fixing a principal whose
+     username account cannot receive reset emails, and a principal replacing their own
+     username sign-in (the app's own copy tells them to do it from the Team screen).
+     Blocking those made the button fail with "cannot be replaced here". */
+  if (member.role === "principal" && !isOwner(caller) && caller.uid !== oldUid) {
+    throw new HttpsError("permission-denied", "Only the platform owner can replace another principal's sign-in.");
+  }
 
   const auth = getAuth();
   let user = null;
@@ -196,6 +203,13 @@ exports.replaceMemberLogin = onCall({ region: REGION, timeoutSeconds: 60, memory
     updates[`users/${user.uid}`] = { name: member.name, email, role: member.role, schoolId, active: true, createdAt: now };
     updates[`schools/${schoolId}/members/${oldUid}`] = null;
     updates[`users/${oldUid}`] = null;
+    /* profile/principalUid is written at school creation and validated as immutable by the
+       database rules, so a replaced principal login would otherwise leave it pointing at a
+       deleted Auth account. Keep the record honest (the Admin SDK bypasses those rules). */
+    if (member.role === "principal") {
+      updates[`schools/${schoolId}/profile/principalUid`] = user.uid;
+      updates[`schools/${schoolId}/profile/principalEmail`] = email;
+    }
     await db.ref().update(updates);
   } catch (error) {
     await auth.deleteUser(user.uid).catch(() => {});
