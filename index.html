@@ -3848,7 +3848,10 @@ async function ensureOcrWorker(langs){
     langPath:vsrc("tessdata"),
     cacheMethod:"none",                  /* our own copy of the data is already local */
     workerBlobURL:true,
-    logger:()=>{},
+    logger:m=>{                            /* progress during the read itself */
+      const cb=ocrWorker&&ocrWorker._onProgress;
+      if(cb&&m.status==="recognizing text") cb(m.progress||0);
+    },
     /* Tables lose their columns without this: the reader then keeps the gaps
        between words instead of collapsing them into single spaces. */
     params:{preserve_interword_spaces:"1", tessedit_pageseg_mode:"6"}
@@ -4367,6 +4370,7 @@ async function scanRunPhoto(file){
   Scan.doc=null; Scan.docName=file.name||"photo"; Scan.report=null;
   Scan.status="Reading the photo…"; Store.requestRender();
   try{
+    await ensureScanner();                 /* the geometry reader; cached after the first use */
     const img=await scanLoadImage(file);
     Scan.srcDataUrl="";
     Scan.status="Repairing lighting, angle and contrast…"; Scan.progress=12; Store.requestRender();
