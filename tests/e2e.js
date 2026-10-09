@@ -152,6 +152,16 @@ const failedScreen=html=>/This screen could not open/.test(html);
     check("a non-question does not auto-open the answer card", (doc.getElementById("find-ai")?.innerHTML||"")==="");
   }
   // add-source dialog (the bug the user reported)
+  // Stub the server functions (no network in tests). Mirrors findSheetImport's reply shape.
+  const SHEET_CSV = "Name,Subject\nNimal Perera,Maths\nKamala Silva,Science\n";
+  const stubSheet = () => ({ id:"sheet_abc123_0", label:"Term marks", url:"https://docs.google.com/spreadsheets/d/abc123/edit#gid=0", gid:"0", fetchedAt:Date.now(), rowCount:2, csv:SHEET_CSV });
+  // Stub the server calls at the Find boundary (the Find screen re-wires them on every render,
+  // so the stub is re-applied right before each action that needs it).
+  w.__stubSheet = () => stubSheet();
+  w.__importStub = async (label) => Object.assign(stubSheet(), { label: label });
+  w.__removeStub = async () => ({ ok: true });
+  const useStub = () => T.evalIn("Find.configure({ importSheet: window.__importStub, removeSheet: window.__removeStub })");
+  useStub();
   const addBtn=doc.querySelector('[data-action="find-add-source"]');
   check("Add public sheet button exists", !!addBtn);
   if(addBtn){ click(addBtn); await sleep(20); }
@@ -162,7 +172,9 @@ const failedScreen=html=>/This screen could not open/.test(html);
   check("empty URL keeps the dialog open (validation)", !!doc.getElementById("modal-panel"));
   const urlIn=doc.getElementById("find-src-url");
   if(urlIn){ urlIn.value="https://docs.google.com/spreadsheets/d/abc123/edit#gid=0"; }
-  if(submit){ click(submit); await sleep(80); }
+  const submit2=[...doc.querySelectorAll('[data-action="modal-run"]')].find(b=>/Add/.test(b.textContent));   // re-query: the first click re-rendered the dialog
+  useStub();
+  if(submit2){ click(submit2); await sleep(80); }
   check("valid URL is accepted and saved as a source", T.evalIn("Find.sources().length")>=1, T.evalIn("Find.sources().length"));
   check("the source URL converts to a CSV export", /export\?format=csv&gid=0/.test(T.evalIn("Find.sheetExportUrl(Find.sources()[0].url)")), T.evalIn("Find.sheetExportUrl(Find.sources()[0].url)"));
   // remove it
@@ -320,6 +332,36 @@ const failedScreen=html=>/This screen could not open/.test(html);
     }
     check("Find.search and Assistant survive awkward inputs", bad.length === 0, bad.slice(0,3).join(" | "));
     check("Find.search finds 'nimal' regardless of case", T.evalIn('Find.search("NIMAL", 10).length') === T.evalIn('Find.search("nimal", 10).length') && T.evalIn('Find.search("nimal", 10).length') > 0);
+  }
+
+
+  // 8e) Find sheets: saved once in Firebase, cached on the device, never crash on bad data.
+  {
+    const sid = T.evalIn("Session.schoolId");
+    // a damaged saved list (null entries, wrong types) must not break the Find screen
+    w.localStorage.setItem("find.sources."+sid, JSON.stringify([null, "junk", {id:"bad1", url:5, rows:"nope"}]));
+    T.go("find"); await sleep(40);
+    check("Find opens with damaged saved sheets (no error screen)", !failedScreen(T.viewHtml()) && !!doc.getElementById("find-q"));
+    check("damaged saved sheet is kept safely as a sanitized entry", T.evalIn("Find.sources().length")===1 && T.evalIn("Find.sources()[0].rows.length")===0);
+    // cloud copy arrives: device pulls it and can search it offline
+    T.evalIn("Find.configure({ readCloud:async()=>({ sheet_abc123_0: Object.assign(window.__stubSheet(),{fetchedAt:Date.now()+1000}) }) })");   // device pull
+    const n = await T.evalIn("Find.syncFromCloud()");
+    check("sync pulls the school's sheet to this device", n>=1 && T.evalIn("Find.sources().some(s=>s.id==='sheet_abc123_0')"), "changed="+n);
+    check("sheet data is searchable from the local copy", T.evalIn('Find.search("kamala", 10).length')>0);
+    // a sheet deleted in the cloud disappears locally on the next open
+    T.evalIn("Find.configure({ readCloud:async()=>({}) })");
+    const n2 = await T.evalIn("Find.syncFromCloud()");
+    check("sheet removed in the cloud is dropped locally", n2>=1 && !T.evalIn("Find.sources().some(s=>s.id==='sheet_abc123_0')"));
+    // importing a sheet keeps the local copy and the search index in sync
+    useStub();
+    const src = await T.evalIn("Find.importSheet('Term marks','https://docs.google.com/spreadsheets/d/abc123/edit#gid=0')");
+    check("import stores the CSV on the device", src && typeof src.csv==="string" && src.csv.length>0 && T.evalIn("Find.sources().some(s=>s.id==='sheet_abc123_0' && s.csv.length>0)"));
+    check("import is searchable straight away", T.evalIn('Find.search("science", 10).length')>0);
+    // importing with no backend must fail clearly, not crash
+    T.evalIn("Find.configure({ importSheet:null })");   // (no backend wired)
+    let msg=""; try{ await T.evalIn("Find.importSheet('x','https://docs.google.com/spreadsheets/d/abc123/edit')"); }catch(e){ msg=e.message; }
+    check("import without backend fails with a clear message", /not available/.test(msg), msg);
+    w.localStorage.removeItem("find.sources."+sid);
   }
 
   // 9) errors overall

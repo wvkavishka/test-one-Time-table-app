@@ -758,3 +758,84 @@ exports.deviceKeyList = onCall({ region: REGION, enforceAppCheck: APP_CHECK_ENFO
   });
   return { devices: out };
 });
+
+/* ---------------------------------------------------------------------------
+   Find sheets. Browsers cannot read a Google Sheet directly (Google sends no
+   CORS header), so the server fetches the public CSV once and stores it under
+   the school. Every device then reads the copy from Firebase and caches it, so
+   later searches are instant and work offline.
+   --------------------------------------------------------------------------- */
+const SHEET_MAX_BYTES = 1.5 * 1024 * 1024;
+const SHEET_ID_RE = /^sheet_[A-Za-z0-9_]{1,120}$/;
+
+function parseGoogleSheetUrl(url){
+  const text = String(url || "");
+  const m = text.match(/^https:\/\/docs\.google\.com\/spreadsheets\/d\/([a-zA-Z0-9_-]{10,120})(?=[\/?#]|$)/);
+  if (!m) return null;
+  const g = text.match(/[#?&]gid=(\d{1,12})/);
+  return { sheetId: m[1], gid: g ? g[1] : "0" };
+}
+
+exports.findSheetImport = onCall({ region: REGION, enforceAppCheck: APP_CHECK_ENFORCED, timeoutSeconds: 60, memory: "256MiB" }, async request => {
+  const caller = requireSignedIn(request);
+  const data = request.data || {};
+  const schoolId = clean(data.schoolId, 80);
+  if (!schoolId) throw new HttpsError("invalid-argument", "Missing school.");
+  await assertSchoolMember(caller, schoolId);   // any active member may add a sheet to search
+
+  const parsed = parseGoogleSheetUrl(data.url);
+  if (!parsed) throw new HttpsError("invalid-argument", "That doesn't look like a Google Sheets link.");
+  const label = clean(data.label, 80) || "Sheet";
+  const id = ("sheet_" + parsed.sheetId.replace(/[^A-Za-z0-9]/g, "").slice(0, 60) + "_" + parsed.gid).slice(0, 120);
+  const exportUrl = `https://docs.google.com/spreadsheets/d/${parsed.sheetId}/export?format=csv&gid=${parsed.gid}`;
+
+  let csv;
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 25000);
+    let res;
+    try {
+      res = await fetch(exportUrl, { redirect: "follow", signal: ctrl.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!res.ok) {
+      throw new HttpsError("failed-precondition", `Google returned ${res.status}. Share the sheet as "Anyone with the link can view".`);
+    }
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length > SHEET_MAX_BYTES) {
+      throw new HttpsError("failed-precondition", "That sheet is over 1.5 MB. Keep the rows Find needs in a smaller sheet.");
+    }
+    csv = buf.toString("utf8");
+  } catch (e) {
+    if (e instanceof HttpsError) throw e;
+    throw new HttpsError("unavailable", "Could not reach Google Sheets right now. Try again in a minute.");
+  }
+  if (/^\s*</.test(csv)) {
+    throw new HttpsError("failed-precondition", 'Google sent a web page, not a table. Share the sheet as "Anyone with the link can view".');
+  }
+
+  const rowCount = csv.split(/\r?\n/).filter(line => line.trim()).length - 1;
+  const rec = {
+    label,
+    url: `https://docs.google.com/spreadsheets/d/${parsed.sheetId}/edit#gid=${parsed.gid}`,
+    gid: parsed.gid,
+    fetchedAt: Date.now(),
+    rowCount: Math.max(0, rowCount),
+    importedBy: caller.uid,
+    csv
+  };
+  await getDatabase().ref(`schools/${schoolId}/findSources/${id}`).set(rec);
+  return { id, ...rec };
+});
+
+exports.findSheetRemove = onCall({ region: REGION, enforceAppCheck: APP_CHECK_ENFORCED, timeoutSeconds: 30, memory: "256MiB" }, async request => {
+  const caller = requireSignedIn(request);
+  const data = request.data || {};
+  const schoolId = clean(data.schoolId, 80);
+  const id = clean(data.id, 140);
+  if (!schoolId || !SHEET_ID_RE.test(id)) throw new HttpsError("invalid-argument", "Invalid sheet.");
+  await assertSchoolMember(caller, schoolId);
+  await getDatabase().ref(`schools/${schoolId}/findSources/${id}`).remove();
+  return { ok: true };
+});

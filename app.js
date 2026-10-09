@@ -5324,8 +5324,10 @@ function renderFindResults(){
         <div class="text-[12px] text-zinc-500 line-clamp-2">${esc(h.body||"")}</div>
       </button>`).join("")}</div>`;
 }
+let findSyncing = false;
 async function renderFind(){
   await Promise.allSettled([ensureFind(), ensureAssistant()]);   /* offline first-load must not blank the screen */
+  configureFindCloud();
   const view=$("#view");
   const online=navigator.onLine;
   view.innerHTML=`<div class="space-y-5 view-in">
@@ -5408,6 +5410,22 @@ async function renderFind(){
       ${r.sources&&r.sources.length?`<div class="mt-3 pt-3 border-t border-indigo-100 flex flex-wrap gap-1.5">${r.sources.slice(0,8).map(s=>`<button class="chip !text-[11px] hover:bg-white" data-action="find-jump" data-kind="${esc(s.kind||"")}" data-id="${esc(String(s.id||""))}" data-title="${esc(s.title||"")}">${kindChip(s.kind)} ${esc(s.title||"")}</button>`).join("")}</div>`:""}
     </div>`;
   }
+  // Server-backed sheets: the first import saves the CSV to Firebase; every device then
+  // caches it locally, so searches are instant and work offline.
+  function configureFindCloud(){
+    if(!window.Find || !Session.schoolId) return;
+    const sid = Session.schoolId;
+    Find.configure({
+      importSheet:(label,url)=>callBackend("findSheetImport",{schoolId:sid,label,url},60000),
+      removeSheet:id=>callBackend("findSheetRemove",{schoolId:sid,id},20000),
+      readCloud:async()=>{ const s=await FB.db.ref(`schools/${sid}/findSources`).once("value"); return s.val()||{}; }
+    });
+    if(!FB.ready || findSyncing) return;
+    findSyncing = true;
+    Find.syncFromCloud().then(n=>{
+      if(n){ Find.refresh(); if(Store.raw.ui.route==="find"){ renderFindSources(); renderFindResults(); } }
+    }).catch(e=>console.warn("[Find] sheet sync skipped", e && e.message)).finally(()=>{ findSyncing=false; });
+  }
   function openAddSource(){
     Modal.open({
       title:t("find.addsheet"),
@@ -5420,26 +5438,26 @@ async function renderFind(){
         {label:"Cancel",kind:"ghost",action:()=>Modal.close()},
         {label:"Add & fetch",kind:"primary",action:async()=>{
           const label=$("#find-src-label").value.trim(); const url=$("#find-src-url").value.trim();
-          if(!url){ toast("error","Missing link","Paste a public Google Sheets URL."); throw 0; }
+          if(!url || !Find.sheetExportUrl(url)){ toast("error","Missing link","Paste a Google Sheets link (sharing set to 'Anyone with the link can view')."); throw 0; }
           Modal.close();
-          const src = Find.addSource(label||"Sheet",url);
-          renderFindSources();
-          await refreshSrcObj(src);
+          await sheetImportUi(label||"Sheet", url);
         }}
       ]
     });
   }
-  async function refreshSrcObj(src){
-    const card=document.querySelector(`[data-source-card="${src.id}"]`);
-    if(card) card.querySelector(".src-status").innerHTML=`<span class="spinner"></span> ${esc(t("find.fetching"))}`;
-    const updated = await Find.fetchSource(src);
-    Find.refresh();
-    renderFindSources();
-    renderFindResults();
-    if(updated.error) toast("error","Sheet error",updated.error);
-    else toast("success","Sheet loaded",((updated.rows?.length||1)-1)+" "+t("find.fetched"));
+  async function sheetImportUi(label,url){
+    toast("info","Loading sheet…","Saving it once for everyone in your school. Searches will be instant after this.");
+    try{
+      const src = await Find.importSheet(label,url);
+      Find.refresh();
+      renderFindSources();
+      renderFindResults();
+      toast("success","Sheet saved",(Math.max(0,(src.rows||[]).length-1))+" "+t("find.fetched"));
+    }catch(e){
+      toast("error","Could not load sheet",(e&&e.message)||"Try again in a minute.");
+    }
   }
-  async function refreshSource(id){ const list=Find.sources(); const s=list.find(x=>x.id===id); if(s) await refreshSrcObj(s); }
+  async function refreshSource(id){ const s=Find.sources().find(x=>x.id===id); if(s) await sheetImportUi(s.label,s.url); }
   async function removeSourceUi(id){ if(!confirm("Remove this sheet from Find?")) return; Find.removeSource(id); Find.refresh(); renderFindSources(); renderFindResults(); }
 
   function renderFindSources(){

@@ -2,9 +2,9 @@
    - Local fuzzy search is always available, fully offline.
    - AI answers only when the user adds a Google AI Studio key (same key the
      Scanner already uses) AND they click "Ask AI" — no background calls.
-   - Public Google Sheet URLs are fetched as CSV from the device, parsed into
-     rows, added to the local index. They live in the browser (localStorage per
-     school) so they don't bloat Firebase; refresh is one tap. */
+   - Public Google Sheets are imported ONCE by a server function (browsers cannot
+     read Google Sheets directly). The CSV is stored in the school's Firebase data
+     and cached on each device, so searches are instant and work offline. */
 
 const Find = (()=>{
   const L = (...a)=>console.log("[Find]",...a);
@@ -40,51 +40,96 @@ const Find = (()=>{
   }
 
   // --- sources ---
+  // Sheets are imported ONCE by the server (findSheetImport), which stores the CSV in
+  // Firebase under schools/{sid}/findSources. Every device keeps a local copy so searches
+  // are instant and work offline. Local copies that are damaged are ignored, never crash.
   let _idx = null;
+  let _cloud = { importSheet:null, removeSheet:null, readCloud:null };
+  function configure(c){ _cloud = Object.assign({}, _cloud, c||{}); }
+  function cleanSource(s){
+    if(!s || typeof s!=="object") return null;
+    const id = String(s.id||"");
+    if(!id) return null;
+    return {
+      id,
+      label: String(s.label||"Sheet").slice(0,80) || "Sheet",
+      url: typeof s.url==="string" ? s.url : "",
+      addedAt: Number(s.addedAt)||0,
+      fetchedAt: Number(s.fetchedAt)||0,
+      rows: Array.isArray(s.rows) ? s.rows.filter(r=>Array.isArray(r)) : [],
+      csv: typeof s.csv==="string" ? s.csv : "",
+      rowCount: Number(s.rowCount)||0,
+      error: typeof s.error==="string" ? s.error : ""
+    };
+  }
   function sources(){
-    return safeStore.jsonGet("find.sources."+Session.schoolId, []);
+    let raw;
+    try{ raw = safeStore.jsonGet("find.sources."+Session.schoolId, []); }catch(e){ raw = []; }
+    if(!Array.isArray(raw)) return [];
+    return raw.map(cleanSource).filter(Boolean);
   }
   function saveSources(list){
-    safeStore.jsonSet("find.sources."+Session.schoolId, list);
+    safeStore.jsonSet("find.sources."+Session.schoolId, list.map(cleanSource).filter(Boolean));
   }
-  function addSource(label, url){
-    const list=sources();
-    const id = "src_"+Date.now().toString(36);
-    list.unshift({ id, label:String(label||"").slice(0,80)||"Sheet", url:String(url||"").trim(), addedAt:Date.now(), rows:[], fetchedAt:0, error:"" });
+  function upsertLocal(entry){
+    const list = sources().filter(s=>s.id!==entry.id);
+    list.unshift(cleanSource(entry));
     saveSources(list);
-    return list[0];
+    return cleanSource(entry);
   }
+  // Ask the server to read the Google Sheet, store it in Firebase and return it.
+  async function importSheet(label, url){
+    if(!_cloud.importSheet) throw new Error("Sheet import is not available right now.");
+    const rec = await _cloud.importSheet(String(label||"Sheet"), String(url||"").trim());
+    if(!rec || typeof rec.csv!=="string") throw new Error("The server did not return the sheet data.");
+    const existing = sources().find(s=>s.id===rec.id);
+    return upsertLocal({
+      id: rec.id, label: rec.label||label, url: rec.url||url,
+      addedAt: existing ? existing.addedAt : Date.now(),
+      fetchedAt: rec.fetchedAt||Date.now(), csv: rec.csv,
+      rows: parseCSV(rec.csv), rowCount: rec.rowCount||0, error:""
+    });
+  }
+  function addSource(label, url){ return importSheet(label, url); }
   function removeSource(id){
     saveSources(sources().filter(s=>s.id!==id));
+    if(_cloud.removeSheet && String(id).indexOf("sheet_")===0){
+      Promise.resolve().then(()=>_cloud.removeSheet(id)).catch(e=>L("remove failed",e&&e.message));
+    }
+  }
+  // Pull sheets the school has already imported (newer copies replace local ones).
+  // Sheets deleted in the cloud are dropped locally. Returns the number of changes.
+  async function syncFromCloud(){
+    if(!_cloud.readCloud) return 0;
+    const cloud = await _cloud.readCloud() || {};
+    const list = sources();
+    let changed = 0;
+    const next = list.filter(s=>{
+      if(String(s.id).indexOf("sheet_")!==0) return true;   // legacy local-only entries stay
+      const keep = !!cloud[s.id];
+      if(!keep) changed++;
+      return keep;
+    });
+    for(const [id, rec] of Object.entries(cloud)){
+      if(!rec || typeof rec.csv!=="string") continue;
+      const local = next.find(s=>s.id===id);
+      if(local && (local.fetchedAt||0) >= (Number(rec.fetchedAt)||0) && local.csv===rec.csv) continue;
+      const entry = cleanSource({
+        id, label: rec.label||"Sheet", url: rec.url||"", addedAt: local ? local.addedAt : (Number(rec.fetchedAt)||Date.now()),
+        fetchedAt: Number(rec.fetchedAt)||Date.now(), csv: rec.csv, rows: parseCSV(rec.csv), rowCount: rec.rowCount||0, error:""
+      });
+      const i = next.findIndex(s=>s.id===id);
+      if(i>=0) next[i]=entry; else next.unshift(entry);
+      changed++;
+    }
+    if(changed){ saveSources(next); _idx = null; }
+    return changed;
   }
   function sheetExportUrl(url){
-    // Accept any public Google Sheets URL and return the /export?format=csv link
-    // for the first sheet. "/edit", "/edit#gid=0", "/pubhtml" all accepted.
     const m = String(url||"").match(/docs\.google\.com\/spreadsheets\/d\/([a-zA-Z0-9_-]+)/);
     if(!m) return null;
     const gidm = String(url).match(/gid=(\d+)/);
-    const gid = gidm ? gidm[1] : "0";
-    return `https://docs.google.com/spreadsheets/d/${m[1]}/export?format=csv&gid=${gid}`;
-  }
-  async function fetchSource(src){
-    const csv = sheetExportUrl(src.url);
-    if(!csv){ src.error="That doesn't look like a Google Sheet link."; return src; }
-    try{
-      const r = await fetch(csv, { cache:"no-store" });
-      if(!r.ok) throw new Error("HTTP "+r.status);
-      const text = await r.text();
-      const rows = parseCSV(text);
-      src.rows = rows;
-      src.fetchedAt = Date.now();
-      src.error = "";
-    }catch(e){
-      src.error = "Could not read this sheet ("+(e.message||"link not public")+"). Make sure it is shared as 'Anyone with the link can view'.";
-      src.rows = [];
-    }
-    const all = sources();
-    const i = all.findIndex(s=>s.id===src.id);
-    if(i>=0){ all[i]=src; saveSources(all); }
-    return src;
+    return `https://docs.google.com/spreadsheets/d/${m[1]}/export?format=csv&gid=${gidm?gidm[1]:"0"}`;
   }
   function parseCSV(text){
     const out=[];
@@ -107,7 +152,7 @@ const Find = (()=>{
     return out.filter(r=>r.some(c=>String(c||"").trim().length));
   }
   function sheetRowsToDocs(src){
-    const rows = src.rows||[];
+    const rows = (src.rows && src.rows.length) ? src.rows : parseCSV(src.csv||"");
     if(rows.length<2) return [];
     const headers = rows[0].map(h=>String(h||"").trim());
     const docs=[];
@@ -212,7 +257,7 @@ const Find = (()=>{
   // --- AI call ---
   function refresh(){ _idx = buildDocs(); }
 
-  return { search, sources, addSource, removeSource, fetchSource, refresh, sheetExportUrl, parseCSV, tokens, norm, score };
+  return { search, sources, configure, importSheet, addSource, removeSource, syncFromCloud, refresh, sheetExportUrl, parseCSV, tokens, norm, score };
 })();
 
 window.Find = Find;

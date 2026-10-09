@@ -61,6 +61,14 @@
           }
         },
 
+        /* Find sheets: imported once by the findSheetImport function (server-side, so
+           browsers never need Google CORS access). Any active member can read them to
+           search; only the server writes them. */
+        "findSources": {
+          ".read": "auth != null && root.child('schools/' + $schoolId + '/members/' + auth.uid + '/active').val() === true",
+          ".write": false
+        },
+
         /* Biometric credentials: only the member can read or write their own keys.
            The cloud function runs as admin when it needs to sign a clock-in. */
         "bioCreds": {
