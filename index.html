@@ -4283,10 +4283,45 @@ async function scanOcrSmart(canvas,onProgress){
 /* Gemini model identifier lives in configuration, not buried in request code. Google
    retires model versions on a schedule (2.0 Flash shut down June 2026), so the app asks
    the key holder to confirm the model name instead of promising one forever. */
-const defaultGeminiModel = () => localStorage.getItem("cf.geminiModel") || "gemini-2.5-flash";
+const defaultGeminiModel = () => localStorage.getItem("cf.geminiModel") || "gemini-2.0-flash";
+/* Free-model fallback list, in quality order. If the preferred model returns a
+   404/400 (Google retires versions or your key is on the free tier of a different
+   one), we quietly try the next one before surfacing an error. All four are
+   currently free-tier on Google AI Studio. */
+const FREE_GEMINI_MODELS = ["gemini-2.0-flash","gemini-2.5-flash","gemini-2.0-flash-lite","gemini-2.5-flash-lite"];
+async function callGemini(promptText, opts){
+  let key = (opts?.key || (typeof Scan!=="undefined" && Scan.aiKey) || localStorage.getItem("cf.aiKey") || "").trim();
+  if(!key) throw new Error("Add your Google AI Studio key first (free from aistudio.google.com). Paste it on this screen.");
+  if(!navigator.onLine) throw new Error("AI answers need internet. Local search still works.");
+  const preferred = defaultGeminiModel();
+  const order = [preferred, ...FREE_GEMINI_MODELS.filter(m=>m!==preferred)];
+  let lastErr = null;
+  for(const model of order){
+    try{
+      const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models/"+model+":generateContent",{
+        method:"POST", headers:{"Content-Type":"application/json","x-goog-api-key":key},
+        body: JSON.stringify({ contents:[{ parts:[{text:promptText}] }],
+          generationConfig:{ temperature:opts?.temperature ?? 0.2, maxOutputTokens:opts?.maxTokens ?? 1024 } })
+      });
+      if(r.ok){
+        const j = await r.json();
+        const text = j?.candidates?.[0]?.content?.parts?.map(p=>p.text||"").join("\n")||"";
+        if(text.trim()) return { text, model };
+        lastErr = new Error("Empty response.");
+        continue;
+      }
+      const detail = await r.text().catch(()=>"");
+      if(r.status===400 && /API key/i.test(detail)) throw new Error("That AI key was rejected. Get a free key from aistudio.google.com and paste it below.");
+      if(r.status===429){ lastErr = new Error("Google is rate-limiting the free tier right now — wait a minute or pick a lighter model in Scanner settings."); continue; }
+      if(r.status===404){ lastErr = new Error("Model "+model+" not available on your key, trying the next free model…"); continue; }
+      lastErr = new Error("AI error "+r.status+" from "+model);
+    }catch(e){ lastErr = e; if(String(e.message||"").includes("API key")) throw e; }
+  }
+  throw lastErr || new Error("No free model answered.");
+}
 async function scanOcrAI(canvas,mode){
   const key=Scan.aiKey.trim();
-  if(!key) throw new Error("Add your Google AI Studio key first.");
+  if(!key) throw new Error("Add your free Google AI Studio key below or in Scanner → Settings first.");
   const b64=canvas.toDataURL("image/jpeg",0.9).split(",")[1];
   const ask = mode==="timetable"
     ? "This is a school class timetable. Return ONLY rows of plain text, one line per period, cells separated by | . Preserve empty cells as a single - . No commentary."
@@ -4295,22 +4330,31 @@ async function scanOcrAI(canvas,mode){
     : mode==="teachers"
     ? "This is a school teacher list, possibly handwritten. Return one line per teacher as: Name - Subject, Subject. If subjects are not shown, return just the name. No commentary."
     : "Transcribe all readable text exactly, preserving line breaks. No commentary.";
-  const model=defaultGeminiModel();
-  const r=await fetch("https://generativelanguage.googleapis.com/v1beta/models/"+model+":generateContent",{
-    method:"POST", headers:{"Content-Type":"application/json","x-goog-api-key":key},
-    body:JSON.stringify({ contents:[{ parts:[{text:ask},{inline_data:{mime_type:"image/jpeg",data:b64}}] }],
-      generationConfig:{temperature:0.1} })
-  });
-  if(!r.ok){
-    const detail=await r.text().catch(()=>"");
-    if(r.status===400&&/API key/i.test(detail)) throw new Error("That AI key was rejected. Check it in Google AI Studio.");
-    if(r.status===429) throw new Error("The AI service is rate-limiting. Wait a minute and retry.");
-    throw new Error("AI engine error ("+r.status+").");
+  // Image-in + free-model fallback uses our shared callGemini but we need a direct
+  // fetch because callGemini is text-only; iterate the same free model list.
+  const order = [defaultGeminiModel(), ...FREE_GEMINI_MODELS.filter(m=>m!==defaultGeminiModel())];
+  let lastErr=null;
+  for(const model of order){
+    try{
+      const r=await fetch("https://generativelanguage.googleapis.com/v1beta/models/"+model+":generateContent",{
+        method:"POST", headers:{"Content-Type":"application/json","x-goog-api-key":key},
+        body:JSON.stringify({ contents:[{ parts:[{text:ask},{inline_data:{mime_type:"image/jpeg",data:b64}}] }],
+          generationConfig:{temperature:0.1} })
+      });
+      if(r.ok){
+        const j=await r.json();
+        const text=j?.candidates?.[0]?.content?.parts?.map(p=>p.text||"").join("\n")||"";
+        if(text.trim()) return { text, conf:0.9, model };
+        continue;
+      }
+      const detail=await r.text().catch(()=>"");
+      if(r.status===400&&/API key/i.test(detail)) throw new Error("That AI key was rejected. Check it at aistudio.google.com.");
+      if(r.status===429){ lastErr=new Error("The AI service is rate-limiting. Wait a minute and retry."); continue; }
+      if(r.status===404) continue;
+      lastErr=new Error("AI engine error ("+r.status+").");
+    }catch(e){ lastErr=e; if(String(e.message||"").includes("API key")) throw e; }
   }
-  const j=await r.json();
-  const text=j?.candidates?.[0]?.content?.parts?.map(p=>p.text||"").join("\n")||"";
-  if(!text.trim()) throw new Error("The AI engine returned nothing readable.");
-  return { text, conf:0.9 };
+  throw lastErr || new Error("AI engine returned nothing readable.");
 }
 
 /* ---------- parsing ---------- */
@@ -5524,14 +5568,29 @@ async function renderFind(){
     <div><div class="text-[11px] font-bold uppercase tracking-[.1em] text-indigo-600">CampusFlow search</div>
       <h2 class="font-display font-bold text-2xl sm:text-[28px] tracking-tight mt-0.5">${esc(t("route.find"))}</h2>
       <p class="text-xs text-zinc-500 font-medium mt-1">Search teachers, classes, subjects, lessons, attendance and any linked Google Sheets — or ask a question in plain words.</p></div>
-    <div class="card p-4 sticky top-0 z-20 bg-white/90 backdrop-blur">
-      <div class="flex items-center gap-2">
-        <i class="ph ph-magnifying-glass text-zinc-400 text-xl pl-1"></i>
-        <input id="find-q" class="flex-1 !border-0 !ring-0 !bg-transparent !shadow-none !pl-0 text-[15px]" placeholder="${esc(t("find.placeholder"))}" autocomplete="off" autofocus>
-        <button class="btn btn-primary !h-10 !px-3" data-action="find-ai"><i class="ph-fill ph-sparkle"></i><span class="hidden sm:inline">${esc(t("find.askai"))}</span></button>
+      <div class="card p-4 sticky top-0 z-20 bg-white/90 backdrop-blur">
+        <div class="flex items-center gap-2">
+          <i class="ph ph-magnifying-glass text-zinc-400 text-xl pl-1"></i>
+          <input id="find-q" class="flex-1 !border-0 !ring-0 !bg-transparent !shadow-none !pl-0 text-[15px]" placeholder="${esc(t("find.placeholder"))}" autocomplete="off" autofocus>
+          <button class="btn btn-primary !h-10 !px-3" data-action="find-ai"><i class="ph-fill ph-sparkle"></i><span class="hidden sm:inline">${esc(t("find.askai"))}</span></button>
+        </div>
+        <div id="find-ai"></div>
+        <details class="mt-2 text-[11px] text-zinc-500 ${((Scan.aiKey||"").trim()||localStorage.getItem("cf.aiKey"))?"":"open"}">
+          <summary class="cursor-pointer select-none flex items-center gap-1.5 py-1"><i class="ph-fill ${((Scan.aiKey||"").trim()||localStorage.getItem("cf.aiKey"))?"ph-check-circle text-emerald-500":"ph-key text-indigo-500"}"></i>
+            ${((Scan.aiKey||"").trim()||localStorage.getItem("cf.aiKey"))
+              ? `<span class="font-semibold text-emerald-700">AI key saved on this device (using free <span class="font-mono">${esc(defaultGeminiModel())}</span>) — click to change</span>`
+              : `<span class="font-semibold text-indigo-700">Paste a free Google AI Studio key to enable AI answers</span>`}
+          </summary>
+          <div class="mt-2 space-y-2">
+            <p class="leading-relaxed">Get a free key from <a class="text-indigo-600 underline" href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a>, paste it here. It stays only on this device (never uploaded, never synced), and the app tries the best free models in order. <b>No billing, no account after the key.</b></p>
+            <div class="flex gap-2">
+              <input id="find-key" class="field font-mono !text-xs flex-1" type="password" placeholder="AIza…" value="${esc((Scan.aiKey||"").trim()||localStorage.getItem("cf.aiKey")||"")}" autocomplete="off">
+              <button class="btn btn-ghost !h-10 !px-3" data-action="find-key-save"><i class="ph ph-check"></i>Save</button>
+              <button class="btn btn-ghost !h-10 !px-3 text-rose-500" data-action="find-key-clear" title="Remove key from this device"><i class="ph ph-trash"></i></button>
+            </div>
+          </div>
+        </details>
       </div>
-      <div id="find-ai"></div>
-    </div>
     <div class="grid lg:grid-cols-3 gap-4">
       <div id="find-results" class="lg:col-span-2 space-y-2"></div>
       <div class="space-y-4">
@@ -5568,6 +5627,8 @@ async function renderFind(){
     if(!b) return;
     const a=b.dataset.action;
     if(a==="find-ai"){ doAi(); }
+    else if(a==="find-key-save"){ saveKey(); }
+    else if(a==="find-key-clear"){ clearKey(); }
     else if(a==="find-add-source"){ openAddSource(); }
     else if(a==="find-refresh"){ refreshSource(b.dataset.id); }
     else if(a==="find-remove"){ removeSourceUi(b.dataset.id); }
@@ -5588,6 +5649,23 @@ async function renderFind(){
     }catch(e){ out.innerHTML=`<div class="mt-3 rounded-xl bg-rose-50 border border-rose-200 p-3 text-[12px] text-rose-700">${esc(e.message||String(e))}</div>`; }
   }
 
+  function saveKey(){
+    const v=($("#find-key")?.value||"").trim();
+    if(!v.startsWith("AIza")){ toast("error","That doesn't look like a Google AI key","Keys start with AIza — get one free at aistudio.google.com/apikey"); return; }
+    Scan.aiKey=v;
+    try{ localStorage.setItem("cf.aiKey",v); }catch(_){}
+    if(document.getElementById("scan-remember-key")) document.getElementById("scan-remember-key").checked=true;
+    toast("success","Key saved on this device","Using free model "+defaultGeminiModel()+". Ask AI is now live.");
+    // re-render the summary line
+    const det=view.querySelector("details"); if(det){ det.open=false; det.querySelector("summary").innerHTML=`<i class="ph-fill ph-check-circle text-emerald-500"></i><span class="font-semibold text-emerald-700">AI key saved on this device (using free <span class="font-mono">${esc(defaultGeminiModel())}</span>) — click to change</span>`; }
+  }
+  function clearKey(){
+    Scan.aiKey="";
+    try{ localStorage.removeItem("cf.aiKey"); }catch(_){}
+    const k=$("#find-key"); if(k) k.value="";
+    toast("info","Key removed from this device","");
+    const det=view.querySelector("details"); if(det){ det.open=true; }
+  }
   function openAddSource(){
     Modal.open({
       title:t("find.addsheet"),
