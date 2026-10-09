@@ -869,13 +869,63 @@ const classFill = cid => {
 };
 /* relief */
 const dayIndexFor = iso => { const j=new Date(iso+"T00:00:00").getDay(); return j===0?-1:j-1; };
-const absRecRead = iso => { const r=state.absences[iso]; if(!r) return { teachers:[], relief:{} }; return r.relief ? r : { ...r, relief:{} }; };
-function absRecWrite(iso){ if(!state.absences[iso]) state.absences[iso]={teachers:[],relief:{}}; const r=state.absences[iso]; if(!r.relief) r.relief={}; if(!Array.isArray(r.teachers)) r.teachers=Object.values(r.teachers||{}); return r; }
-function buildReliefCtx(iso){
+const absRecRead = iso => { const r=state.absences[iso]; if(!r) return { teachers:[], present:[], relief:{}, auto:{} }; const out = r.relief ? {...r} : { ...r, relief:{} }; if(!out.auto) out.auto={}; if(!Array.isArray(out.present)) out.present=[]; if(!Array.isArray(out.teachers)) out.teachers=Object.values(out.teachers||{}); return out; };
+function absRecWrite(iso){ if(!state.absences[iso]) state.absences[iso]={teachers:[],present:[],relief:{},auto:{}}; const r=state.absences[iso]; if(!r.relief) r.relief={}; if(!r.auto) r.auto={}; if(!Array.isArray(r.present)) r.present=[]; if(!Array.isArray(r.teachers)) r.teachers=Object.values(r.teachers||{}); return r; }
+/* Automatic absence detection from biometric attendance. A teacher is considered
+   auto-absent for relief purposes when they have at least one lesson today AND
+   their first lesson has already started (first-bell minutes for their earliest
+   slot) AND they have not clocked in today. Principals can still override any
+   row — manual marks (presence forced present, or manually marked absent) win. */
+const ATT_GRACE_MIN = 10;
+function reliefAutoAbsent(iso, attDay){
+  if(!attDay) return { autoIds:[], forcedPresent:new Set(), forcedAbsent:new Set() };
+  const byMember = attDay.byMember||{};
+  const dayIdx = dayIndexFor(iso);
+  if(dayIdx<0) return { autoIds:[], forcedPresent:new Set(), forcedAbsent:new Set() };
+  const now = new Date(); const todayKey = now.toISOString().slice(0,10);
+  if(iso !== todayKey) return { autoIds:[], forcedPresent:new Set(), forcedAbsent:new Set() }; // auto only runs for today
+  const minutesNow = now.getHours()*60 + now.getMinutes();
+  const autoIds=[];
+  const forcedPresent = new Set(); // teachers who tapped "mark present" / clocked in despite being late
+  const forcedAbsent = new Set();  // teachers manually marked absent before bell
+  const rec=absRecRead(iso);
+  (rec.present||[]).forEach(id=>forcedPresent.add(id));
+  (rec.teachers||[]).forEach(id=>forcedAbsent.add(id));
+  Object.entries(byMember).forEach(([uid, mrec])=>{
+    if(!mrec) return;
+    const ev = mrec.events?Object.values(mrec.events):[];
+    ev.sort((a,b)=>(a.at||0)-(b.at||0));
+    const last = ev[ev.length-1];
+    if(last && last.kind==="in") forcedPresent.add(uid);
+  });
+  state.teachers.forEach(t=>{
+    if(forcedPresent.has(t.id)) return;
+    // only auto-mark teachers who actually teach today
+    const slots = slotsOfTeacherOn(t.id,dayIdx);
+    if(!slots.length) return;
+    const firstP = Math.min.apply(null, slots.map(s=>s.p));
+    const startMin = BELL_START + firstP*BELL_STEP + ATT_GRACE_MIN;
+    if(minutesNow >= startMin && !forcedPresent.has(t.id) && !forcedAbsent.has(t.id)){
+      autoIds.push(t.id);
+    }
+  });
+  return { autoIds, forcedPresent, forcedAbsent };
+}
+function reliefEffectiveAbsent(iso, attDay){
+  const rec = absRecRead(iso);
+  const manual = new Set(rec.teachers||[]);
+  const { autoIds, forcedPresent } = reliefAutoAbsent(iso, attDay);
+  const auto = new Set(autoIds.filter(id=>!manual.has(id) && !forcedPresent.has(id)));
+  const combined = new Set([...manual, ...auto]);
+  forcedPresent.forEach(id=>combined.delete(id));
+  return { manual, auto, combined };
+}
+function buildReliefCtx(iso, attDay){
   const abs=absRecRead(iso); const dayIdx=dayIndexFor(iso);
-  const absentSet=new Set(abs.teachers||[]); const taken=new Set();
+  const { combined } = reliefEffectiveAbsent(iso, attDay);
+  const absentSet=combined; const taken=new Set();
   Object.entries(abs.relief||{}).forEach(([k,v])=>{ if(v) taken.add(v+"|"+k.split("|")[1]); });
-  return { abs, dayIdx, absentSet, taken };
+  return { abs, dayIdx, absentSet, taken, autoAbsent: reliefEffectiveAbsent(iso,attDay).auto };
 }
 function reliefCandidates(slot, ctx){
   const cls=C(slot.classId);
@@ -888,11 +938,11 @@ function reliefCandidates(slot, ctx){
   const others = free.filter(t=>!(t.subjectIds||[]).includes(slot.subjectId)).sort((a,b)=>rank(a)-rank(b));
   return { match, others };
 }
-function autoAssignAll(iso){
+function autoAssignAll(iso, attDay){
   const dayIdx=dayIndexFor(iso); if(dayIdx<0||dayIdx>=state.settings.daysPerWeek) return 0;
   const rec=absRecWrite(iso); const taken=new Set(); let assigned=0;
-  const ctx={ dayIdx, absentSet:new Set(rec.teachers||[]), taken };
-  (rec.teachers||[]).forEach(tid=>{
+  const ctx={ dayIdx, absentSet: reliefEffectiveAbsent(iso,attDay).combined, taken, autoAbsent: reliefEffectiveAbsent(iso,attDay).auto };
+  [...ctx.absentSet].forEach(tid=>{
     slotsOfTeacherOn(tid,dayIdx).forEach(slot=>{
       const c=reliefCandidates(slot,ctx); const pick=c.match[0]||null;
       rec.relief[slot.classId+"|"+slot.p+"|"+slot.li]=pick?pick.id:null;
@@ -901,10 +951,10 @@ function autoAssignAll(iso){
   });
   return assigned;
 }
-function autoAssignForTeacher(iso, tid){
+function autoAssignForTeacher(iso, tid, attDay){
   const dayIdx=dayIndexFor(iso); if(dayIdx<0||dayIdx>=state.settings.daysPerWeek) return 0;
-  const rec=absRecWrite(iso); const ctx=buildReliefCtx(iso);
-  ctx.dayIdx=dayIdx; ctx.absentSet=new Set(rec.teachers||[]);
+  const rec=absRecWrite(iso); const ctx=buildReliefCtx(iso,attDay);
+  ctx.dayIdx=dayIdx; ctx.absentSet=reliefEffectiveAbsent(iso,attDay).combined;
   let assigned=0;
   slotsOfTeacherOn(tid,dayIdx).forEach(slot=>{
     const c=reliefCandidates(slot,ctx); const pick=c.match[0]||null;
@@ -2083,12 +2133,44 @@ function renderTeam(){
 }
 
 /* ---------- RELIEF ---------- */
+let _reliefAttRef=null, _reliefAttDay=null;
+function reliefStopListen(){ if(_reliefAttRef){ _reliefAttRef.off("value"); _reliefAttRef=null; } _reliefAttDay=null; }
+async function reliefSubscribeToday(iso){
+  if(!Session.schoolId || !FB.ready){ reliefStopListen(); return null; }
+  const now=new Date(); now.setHours(0,0,0,0); const today=now.toISOString().slice(0,10);
+  if(iso!==today){ reliefStopListen(); return null; }
+  if(_reliefAttRef) return _reliefAttDay;
+  _reliefAttDay=null;
+  _reliefAttRef = FB.db.ref(`schools/${Session.schoolId}/attendance/${today}`);
+  _reliefAttRef.on("value", snap=>{
+    _reliefAttDay=snap.val()||null;
+    if(Store.raw.ui.route==="relief" && state.ui.reliefDate===today){
+      const rec=absRecWrite(today);
+      const { combined } = reliefEffectiveAbsent(today, _reliefAttDay);
+      const taken=new Set(); Object.entries(rec.relief||{}).forEach(([k,v])=>{ if(v) taken.add(v+"|"+k.split("|")[1]); });
+      const ctx={ dayIdx:dayIndexFor(today), absentSet:combined, taken };
+      [...combined].forEach(tid=>{
+        slotsOfTeacherOn(tid,ctx.dayIdx).forEach(slot=>{
+          const key=slot.classId+"|"+slot.p+"|"+slot.li;
+          if(rec.relief[key]) return;
+          const c=reliefCandidates(slot,ctx); const pick=c.match[0]||c.others[0]||null;
+          if(pick){ rec.relief[key]=pick.id; taken.add(pick.id+"|"+slot.p); }
+        });
+      });
+      state.absences[today]=rec;
+      refresh();
+    }
+  });
+  return new Promise(res=>{ const h=snap=>{ _reliefAttDay=snap.val()||null; _reliefAttRef.off("value",h); res(_reliefAttDay); }; _reliefAttRef.on("value",h); });
+}
 function renderRelief(){
   const iso=state.ui.reliefDate;
   const dayIdx=dayIndexFor(iso);
   const validDay=dayIdx>=0 && dayIdx<state.settings.daysPerWeek;
   const abs=absRecRead(iso);
   const edit=canEdit();
+  (async()=>{ const att=await reliefSubscribeToday(iso); paintRelief(att); })();
+  function paintRelief(attDay){
 
   if (!state.teachers.length){
     $("#view").innerHTML=`<div class="max-w-xl mx-auto pt-6">${emptyState("ph-user-switch","No teachers to manage",
@@ -2105,43 +2187,55 @@ function renderRelief(){
     return;
   }
 
-  const absentSet=new Set(abs.teachers||[]);
+  const eff = reliefEffectiveAbsent(iso, attDay);
+  const absentSet = eff.combined;
+  const manualSet = eff.manual, autoSet = eff.auto;
   const affected=[];
-  (abs.teachers||[]).forEach(tid => slotsOfTeacherOn(tid,dayIdx).forEach(slot => affected.push({...slot})));
+  [...absentSet].forEach(tid => slotsOfTeacherOn(tid,dayIdx).forEach(slot => affected.push({...slot,isAuto:autoSet.has(tid)&&!manualSet.has(tid)})));
   const uncovered=affected.filter(s=>!abs.relief[s.classId+"|"+s.p+"|"+s.li]).length;
   const waText=buildWhatsApp(iso);
   const waHref="https://wa.me/?text="+encodeURIComponent(waText);
+  const now=new Date(); now.setHours(0,0,0,0); const todayKey=now.toISOString().slice(0,10);
+  const isToday = iso===todayKey;
+  const autoCount=[...autoSet].filter(id=>slotsOfTeacherOn(id,dayIdx).length).length;
+  const manualCount=manualSet.size;
 
   $("#view").innerHTML=`
   <div class="space-y-4">
     ${reliefHeader(iso, edit)}
+    ${attDay && isToday ? `<div class="card p-3 !bg-violet-50 !border-violet-200 flex items-center gap-2.5 text-[12px] text-violet-900">
+      <i class="ph-fill ph-fingerprint text-violet-600 text-lg"></i>
+      <span class="flex-1"><b>Live from fingerprint attendance.</b> ${autoCount?autoCount+" teacher"+(autoCount===1?"":"s")+" not clocked in by their first bell are marked automatically":""}${autoCount&&manualCount?" · ":" "}${manualCount?manualCount+" manually marked":""}${(!autoCount&&!manualCount)?"Everyone teaching today has clocked in.":""}</span>
+      <span class="flex items-center gap-1 text-[11px] font-bold text-emerald-600"><span class="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>live</span>
+    </div>`:""}
     ${absentSet.size===0 ? emptyState("ph-confetti","Everyone's in today",
-      "No absences recorded for "+fmtDateLong(iso)+(edit?". Flip a switch below to mark a teacher absent — relief is auto-assigned in a blink.":".")) : `
+      (attDay&&isToday?"Fingerprint attendance shows no one missing their first lesson yet. ":"")+"No absences recorded for "+fmtDateLong(iso)+(edit?". Flip a switch below to mark a teacher absent — relief is auto-assigned instantly.":".")) : `
       <div class="grid lg:grid-cols-5 gap-4 items-start">
         <div class="lg:col-span-3 space-y-3">
           <div class="card p-4 flex items-center gap-3 ${uncovered?"!border-amber-200 bg-amber-50/50":"!border-emerald-200 bg-emerald-50/40"}">
             <div class="tile ${uncovered?"bg-amber-500/12 text-amber-600":"bg-emerald-500/12 text-emerald-600"}"><i class="ph-fill ${uncovered?"ph-warning":"ph-shield-check"} text-lg"></i></div>
             <div class="text-[13px] font-semibold ${uncovered?"text-amber-800":"text-emerald-800"}">
-              ${absentSet.size} absent · ${affected.length} period${affected.length!==1?"s":""} affected
+              ${absentSet.size} absent · ${affected.length} period${affected.length!==1?"s":""} affected${autoCount?` · <span class="font-normal text-violet-700">${autoCount} auto from fingerprint</span>`:""}
               ${uncovered?` · <span class="font-bold">${uncovered} still uncovered</span>`:` · <span class="font-bold">fully covered</span>`}
             </div>
           </div>
-          ${(abs.teachers||[]).map(tid=>{
+          ${[...absentSet].map(tid=>{
             const t=T(tid); if(!t) return "";
             const slots=slotsOfTeacherOn(tid,dayIdx);
-            return `<div class="card p-4 rise">
+            const isAuto=autoSet.has(tid)&&!manualSet.has(tid);
+            return `<div class="card p-4 rise ${isAuto?"!border-violet-200 bg-violet-50/30":""}">
             <div class="flex items-center gap-3">
               <div class="tile rounded-xl text-[12px] font-extrabold" style="background:${t.color}1a;color:${t.color}">${esc(t.code||initials(t.name))}</div>
               <div class="flex-1 min-w-0"><div class="font-bold text-[14px] truncate">${esc(t.name)}</div>
-              <div class="text-[11px] text-rose-500 font-bold uppercase tracking-wide">Absent · ${slots.length} lesson${slots.length!==1?"s":""} today</div></div>
-              ${edit?`<button class="icon-btn danger !w-10 !h-10" data-action="absence-off" data-id="${t.id}" aria-label="Mark present"><i class="ph ph-arrow-counter-clockwise"></i></button>`:""}
+              <div class="text-[11px] ${isAuto?"text-violet-600":"text-rose-500"} font-bold uppercase tracking-wide">${isAuto?`<i class="ph-fill ph-fingerprint"></i> NOT CLOCKED IN`:"Absent"} · ${slots.length} lesson${slots.length!==1?"s":""} today</div></div>
+              ${edit?`<button class="icon-btn ${isAuto?"":"danger"} !w-10 !h-10" data-action="${isAuto?"att-manual-present":"absence-off"}" data-id="${t.id}" aria-label="Mark present"><i class="ph ${isAuto?"ph-check-circle":"ph-arrow-counter-clockwise"}"></i></button>`:""}
             </div>
             ${slots.length===0 ? `<p class="text-xs text-zinc-400 italic mt-3 pl-1">No lessons scheduled today — no relief needed.</p>` : `
             <div class="mt-3 space-y-2">
               ${slots.map(slot=>{
                 const key=slot.classId+"|"+slot.p+"|"+slot.li;
                 const stored=abs.relief[key]||"";
-                const ctx=buildReliefCtx(iso);
+                const ctx=buildReliefCtx(iso,attDay);
                 const { match, others }=reliefCandidates(slot,ctx);
                 const rt=stored?T(stored):null;
                 if (rt && !match.some(m=>m.id===rt.id) && !others.some(o=>o.id===rt.id)) match.unshift(rt);
@@ -2178,20 +2272,28 @@ function renderRelief(){
       </div>`}
 
     <div class="card p-5 ${edit?"":"pointer-events-none opacity-80"}">
-      <h3 class="font-display font-bold text-[15px] tracking-tight mb-1 flex items-center gap-2"><i class="ph-fill ph-users-three text-sky-500"></i>Staff attendance · ${esc(DAYS_FULL[dayIdx])}</h3>
-      <p class="text-xs text-zinc-500 mb-4">${edit?"Toggle to mark a teacher absent. Relief is computed instantly against live timetable data.":"Attendance board (read-only)."}</p>
+      <h3 class="font-display font-bold text-[15px] tracking-tight mb-1 flex items-center gap-2"><i class="ph-fill ph-users-three text-sky-500"></i>Staff attendance · ${esc(DAYS_FULL[dayIdx])}${attDay&&isToday?` <span class="text-[11px] font-bold text-violet-600 ml-2"><i class="ph-fill ph-fingerprint"></i> synced with fingerprint attendance</span>`:""}</h3>
+      <p class="text-xs text-zinc-500 mb-4">${edit?"Toggle to mark a teacher absent. When a teacher hasn't clocked in by their first lesson the row turns violet and cover is auto-assigned — flipping the switch overrides it.":"Attendance board (read-only)."}</p>
       <div class="grid sm:grid-cols-2 gap-2">
-        ${state.teachers.map(t=>{ const off=absentSet.has(t.id); const todays=slotsOfTeacherOn(t.id,dayIdx).length;
-          return `<label class="flex items-center gap-3 p-2.5 pl-3 rounded-xl border transition-all ${edit?"cursor-pointer":""} min-h-[52px] ${off?"bg-rose-50/70 border-rose-200":"bg-white border-zinc-200/80 hover:border-zinc-300"}">
+        ${state.teachers.map(t=>{
+          const off=absentSet.has(t.id);
+          const isAuto=autoSet.has(t.id)&&!manualSet.has(t.id);
+          const todays=slotsOfTeacherOn(t.id,dayIdx).length;
+          const me=attDay?.byMember?.[t.id];
+          const stt=me&&window.ATT?ATT.latestStatus(me):{status:"away"};
+          return `<label class="flex items-center gap-3 p-2.5 pl-3 rounded-xl border transition-all ${edit?"cursor-pointer":""} min-h-[52px] ${off?(isAuto?"bg-violet-50/70 border-violet-200":"bg-rose-50/70 border-rose-200"):"bg-white border-zinc-200/80 hover:border-zinc-300"}">
             <input type="checkbox" class="sr-only" data-change="absence-toggle" data-id="${t.id}" ${off?"checked":""} ${edit?"":"disabled"}>
             <span class="switch"></span>
             <div class="tile w-9 h-9 rounded-lg text-[11px] font-extrabold" style="background:${t.color}1a;color:${t.color}">${esc(t.code||initials(t.name))}</div>
-            <div class="min-w-0 flex-1"><div class="text-[13px] font-bold truncate">${esc(t.name)}</div>
-            <div class="text-[10px] font-semibold ${off?"text-rose-500":"text-zinc-400"}">${off?"ABSENT":todays+" lesson"+(todays!==1?"s":"")+" today"}</div></div>
+            <div class="min-w-0 flex-1">
+              <div class="flex items-center gap-1.5"><span class="text-[13px] font-bold truncate">${esc(t.name)}</span>${attDay&&stt.status==="in"?`<i class="ph-fill ph-check-circle text-emerald-500 text-sm" title="clocked in"></i>`:""}</div>
+              <div class="text-[10px] font-semibold ${off?(isAuto?"text-violet-600":"text-rose-500"):"text-zinc-400"}">${off?(isAuto?`<i class="ph-fill ph-fingerprint"></i> NO CLOCK-IN BY FIRST BELL`:"MANUALLY ABSENT"):todays+" lesson"+(todays!==1?"s":"")+" today"}</div>
+            </div>
           </label>`; }).join("")}
       </div>
     </div>
   </div>`;
+  }
 }
 function reliefHeader(iso, edit){
   return `<div class="flex items-center justify-between flex-wrap gap-3">
@@ -2210,17 +2312,19 @@ function reliefHeader(iso, edit){
 function buildWhatsApp(iso){
   const dayIdx=dayIndexFor(iso);
   const abs=absRecRead(iso);
+  const { combined, auto } = reliefEffectiveAbsent(iso,_reliefAttDay);
+  const all=[...combined];
   const L=[];
   L.push("*RELIEF PLAN — "+fmtDateLong(iso).toUpperCase()+"*");
   L.push("_"+(state.settings.schoolName||"CampusFlow")+"_");
   L.push("");
-  if (!(abs.teachers||[]).length){ L.push("No absences today. Full staffing, zero-cover needed."); return L.join("\n"); }
-  L.push("*Absent ("+abs.teachers.length+"):*");
-  abs.teachers.forEach(tid=>{ const t=T(tid); if(t){ const subs=(t.subjectIds||[]).map(sid=>S(sid)?.code).filter(Boolean).join(", "); L.push("• "+t.name+" ("+t.code+")"+(subs?" — "+subs:"")); }});
+  if (!all.length){ L.push("No absences today. Full staffing, zero-cover needed."); return L.join("\n"); }
+  L.push("*Absent ("+all.length+"):*");
+  all.forEach(tid=>{ const t=T(tid); if(t){ const flag=auto.has(tid)?" (not clocked in)":""; const subs=(t.subjectIds||[]).map(sid=>S(sid)?.code).filter(Boolean).join(", "); L.push("• "+t.name+" ("+t.code+")"+flag+(subs?" — "+subs:"")); }});
   L.push("");
   L.push("*Cover schedule:*");
   let any=false, uncovered=0;
-  abs.teachers.forEach(tid=>{
+  all.forEach(tid=>{
     const t=T(tid); if(!t) return;
     slotsOfTeacherOn(tid,dayIdx).forEach(slot=>{
       any=true;
@@ -6127,7 +6231,7 @@ async function signOut(silent=false){
   }
   const unsynced=!!(Sync.pending||Sync.localDirty);
   try { if (FB.ready && FB.auth.currentUser) await FB.auth.signOut(); } catch(_){ /* sign-out is best effort; local state is cleared anyway */ }
-  Sync.detach(); Team.detach(); Admin.detach(); Admin.schools={}; Admin.allUsers={};
+  Sync.detach(); Team.detach(); Admin.detach(); reliefStopListen(); Admin.schools={}; Admin.allUsers={};
   Session.role=null; Session.schoolRole=null; Session.schoolId=null; Session.email=null; Session.uid=null; saveSession();
   /* Shared computers: an explicit sign-out removes this school's offline copy, unless changes
      are still waiting to upload (keeping those is the lesser harm). */
@@ -6698,11 +6802,13 @@ const needSettings = () => { if (canEditSettings()) return true; toast("error","
 const actions={
   "nav": el=>{ const r=el.dataset.route;
     if (r==="admin"){
-      Store.flush();                                      /* still keyed to the school */
+      Store.flush();
       if(Sync.active&&(Sync.pending||Sync.localDirty)) Sync.pushNow();
       Session.schoolId=null; saveSession(); Sync.detach(); Team.detach();
+      reliefStopListen();
       if(isSuper()&&!Admin._sRef) adminSubscribe();
     }
+    if (r!=="relief") reliefStopListen();
     Store.raw.ui.route=r; Store.flush(); Store.requestRender(); Modal.close(); },
   "goto-database": el=>{ if(el?.dataset?.tab) Store.raw.ui.dbTab=el.dataset.tab; Store.raw.ui.route="database"; Store.flush(); Store.requestRender(); },
   "toast-close": el=>{ const t=el.closest(".toast"); t?.classList.add("leaving"); setTimeout(()=>t?.remove(),220); },
@@ -6900,19 +7006,33 @@ const actions={
     const iso=state.ui.reliefDate; const dayIdx=dayIndexFor(iso);
     if (dayIdx<0||dayIdx>=state.settings.daysPerWeek){ toast("error","No school day","Relief cannot be optimized for this date."); return; }
     const rec=absRecRead(iso); if(!(rec.teachers||[]).length){ toast("info","No absences","Mark a teacher absent first."); return; }
-    const n=autoAssignAll(iso);
+    const n=autoAssignAll(iso,_reliefAttDay);
     toast("success","Relief re-optimized", n?n+" cover assignment"+(n!==1?"s":"")+" computed from live availability.":"No free matching teachers found.");
   },
   "absence-off": el=>{
     if(!needEdit()) return;
     const rec=absRecWrite(state.ui.reliefDate); const tid=el.dataset.id;
     rec.teachers=(rec.teachers||[]).filter(x=>x!==tid);
+    rec.present=[...new Set([...(rec.present||[]),tid])];
     const d=dayIndexFor(state.ui.reliefDate);
     Object.keys(rec.relief||{}).forEach(k=>{
       const parts=k.split("|"), li=parts.length===3?(+parts[2]||0):0;
       const L=lessonsOf(getCell(parts[0],d,+parts[1]))[li];
       if (L?.teacherId===tid) delete rec.relief[k];
     });
+  },
+  "att-manual-present": async el=>{
+    if(!needEdit()) return;
+    const tid=el.dataset.id; if(!tid) return;
+    try{
+      if(window.ATT){ await ATT.clockManual("in"); toast("success","Marked present","Recorded as a manual sign-in and removed from auto-absent."); }
+      else {
+        const rec=absRecWrite(state.ui.reliefDate);
+        rec.present=[...new Set([...(rec.present||[]),tid])];
+        rec.teachers=(rec.teachers||[]).filter(x=>x!==tid);
+        toast("success","Marked present","They won't be counted as absent today.");
+      }
+    }catch(e){ toast("error","Could not record", backendMessage(e)); }
   },
   "copy-whatsapp": async ()=>{
     const txt=buildWhatsApp(state.ui.reliefDate);
@@ -7961,7 +8081,7 @@ const changeHandlers={
     const rec=absRecWrite(iso); const tid=el.dataset.id; const t=T(tid);
     if (el.checked){
       if(!rec.teachers.includes(tid)) rec.teachers.push(tid);
-      const n=autoAssignForTeacher(iso,tid);
+      const n=autoAssignForTeacher(iso,tid,_reliefAttDay);
       const slots=dayIdx>=0?slotsOfTeacherOn(tid,dayIdx).length:0;
       if (slots===0) toast("info", t.name+" marked absent","No lessons scheduled that day — nothing to cover.");
       else if (n>0) toast("success","Relief auto-assigned", n+" of "+slots+" period"+(slots!==1?"s":"")+" covered by the best-matched free teachers.");
