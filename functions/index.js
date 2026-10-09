@@ -661,7 +661,7 @@ exports.attendancePush = onRequest({ region: REGION, timeoutSeconds: 30, memory:
     // Look up the key -> { schoolId, label, active }
     const keySnap = await db.ref("deviceKeys").orderByChild("key").equalTo(key).limitToFirst(1).get();
     let found=null;
-    keySnap.forEach(s=>{ found={key:s.key, ...s.val()}; });
+    keySnap.forEach(s=>{ found={ ...s.val(), deviceId:s.key }; });   /* s.val() holds the secret in .key: keep the id separate */
     if(!found||!found.active) return res.status(401).json({error:"invalid device key"});
     const schoolId=found.schoolId;
     const body = req.body && typeof req.body==="object" ? req.body : {};
@@ -686,6 +686,8 @@ exports.attendancePush = onRequest({ region: REGION, timeoutSeconds: 30, memory:
     const evt={ at:nowMs, kind, method:"device", deviceLabel:found.label||"Attendance device", note:clean(body.note,200), via:evRef.key };
     await evRef.set(evt);
     await db.ref(`schools/${schoolId}/attendance/${date}/byMember/${matchedUid}/last`).set({...evt});
+    /* Let the principal see when this device last sent a clock-in (shown as "last seen"). */
+    await db.ref(`deviceKeys/${found.deviceId}/lastSeenAt`).set(Date.now());
     return res.status(200).json({ ok:true, name:matched.name, role:matched.role, kind, at:evt.at });
   }catch(e){
     console.error("attendancePush failed:", e);

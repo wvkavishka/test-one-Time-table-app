@@ -234,6 +234,21 @@ const failedScreen=html=>/This screen could not open/.test(html);
     check("teacher: canViewUsers is false", T.evalIn("canViewUsers()") === false);
   }
 
+  // 8c) Attendance devices (fingerprint machines). With the server offline or the functions
+  // not deployed, the Attendance screen must still render and explain the device problem,
+  // and the principal must see the full setup (URL, header, body) to configure a machine.
+  {
+    T.setRole("principal"); T.go("attendance"); await sleep(400);
+    const attHtml = T.viewHtml();
+    check("attendance renders for principal when devices cannot load", /Attendance devices could not load/.test(attHtml), attHtml.slice(0,120));
+    check("device card points to the one-time deploy command", /firebase deploy --only functions/.test(attHtml));
+    const setup = T.evalIn("deviceSetupHtml()");
+    check("device setup shows the full attendancePush URL", setup.includes("https://asia-south1-mom-school-time-table.cloudfunctions.net/attendancePush"), setup.slice(0,120));
+    check("device setup shows the Bearer header and a JSON body", /Authorization: Bearer/.test(setup) && /staffId/.test(setup));
+    T.setRole("teacher"); T.go("dashboard"); await sleep(150); T.go("attendance"); await sleep(400);
+    check("teacher gets no device card", !/Attendance devices|att-add-device/.test(T.viewHtml()), (T.viewHtml().match(/.{0,60}(Attendance devices|att-add-device).{0,40}/)||[""])[0]);
+  }
+
   // 9) errors overall
   const uncaught=w.__err.filter(x=>/uncaught|TypeError|ReferenceError/.test(x));
   check("no uncaught JS errors during the whole run", uncaught.length===0, uncaught.slice(0,3).join(" | "));

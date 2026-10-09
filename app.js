@@ -405,6 +405,21 @@ const canViewUsers = () => isSuper() || isPrincipal() || App.me?.permissions?.vi
    in the rules, so it must not grant it here either (it would only cause permission_denied). */
 const canReadDayAttendance = () => Session.schoolRole==="principal" || Session.schoolRole==="admin" || App.me?.permissions?.viewUsers === true;
 window.canReadDayAttendance = canReadDayAttendance;
+/* Where the attendance machine must send its clock-ins (the attendancePush function). */
+function attendancePushUrl(){
+  return `https://asia-south1-${firebaseConfig.projectId}.cloudfunctions.net/attendancePush`;
+}
+function deviceSetupHtml(){
+  const url=attendancePushUrl();
+  const sample=JSON.stringify({staffId:"NP",kind:"in"},null,2);
+  return `<div class="space-y-1.5 text-[11px] text-sky-900/80 leading-relaxed">
+    <div><b>1. URL</b> (POST): <code class="font-mono break-all bg-white/60 rounded px-1">${esc(url)}</code></div>
+    <div><b>2. Header</b>: <code class="font-mono break-all bg-white/60 rounded px-1">Authorization: Bearer &lt;device key&gt;</code></div>
+    <div><b>3. Body</b> (JSON): <code class="font-mono whitespace-pre-wrap break-all bg-white/60 rounded px-1 block">${esc(sample)}</code>
+      <span class="text-zinc-500">staffId is the teacher code, the member's sign-in email, or their user id. kind is "in" or "out".</span></div>
+  </div>`;
+}
+
 const canManageUsers = () => isSuper() || isPrincipal();
 const canEditSettings = () => isSuper() || isPrincipal();
 /* Look & colours: principal always; any admin the principal grants editBranding. */
@@ -5004,7 +5019,7 @@ async function renderAttendance(){
   const canManage = isPrincipal() || Session.schoolRole==="admin" || isSuper();
     const mayReadDay = canReadDayAttendance();
   async function paint(){
-    const mine = await ATT.todayForMe();
+    const mine = await ATT.todayForMe().catch(()=>null);   /* offline: show "not in yet" rather than failing the screen */
     const mineStatus = ATT.latestStatus(mine);
     // Registering a fingerprint only makes sense on a device that can actually prompt for one.
     const bio = ATT.hasBiometric();
@@ -5043,7 +5058,9 @@ async function renderAttendance(){
 
     let schoolHtml="";
     if(canManage && mayReadDay){
-      const data = await ATT.todayForSchool();
+      /* A failed read (offline, or rules changed) must not blank the whole screen: the
+         device card below still has to render so the principal can fix the setup. */
+      const data = await ATT.todayForSchool().catch(e=>({ day:null, members:{}, loadErr: backendMessage(e)||e?.message||"unknown error" }));
       const day = data.day;
       const members = data.members;
       const rows = Object.entries(members).filter(([uid,m])=>m && m.active && (m.role==="teacher"||m.role==="staff"||m.role==="admin"))
@@ -5090,6 +5107,7 @@ async function renderAttendance(){
         </div>
         ${await renderAttendanceDevices()}
       </div>`;
+      if(data.loadErr) schoolHtml = `<div class="lg:col-span-2 rounded-xl border border-rose-200 bg-rose-50 p-3 text-[12px] text-rose-800">Today's attendance could not load: ${esc(data.loadErr)}</div>` + schoolHtml;
     } else schoolHtml=`<div class="lg:col-span-2"></div>`;
 
     view.querySelector("#att-body").innerHTML = mineHtml + schoolHtml;
@@ -5142,8 +5160,16 @@ async function renderAttendance(){
 
   async function renderAttendanceDevices(){
     if(!canManage) return "";
-    const r = await callBackend("deviceKeyList",{schoolId:Session.schoolId});
-    const devs=r.devices||[];
+    let devs=[], loadErr="";
+    try{ const r = await callBackend("deviceKeyList",{schoolId:Session.schoolId}); devs=r.devices||[]; }
+    catch(e){ loadErr=backendMessage(e)||"unknown error"; }
+    if(loadErr) return `<div class="card p-5">
+      <h3 class="font-bold text-[15px]"><i class="ph-fill ph-plugs-connected text-sky-500 mr-1"></i>${esc(t("att.devices"))}</h3>
+      <div class="mt-3 rounded-xl border border-rose-200 bg-rose-50 p-3 text-[12px] text-rose-800 leading-relaxed">
+        <b>Attendance devices could not load.</b> ${esc(loadErr)}
+        <div class="mt-1 text-[11px] text-rose-700/80">If this is a new setup, the server functions must be deployed once: <code class="font-mono">firebase deploy --only functions</code>.</div>
+      </div>
+    </div>`;
     return `<div class="card p-5">
       <div class="flex items-center justify-between"><h3 class="font-bold text-[15px]"><i class="ph-fill ph-plugs-connected text-sky-500 mr-1"></i>${esc(t("att.devices"))}</h3>
         <button class="btn btn-ghost !h-8 !px-3 !text-[11px]" data-action="att-add-device"><i class="ph ph-plus"></i>${esc(t("att.adddevice"))}</button></div>
@@ -5156,7 +5182,8 @@ async function renderAttendance(){
         </div>`).join("")}</div>`
         :`<p class="text-[11px] text-zinc-500 mt-3 rounded-xl bg-zinc-50 border border-dashed border-zinc-200 p-3 text-center">${esc(t("att.nokeys"))}</p>`}
       <div class="mt-4 rounded-xl bg-sky-50 border border-sky-200 p-3 text-[11px] text-sky-900/80 leading-relaxed">
-        <b><i class="ph-fill ph-info text-sky-500 mr-1"></i>For a USB fingerprint reader or wall scanner:</b> a small companion app on a PC at reception sends POSTs to <code class="font-mono text-sky-800 bg-white/60 rounded px-1">/attendancePush</code> with the device key, staff id and clock-in time. That feeds this same live list.
+        <b><i class="ph-fill ph-info text-sky-500 mr-1"></i>For a USB fingerprint reader or wall scanner:</b> create a device key above, then set the machine (or its companion app on a PC at reception) to send each clock-in to this address. Clock-ins appear in this live list.
+        <div class="mt-2">${deviceSetupHtml()}</div>
       </div>
     </div>`;
   }
@@ -5181,6 +5208,7 @@ async function renderAttendance(){
               <p class="text-xs text-zinc-600 leading-relaxed">Copy this key now — it is shown exactly once and cannot be recovered.</p>
               <textarea class="field font-mono !text-[11px] h-28" readonly id="att-dev-key">${esc(r.key)}</textarea>
               <p class="text-[11px] text-zinc-500">Device id: <code class="font-mono">${esc(r.deviceId)}</code></p>
+              <div class="rounded-xl bg-sky-50 border border-sky-200 p-3">${deviceSetupHtml()}</div>
             </div>`,
             actions:[
               {label:"Copy",kind:"primary",action:()=>{
