@@ -12,8 +12,8 @@
       at all — not even the part that had already downloaded.)
    4. No skipWaiting/claim storm. The new worker waits deliberately; the page prompts for a
       controlled reload at a point that cannot interrupt unsaved work. */
-const VERSION = "cf-shell-v40";
-const CRITICAL = ["./", "./index.html", "./app.css"];
+const VERSION = "cf-shell-v41";
+const CRITICAL = ["./", "./index.html", "./app.css", "./styles/shell.css", "./app.js"];
 const OPTIONAL = ["./manifest.webmanifest", "./icon.svg", "./icon"];
 const LIBS = [
   "https://www.gstatic.com/firebasejs/10.12.5/firebase-app-compat.js",
