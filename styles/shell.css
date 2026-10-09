@@ -176,7 +176,7 @@
     .chip { font-size:.68rem; padding:.3rem .5rem; }
     .card { border-radius:.85rem; }
     #view { padding-left:.65rem; padding-right:.65rem; }
-    .tab-item { font-size:9px; }
+    .tab-item { font-size:10px; }
     .tab-item i { font-size:1.15rem; }
     .ttable td.cell { min-width:104px; }
     h2.font-display { font-size:1.15rem !important; }
@@ -195,6 +195,12 @@
     .tab-item { min-width:0; overflow:hidden; }
     .tab-item span { display:block; width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   }
+  /* Phone tab bar: every tab keeps a usable width (72px) and the bar scrolls sideways when a
+     principal has many tabs, instead of squeezing the labels into unreadable slivers. */
+  #tabbar { overflow-x:auto; overscroll-behavior-x:contain; scrollbar-width:none; -webkit-overflow-scrolling:touch; }
+  #tabbar::-webkit-scrollbar { display:none; }
+  #tabbar .tab-item { min-width:72px; font-size:10px; }
+  #tabbar .tab-item i { font-size:1.25rem; }
   /* Progressive text sizing: very long school names step down in size instead of truncating */
   #hdr-title.t-lg { font-size:15px; line-height:1.2; }
   #hdr-title.t-xl { font-size:13.5px; line-height:1.2; }

@@ -249,6 +249,29 @@ const failedScreen=html=>/This screen could not open/.test(html);
     check("teacher gets no device card", !/Attendance devices|att-add-device/.test(T.viewHtml()), (T.viewHtml().match(/.{0,60}(Attendance devices|att-add-device).{0,40}/)||[""])[0]);
   }
 
+  // 8c2) Phone tab bar: every tab keeps 72px and the bar scrolls instead of squeezing labels.
+  {
+    T.setRole("principal"); T.go("dashboard"); await sleep(150);
+    const grid = doc.getElementById("tabbar-grid");
+    const n = grid.querySelectorAll(".tab-item").length;
+    check("phone tab bar: one tab per route, min 72px each", n >= 4 && grid.style.minWidth === (n*72)+"px" && grid.style.gridTemplateColumns.includes("minmax(72px"), grid.style.minWidth+" / "+n);
+  }
+
+  // 8d) Find bar: awkward inputs must never throw and must return a list (no blank screen).
+  {
+    const probes = ["", "   ", "(", "*", "[", "\\", "a.b-c", "10A", "p3", "Mathematics", "nimal", "NIMAL", "\u0dc3\u0dd2\u0d82\u0dc4\u0dbd", "\u0b85", "who is free in period 3?", "x".repeat(600), "%%$$##"];
+    const bad = [];
+    for (const q of probes) {
+      try {
+        const hits = T.evalIn("Find.search(" + JSON.stringify(q) + ", 80)");
+        if (!Array.isArray(hits)) bad.push("not array:" + JSON.stringify(q));
+      } catch (e) { bad.push(JSON.stringify(q) + " -> " + e.message); }
+      try { w.Assistant.answer(q); } catch (e) { bad.push("assistant " + JSON.stringify(q).slice(0,20) + " -> " + e.message); }
+    }
+    check("Find.search and Assistant survive awkward inputs", bad.length === 0, bad.slice(0,3).join(" | "));
+    check("Find.search finds 'nimal' regardless of case", T.evalIn('Find.search("NIMAL", 10).length') === T.evalIn('Find.search("nimal", 10).length') && T.evalIn('Find.search("nimal", 10).length') > 0);
+  }
+
   // 9) errors overall
   const uncaught=w.__err.filter(x=>/uncaught|TypeError|ReferenceError/.test(x));
   check("no uncaught JS errors during the whole run", uncaught.length===0, uncaught.slice(0,3).join(" | "));

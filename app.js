@@ -5508,10 +5508,14 @@ function renderNav(){
       <button class="nav-item ${r===id?"active":""}" data-action="nav" data-route="${id}"><i class="ph ${R.icon} text-lg"></i>${label}</button>`;
     }).join("");
   const grid=$("#tabbar-grid");
-  grid.className="grid max-w-md mx-auto";
-  grid.style.gridTemplateColumns=`repeat(${tabs.length},minmax(0,1fr))`;
+  grid.className="grid mx-auto";
+  /* Each tab keeps at least 72px; with many tabs the bar scrolls sideways (see shell.css). */
+  grid.style.gridTemplateColumns=`repeat(${tabs.length},minmax(72px,1fr))`;
+  grid.style.minWidth=`${tabs.length*72}px`;
   grid.innerHTML=tabs.map(id=>{ const R=ROUTES[id];
     return `<button class="tab-item ${r===id?"active":""}" data-action="nav" data-route="${id}"><i class="ph ${R.icon}"></i><span class="truncate max-w-full px-0.5">${id==="admin"&&Session.schoolId?t("tab.admin"):(t("tab."+id)||R.tab)}</span></button>`; }).join("");
+  /* On a scrolling phone tab bar, keep the current tab visible. */
+  grid.querySelector(".tab-item.active")?.scrollIntoView?.({inline:"nearest",block:"nearest"});
   $("#sidebar-footnote").innerHTML=
     langSwitcher("w-full !flex mb-2")+
     (isSuper() && !Session.schoolId
