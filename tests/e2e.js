@@ -192,7 +192,49 @@ const failedScreen=html=>/This screen could not open/.test(html);
   T.raw().ui.route="find"; T.flush();
   check("route persisted to cf.ui.v1", /"route":"find"/.test(w.localStorage.getItem("cf.ui.v1")||""));
 
-  // 8) errors overall
+  // 8) PDF with a text layer is read AND analysed. Regression: the text-layer branch
+  // of scanRunDoc only set the engine name and never ran scanAnalysePages/scanConvert,
+  // so a selectable-text PDF showed an empty result. Uses the real pdf.js library
+  // (dev dependency, same version as vendor/pdf.min.mjs) handed to scanner.js.
+  {
+    const pdfLib = await import('pdfjs-dist/legacy/build/pdf.mjs');
+    w.__cfPdf = pdfLib;                       // scanner.js reuses an already-loaded pdf.js
+    w.eval(read('vendor/scanner.js'));
+    const bytes = fs.readFileSync(path.join(__dirname, 'fixtures', 'timetable-text.pdf'));
+    w.__scanFile = new w.File([bytes], 'timetable-text.pdf', { type: 'application/pdf' });
+    // jsdom's File has no arrayBuffer(); the real browser File does.
+    w.__scanFile.arrayBuffer = async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+    await T.evalIn('scanRunDoc(window.__scanFile, "pdf")');
+    const st = T.evalIn('({pages:Scan.doc&&Scan.doc.pages?Scan.doc.pages.length:0, needsOcr:!!(Scan.doc&&Scan.doc.needsOcr), engine:Scan.usedEngine, raw:Scan.rawText||"", grid:!!Scan.grid, err:Scan.error||"", step:Scan.step})');
+    check("text-layer PDF: pages read from the file", st.pages === 1 && !st.needsOcr, JSON.stringify(st).slice(0, 160));
+    check("text-layer PDF: engine is 'text' and no error", st.engine === 'text' && st.err === '', JSON.stringify(st).slice(0, 160));
+    check("text-layer PDF: content is analysed into rawText or a grid", /Mathematics/.test(st.raw) || st.grid, JSON.stringify(st).slice(0, 160));
+    T.evalIn('Scan.doc=null; Scan.rawText=""; Scan.grid=null; Scan.error=""');
+  }
+
+  // 8b) Attendance is gated by role. A teacher asking who is in gets the refusal, not
+  // the whole-day list (the database only lets principals/admins/viewers read it).
+  {
+    T.setRole("teacher");
+    const tAns = JSON.stringify(w.Assistant.answer("who is in today?"));
+    check("teacher: Assistant refuses the whole-day attendance list", /only visible to the principal and admins/.test(tAns), tAns.slice(0,160));
+    T.setRole("principal");
+    const pAns = JSON.stringify(w.Assistant.answer("who is in today?"));
+    check("principal: Assistant does not give the refusal", !/only visible to the principal and admins/.test(pAns), pAns.slice(0,160));
+    check("principal/teacher gate: canViewUsers true for principal only", T.evalIn("canViewUsers()") === true);
+    // Whole-day attendance follows the database rules exactly (principal, admin, or viewUsers).
+    // Super-admin is NOT in the rules, so it must not pass the client gate either.
+    const dayRead = (role, perms) => { T.setRole(role); if(perms) T.evalIn(`App.me.permissions=${JSON.stringify(perms)}`); return T.evalIn("canReadDayAttendance()"); };
+    check("day-read gate: principal yes", dayRead("principal") === true);
+    check("day-read gate: admin yes", dayRead("admin") === true);
+    check("day-read gate: teacher no", dayRead("teacher") === false);
+    check("day-read gate: teacher with viewUsers yes", dayRead("teacher", { viewUsers: true }) === true);
+    check("day-read gate: superadmin (not in rules) no", dayRead("superadmin") === false);
+    T.setRole("teacher");
+    check("teacher: canViewUsers is false", T.evalIn("canViewUsers()") === false);
+  }
+
+  // 9) errors overall
   const uncaught=w.__err.filter(x=>/uncaught|TypeError|ReferenceError/.test(x));
   check("no uncaught JS errors during the whole run", uncaught.length===0, uncaught.slice(0,3).join(" | "));
 

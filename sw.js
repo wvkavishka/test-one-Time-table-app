@@ -12,7 +12,7 @@
       at all — not even the part that had already downloaded.)
    4. No skipWaiting/claim storm. The new worker waits deliberately; the page prompts for a
       controlled reload at a point that cannot interrupt unsaved work. */
-const VERSION = "cf-shell-v42";
+const VERSION = "cf-shell-v43";
 const CRITICAL = ["./", "./index.html", "./app.css", "./styles/shell.css", "./app.js"];
 const OPTIONAL = ["./manifest.webmanifest", "./icon.svg"];
 const LIBS = [

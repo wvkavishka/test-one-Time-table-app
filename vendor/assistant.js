@@ -130,6 +130,8 @@ const Assistant = (()=>{
     if(/\b(in today|present|attendance|signed in|clocked in|who is in)\b/.test(q.toLowerCase())){
       const k=(window.ATT&&ATT.todayKey)?ATT.todayKey():localDateKey(new Date());
       const day=(state._attendance||{})[k];
+      const mayRead = typeof window.canReadDayAttendance==="function" ? window.canReadDayAttendance() : (typeof canViewUsers==="function" && canViewUsers());
+      if(!mayRead) return result(["Attendance is only visible to the principal and admins."]);
       if(day===undefined) return result(["Today's attendance has not loaded yet. Give it a moment, or open Attendance."]);
       if(!day) return result(["Nobody has clocked in today yet."]);
       const ins=[];

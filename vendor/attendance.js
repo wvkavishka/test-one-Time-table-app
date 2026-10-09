@@ -107,7 +107,12 @@ const ATT = (()=>{
     const r=await FB.db.ref(`schools/${sid()}/attendance/${key}/byMember/${Session.uid}`).once("value");
     return r.val()||null;
   }
+  /* Whole-day reads: the database only allows a principal, an admin or a team viewer
+     (see database.rules.json). For anyone else, return nothing instead of letting the
+     listener fail with permission_denied. */
+  function mayReadDay(){ return typeof window.canReadDayAttendance!=="function" || window.canReadDayAttendance(); }
   async function todayForSchool(){
+    if(!mayReadDay()) return { day:null, members:{}, denied:true };
     const key=todayKey();
     const [evSnap,memSnap] = await Promise.all([
       FB.db.ref(`schools/${sid()}/attendance/${key}`).once("value"),
@@ -127,6 +132,7 @@ const ATT = (()=>{
   }
 
   async function recentDays(days=14){
+    if(!mayReadDay()) return [];
     const out=[]; const base=new Date(); base.setHours(0,0,0,0);
     const refs=[];
     for(let i=0;i<days;i++){ const d=new Date(base); d.setDate(base.getDate()-i); const k=d.toISOString().slice(0,10); refs.push(FB.db.ref(`schools/${sid()}/attendance/${k}/byMember`).once("value").then(s=>({key:k,v:s.val()||{}}))); }

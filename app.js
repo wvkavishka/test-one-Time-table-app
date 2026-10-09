@@ -400,6 +400,11 @@ const isSuper = () => Session.role==="super" || Session.schoolRole==="superadmin
 const isPrincipal = () => Session.schoolRole === "principal";
 const canEdit = () => isSuper() || isPrincipal() || App.me?.permissions?.editWorkspace === true;
 const canViewUsers = () => isSuper() || isPrincipal() || App.me?.permissions?.viewUsers === true;
+/* Mirrors database.rules.json for whole-day attendance: only a principal, an admin or a
+   member with permissions.viewUsers can read it. Super-admin status does not grant this
+   in the rules, so it must not grant it here either (it would only cause permission_denied). */
+const canReadDayAttendance = () => Session.schoolRole==="principal" || Session.schoolRole==="admin" || App.me?.permissions?.viewUsers === true;
+window.canReadDayAttendance = canReadDayAttendance;
 const canManageUsers = () => isSuper() || isPrincipal();
 const canEditSettings = () => isSuper() || isPrincipal();
 /* Look & colours: principal always; any admin the principal grants editBranding. */
@@ -1876,7 +1881,9 @@ function reliefStopListen(){ if(_reliefAttRef){ _reliefAttRef.off("value"); _rel
 async function reliefSubscribeToday(iso){
   if(!Session.schoolId || !FB.ready){ reliefStopListen(); return null; }
   const now=new Date(); now.setHours(0,0,0,0); const today=now.toISOString().slice(0,10);
-  if(iso!==today){ reliefStopListen(); return null; }
+  /* The database only lets principals, admins and team viewers read the whole day.
+     Anyone else would get permission_denied, so they never subscribe to it. */
+  if(iso!==today || !canReadDayAttendance()){ reliefStopListen(); return null; }
   if(_reliefAttRef) return _reliefAttDay;
   _reliefAttDay=null;
   _reliefAttRef = FB.db.ref(`schools/${Session.schoolId}/attendance/${today}`);
@@ -4447,7 +4454,14 @@ async function scanRunDoc(file,kind){
     Scan.doc=await scanLoadDoc(file,kind);
     const cap=scanCapability();
     if(kind!=="pdf") Scan.usedEngine=kind==="sheet"?"sheet":"text";
-    else if(!Scan.doc.needsOcr) Scan.usedEngine="text";
+    else if(!Scan.doc.needsOcr){
+      /* A PDF with a real text layer: read it exactly, then lay it out like any
+         other sheet. (This branch used to only name the engine, so nothing was
+         analysed and the review screen came up empty.) */
+      Scan.usedEngine="text";
+      Scan.status="Working out the layout…"; Scan.progress=82; Store.requestRender();
+      scanAnalysePages(); scanConvert();
+    }
     else {
       /* ---------------------------------------------------------------
          Reading a PDF is a decision, not a single path. Its own text is exact
@@ -4988,6 +5002,7 @@ async function renderAttendance(){
   try{ await ensureAttendance(); }catch(e){ view.querySelector("#att-body").innerHTML=`<div class="card p-6 text-rose-700">${esc(e.message||String(e))}</div>`; return; }
 
   const canManage = isPrincipal() || Session.schoolRole==="admin" || isSuper();
+    const mayReadDay = canReadDayAttendance();
   async function paint(){
     const mine = await ATT.todayForMe();
     const mineStatus = ATT.latestStatus(mine);
@@ -5027,7 +5042,7 @@ async function renderAttendance(){
       </div>`;
 
     let schoolHtml="";
-    if(canManage){
+    if(canManage && mayReadDay){
       const data = await ATT.todayForSchool();
       const day = data.day;
       const members = data.members;
@@ -5227,7 +5242,7 @@ function ensureFind(){
 let _findAttUnsub=null;
 function findStopAttendance(){ if(_findAttUnsub){ _findAttUnsub(); _findAttUnsub=null; } }
 function findListenAttendance(){
-  if(!Session.schoolId||!FB.ready){ findStopAttendance(); return; }
+  if(!Session.schoolId||!FB.ready||!canReadDayAttendance()){ findStopAttendance(); return; }
   if(_findAttUnsub) return;
   state._attendance = state._attendance || {};
   const today = new Date(); today.setHours(0,0,0,0);
