@@ -32,8 +32,12 @@
             ".validate": "newData.isString() && newData.val().length > 0 && newData.val().length < 120"
           },
           "logo": {
-            ".write": "auth != null && (auth.uid === 'FI059sTQ5hXFSAYEqKefDyk3kBw2' || (auth.token.email === 'w.v.k.kalhara@gmail.com' && auth.token.email_verified === true) || root.child('users/' + auth.uid + '/role').val() === 'super' || root.child('users/' + auth.uid + '/role').val() === 'superadmin' || root.child('schools/' + $schoolId + '/members/' + auth.uid + '/role').val() === 'principal')",
+            ".write": "auth != null && (auth.uid === 'FI059sTQ5hXFSAYEqKefDyk3kBw2' || (auth.token.email === 'w.v.k.kalhara@gmail.com' && auth.token.email_verified === true) || root.child('users/' + auth.uid + '/role').val() === 'super' || root.child('users/' + auth.uid + '/role').val() === 'superadmin' || root.child('schools/' + $schoolId + '/members/' + auth.uid + '/role').val() === 'principal' || (root.child('schools/' + $schoolId + '/members/' + auth.uid + '/active').val() === true && root.child('schools/' + $schoolId + '/members/' + auth.uid + '/permissions/editBranding').val() === true))",
             ".validate": "newData.isString() && newData.val().length < 400000 && (newData.val() === '' || newData.val().beginsWith('data:image/png;base64,') || newData.val().beginsWith('data:image/jpeg;base64,') || newData.val().beginsWith('data:image/webp;base64,') || newData.val().beginsWith('data:image/gif;base64,'))"
+          },
+          "brand": {
+            ".write": "auth != null && (auth.uid === 'FI059sTQ5hXFSAYEqKefDyk3kBw2' || (auth.token.email === 'w.v.k.kalhara@gmail.com' && auth.token.email_verified === true) || root.child('users/' + auth.uid + '/role').val() === 'super' || root.child('users/' + auth.uid + '/role').val() === 'superadmin' || root.child('schools/' + $schoolId + '/members/' + auth.uid + '/role').val() === 'principal' || (root.child('schools/' + $schoolId + '/members/' + auth.uid + '/active').val() === true && root.child('schools/' + $schoolId + '/members/' + auth.uid + '/permissions/editBranding').val() === true))",
+            ".validate": "!newData.exists() || newData.val() === null || (newData.isString() && newData.val().length === 7 && newData.val().beginsWith('#'))"
           },
           "principalUid": {
             ".validate": "auth.uid === 'FI059sTQ5hXFSAYEqKefDyk3kBw2' || (auth.token.email === 'w.v.k.kalhara@gmail.com' && auth.token.email_verified === true) || root.child('users/' + auth.uid + '/role').val() === 'super' || root.child('users/' + auth.uid + '/role').val() === 'superadmin' || newData.val() === data.val()"
@@ -52,11 +56,71 @@
           ".read": "auth != null && (auth.uid === 'FI059sTQ5hXFSAYEqKefDyk3kBw2' || (auth.token.email === 'w.v.k.kalhara@gmail.com' && auth.token.email_verified === true) || root.child('users/' + auth.uid + '/role').val() === 'super' || root.child('users/' + auth.uid + '/role').val() === 'superadmin' || (root.child('schools/' + $schoolId + '/profile/status').val() !== 'disabled' && (root.child('schools/' + $schoolId + '/profile/status').val() !== 'trial' || !root.child('schools/' + $schoolId + '/profile/trialEnds').exists() || root.child('schools/' + $schoolId + '/profile/trialEnds').val() >= now) && root.child('schools/' + $schoolId + '/members/' + auth.uid + '/active').val() === true && (root.child('schools/' + $schoolId + '/members/' + auth.uid + '/role').val() === 'principal' || root.child('schools/' + $schoolId + '/members/' + auth.uid + '/permissions/viewUsers').val() === true)))",
           "$memberUid": {
             ".read": "auth != null && (auth.uid === 'FI059sTQ5hXFSAYEqKefDyk3kBw2' || (auth.token.email === 'w.v.k.kalhara@gmail.com' && auth.token.email_verified === true) || root.child('users/' + auth.uid + '/role').val() === 'super' || root.child('users/' + auth.uid + '/role').val() === 'superadmin' || auth.uid === $memberUid)",
-            ".write": "auth != null && (auth.uid === 'FI059sTQ5hXFSAYEqKefDyk3kBw2' || (auth.token.email === 'w.v.k.kalhara@gmail.com' && auth.token.email_verified === true) || root.child('users/' + auth.uid + '/role').val() === 'super' || root.child('users/' + auth.uid + '/role').val() === 'superadmin' || (root.child('schools/' + $schoolId + '/members/' + auth.uid + '/active').val() === true && root.child('schools/' + $schoolId + '/members/' + auth.uid + '/role').val() === 'principal' && $memberUid !== auth.uid && (!newData.exists() || (newData.child('role').val() !== 'principal' && newData.child('role').val() !== 'superadmin'))))",
+            ".write": "auth != null && (auth.uid === 'FI059sTQ5hXFSAYEqKefDyk3kBw2' || (auth.token.email === 'w.v.k.kalhara@gmail.com' && auth.token.email_verified === true) || root.child('users/' + auth.uid + '/role').val() === 'super' || root.child('users/' + auth.uid + '/role').val() === 'superadmin' || (root.child('schools/' + $schoolId + '/members/' + auth.uid + '/active').val() === true && root.child('schools/' + $schoolId + '/members/' + auth.uid + '/role').val() === 'principal' && $memberUid !== auth.uid && (!data.exists() || data.child('role').val() !== 'principal') && (!newData.exists() || (newData.child('role').val() !== 'principal' && newData.child('role').val() !== 'superadmin'))))",
             ".validate": "!newData.exists() || (newData.hasChildren(['name','email','role','active']) && (newData.child('role').val() === 'principal' || newData.child('role').val() === 'admin' || newData.child('role').val() === 'teacher' || newData.child('role').val() === 'staff'))"
+          }
+        },
+
+        /* Find sheets: imported once by the findSheetImport function (server-side, so
+           browsers never need Google CORS access). Any active member can read them to
+           search; only the server writes them. */
+        "findSources": {
+          ".read": "auth != null && root.child('schools/' + $schoolId + '/members/' + auth.uid + '/active').val() === true",
+          ".write": false
+        },
+
+        /* Biometric credentials: only the member can read or write their own keys.
+           The cloud function runs as admin when it needs to sign a clock-in. */
+        "bioCreds": {
+          "$uid": {
+            ".read": "auth != null && auth.uid === $uid",
+            ".write": "auth != null && auth.uid === $uid",
+            "$cid": {
+              ".validate": "!newData.exists() || (newData.hasChildren(['credId','pubJwk','alg','createdAt']) && newData.child('credId').isString() && (newData.child('alg').val() === 'ES256' || newData.child('alg').val() === 'RS256'))"
+            }
+          }
+        },
+
+        /* Short-lived WebAuthn challenges: only the owning UID can read them, and
+           the cloud function (admin) creates and consumes them. */
+        "_challenges": {
+          "$uid": {
+            ".read": "auth != null && auth.uid === $uid",
+            ".write": "auth != null && auth.uid === $uid",
+            "$rid": {
+              ".validate": "!newData.exists() || (newData.hasChildren(['kind','challenge','expiresAt']) && newData.child('challenge').isString())"
+            }
+          }
+        },
+
+        /* Attendance log: members can read the whole day for their school if they
+           are allowed to view users (principal/admin), or only their own record. */
+        "attendance": {
+          "$date": {
+            ".read": "auth != null && (root.child('schools/' + $schoolId + '/members/' + auth.uid + '/active').val() === true && (root.child('schools/' + $schoolId + '/members/' + auth.uid + '/role').val() === 'principal' || root.child('schools/' + $schoolId + '/members/' + auth.uid + '/role').val() === 'admin' || root.child('schools/' + $schoolId + '/members/' + auth.uid + '/permissions/viewUsers').val() === true))",
+            "byMember": {
+              "$uid": {
+                ".read": "auth != null && (root.child('schools/' + $schoolId + '/members/' + auth.uid + '/active').val() === true && (auth.uid === $uid || root.child('schools/' + $schoolId + '/members/' + auth.uid + '/role').val() === 'principal' || root.child('schools/' + $schoolId + '/members/' + auth.uid + '/role').val() === 'admin' || root.child('schools/' + $schoolId + '/members/' + auth.uid + '/permissions/viewUsers').val() === true))",
+                                ".write": false,   /* clock-ins are written only by Cloud Functions (fingerprint, device or manual), never by the browser */
+                "events": {
+                  "$eid": {
+                    ".validate": "!newData.exists() || (newData.hasChildren(['at','kind','method']) && (newData.child('kind').val() === 'in' || newData.child('kind').val() === 'out') && newData.child('at').isNumber())"
+                  }
+                }
+              }
+            }
           }
         }
       }
+    },
+
+    "deviceKeys": {
+      ".indexOn": ["keyHash", "key", "schoolId"],
+      /* Written only by cloud functions (admin). Listed by principal to see what
+         devices are paired. The key itself is only readable by the function in
+         admin mode; principals only see label/schoolId/active/lastSeenAt. */
+      ".read": "auth != null && (auth.uid === 'FI059sTQ5hXFSAYEqKefDyk3kBw2' || (auth.token.email === 'w.v.k.kalhara@gmail.com' && auth.token.email_verified === true) || root.child('users/' + auth.uid + '/role').val() === 'super' || root.child('users/' + auth.uid + '/role').val() === 'superadmin')",
+      ".write": false
     },
 
     "users": {

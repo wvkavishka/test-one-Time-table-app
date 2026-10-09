@@ -1,0 +1,9422 @@
+/* CampusFlow app logic. Loaded as a classic script (same global scope as before). */
+/* =====================================================================================
+   CAMPUSFLOW v3 — Production multi-school OS
+   Cloud model (matches your RTDB rules):
+     schools/$id/profile  { name, logo, principalUid, principalEmail, createdAt }
+     schools/$id/state    { settings, teachers, subjects, classes, timetable, absences, rev, origin, updatedAt }
+     schools/$id/members/$uid { name, email, role: principal|admin|teacher|staff, active, permissions{editWorkspace,viewUsers}, teacherId? }
+     users/$uid           { name, email, role, schoolId, active }
+   Super admin UID is platform-hardcoded (mirrors the rules).
+   ===================================================================================== */
+"use strict";
+
+/* Platform Super Admin / Owner. This must match database.rules.json exactly. */
+const SUPER_UID = "FI059sTQ5hXFSAYEqKefDyk3kBw2";
+const SUPER_EMAIL = "w.v.k.kalhara@gmail.com";
+const isSuperAdminUser = u => !!u && u.uid === SUPER_UID;
+
+const firebaseConfig = {
+  apiKey: "AIzaSyB6tI4WVkVlSvllDa7CwwU2K43nyYaUMmE",
+  authDomain: "mom-school-time-table.firebaseapp.com",
+  databaseURL: "https://mom-school-time-table-default-rtdb.firebaseio.com",
+  projectId: "mom-school-time-table",
+  storageBucket: "mom-school-time-table.firebasestorage.app",
+  messagingSenderId: "167617265914",
+  appId: "1:167617265914:web:9dffed3f72298a15d80943",
+  measurementId: "G-76940M54L3"
+};
+/* App Check proves that requests come from this web app, not from a script.
+   Set this to the reCAPTCHA v3 site key from Firebase console > App Check (it is a public value).
+   Until it is set, App Check stays off and the app works exactly as before. Steps are in AUDIT.md. */
+const APP_CHECK_SITE_KEY = "";
+let FB = { ready:false, auth:null, db:null, functions:null };
+try {
+  firebase.initializeApp(firebaseConfig);
+  if (APP_CHECK_SITE_KEY && firebase.appCheck) {
+    firebase.appCheck().activate(APP_CHECK_SITE_KEY, true);
+  }
+  FB.auth = firebase.auth();
+  FB.db = firebase.database();
+  FB.ready = true;
+} catch(e) { console.warn("Firebase init failed.", e); }
+
+/* ================= HELPERS ================= */
+const $  = (s, r=document) => r.querySelector(s);
+const $$ = (s, r=document) => [...r.querySelectorAll(s)];
+const uid = (p="id") => p + "-" + Math.random().toString(36).slice(2, 9);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const clamp = (n,a,b) => Math.min(b, Math.max(a,n));
+const PALETTE = ["#059669","#0ea5e9","#8b5cf6","#f59e0b","#ec4899","#6366f1","#14b8a6","#f43f5e","#84cc16","#f97316"];
+const SUBJ_COLORS = ["#10b981","#0ea5e9","#8b5cf6","#f59e0b","#14b8a6","#ec4899","#84cc16","#6366f1","#d946ef","#f43f5e"];
+const DAYS_FULL = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
+const DAYS_SHORT = ["Mon","Tue","Wed","Thu","Fri","Sat"];
+const BELL_START = 8*60, BELL_STEP = 50;
+const toHHMM = m => String(Math.floor(m/60)).padStart(2,"0")+":"+String(m%60).padStart(2,"0");
+const bell = p => toHHMM(BELL_START + p*BELL_STEP);
+const bellEnd = p => toHHMM(BELL_START + p*BELL_STEP + 45);
+const initials = name => (name||"").trim().split(/\s+/).slice(0,2).map(w=>w[0]).join("").toUpperCase() || "??";
+/* The school day, in Sri Lanka time (UTC+5:30, no daylight saving). Attendance, relief and
+   absences all use this, and the server uses the same rule, so the dates always agree. */
+const schoolDayKey = (d=new Date()) => new Intl.DateTimeFormat("en-CA",{timeZone:"Asia/Colombo",year:"numeric",month:"2-digit",day:"2-digit"}).format(d);
+const localISO = (d=new Date()) => { const o=d.getTimezoneOffset(); return new Date(d.getTime()-o*60000).toISOString().slice(0,10); };
+const fmtDateLong = iso => new Date(iso+"T00:00:00").toLocaleDateString("en-GB",{weekday:"long",day:"numeric",month:"long",year:"numeric"});
+const timeGreet = () => { const h=new Date().getHours(); return h<12?"Good morning":h<17?"Good afternoon":"Good evening"; };
+/* Credential material must not come from Math.random(). Exclude ambiguous glyphs so a
+   printed or WhatsApp-read password cannot be misread (l/I/O/0/1). */
+const genPassword = () => {
+  const c="abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789";
+  const out=new Array(10);
+  const bytes=new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  for(let i=0;i<10;i++) out[i]=c[bytes[i]%c.length];
+  return out.join("");
+};
+const fmtRole = r => t("role."+r) || r || "Member";
+
+/* ================= SAFE STORAGE (Phase 1, feature-compatible) =================
+   localStorage can throw synchronously in private browsing, after quota exhaustion, or
+   under restrictive WebViews. No storage exception may abort login/boot. */
+const StorageHealth={ available:true, quota:false, lastError:"", warned:false };
+const safeStore={
+  get(key,fallback=null){
+    try{ const value=localStorage.getItem(key); return value===null?fallback:value; }
+    catch(error){ this.fail(error); return fallback; }
+  },
+  set(key,value){
+    try{ localStorage.setItem(key,String(value)); return true; }
+    catch(error){ this.fail(error); return false; }
+  },
+  remove(key){
+    try{ localStorage.removeItem(key); return true; }
+    catch(error){ this.fail(error); return false; }
+  },
+  jsonGet(key,fallback=null){
+    const raw=this.get(key,null); if(raw===null) return fallback;
+    try{ return JSON.parse(raw); }catch(error){ StorageHealth.lastError="Corrupt local cache: "+key; return fallback; }
+  },
+  jsonSet(key,value){
+    try{ return this.set(key,JSON.stringify(value)); }
+    catch(error){ this.fail(error); return false; }
+  },
+  fail(error){
+    StorageHealth.available=false;
+    StorageHealth.quota=error?.name==="QuotaExceededError"||error?.code===22||error?.code===1014;
+    StorageHealth.lastError=StorageHealth.quota?"Device storage is full.":"Local storage is unavailable.";
+    if(!StorageHealth.warned){
+      StorageHealth.warned=true;
+      setTimeout(()=>{ if(typeof toast==="function") toast("error","Offline storage unavailable",StorageHealth.lastError+" CampusFlow will keep working in this tab, but close/reload may lose unsynced changes."); },0);
+    }
+  }
+};
+const LOGIN_V2_ENABLED=()=>safeStore.get("cf.flag.loginV2","1")!=="0";
+
+/* ================= i18n · English · සිංහල · தமிழ் =================
+   Research: English proficiency is the #1 adoption barrier in SL government schools. */
+const I18N={
+  en:{ "app.tagline":"Your school, beautifully orchestrated",
+    "route.admin":"Schools","route.dashboard":"Dashboard","route.timetable":"Timetable","route.relief":"Relief Center",
+    "route.team":"Team","route.database":"Database","route.print":"Print Center","route.attendance":"Attendance","route.find":"Find",
+    "tab.admin":"Schools","tab.dashboard":"Home","tab.timetable":"Timetable","tab.relief":"Relief","tab.team":"Team","tab.database":"Data","tab.print":"Print","tab.attendance":"Attendance","tab.find":"Find",
+    "role.principal":"Principal","role.admin":"Admin","role.teacher":"Teacher","role.staff":"Staff",
+    "login.user":"Username or email","login.pass":"Password","login.signin":"Sign in","login.forgot":"Forgot?",
+    "login.hint":"Accounts are issued by your school's principal.","login.signing":"Signing in…",
+    "db.teachers":"Teachers","db.subjects":"Subjects","db.classes":"Classes","db.curriculum":"Class setup","db.settings":"Settings",
+    "act.generate":"Auto-generate","act.lock":"Lock","act.unlock":"Unlock","act.clear":"Clear…","act.copyday":"Copy day",
+    "act.free":"Free teachers","act.signout":"Sign out","act.undo":"Undo","act.redo":"Redo","act.print":"Print",
+    "sync.synced":"Synced","sync.syncing":"Syncing…","sync.offline":"Offline · saved locally","sync.connecting":"Connecting…",
+    "att.clockin":"Clock in","att.clockout":"Clock out","att.today":"Today","att.in":"In","att.out":"Out","att.away":"Away",
+    "att.fingerprint":"Fingerprint / Face","att.addbio":"Add fingerprint","att.removebio":"Remove",
+    "att.fingerdesc":"Tap the button and touch your phone's fingerprint sensor. The browser never sees your fingerprint — your phone only confirms it is really you.",
+    "att.nobio":"This device has no fingerprint/face reader the browser can use. Clock in with a tap instead, or open this page on your phone and register a fingerprint there.",
+    "att.manualnote":"I'm at school (without a fingerprint)","att.mymanage":"My devices","att.registered":"Registered fingerprints",
+    "att.noregistered":"No fingerprints registered yet. Register one from your phone — the next clock-in takes one tap.","att.live":"Live today",
+    "att.devices":"Attendance devices","att.adddevice":"Add USB / wall device","att.adddevicedesc":"Create a key for a PC connected to a USB fingerprint reader, or a wall-mounted attendance machine. Copy the key once — it is never shown again.",
+    "att.revoke":"Revoke","att.keycopied":"Key copied. Paste it into your attendance device or companion app.","att.nokeys":"No paired devices yet.",
+    "att.printsheet":"Print attendance sheet","att.printrecent":"Print last 14 days","att.summary":"Daily summary","att.method.fingerprint":"Fingerprint","att.method.manual":"Manual sign-in","att.method.device":"Scanner device",
+    "att.registeredon":"Registered","att.lastused":"Last used","att.statusin":"Signed in","att.statusout":"Left","att.statusaway":"Not here yet",
+    "att.confirmremove":"Remove this fingerprint? You can register it again from the same phone later.",
+    "att.attaching":"Talking to the fingerprint sensor…","att.wholetime":"Live clock-ins appear here as teachers tap in.",
+    "find.placeholder":"Search teachers, subjects, classes, attendance, or ask a question…",
+    "find.searching":"Searching…","find.results":"Results","find.nohits":"Nothing matches that yet. Try fewer words or add a sheet with more data.",
+    "find.askai":"Ask AI","find.aiworking":"Thinking…","find.aianswer":"Answer","find.sources":"Sources used",
+    "find.addsheet":"Add a public Google Sheet","find.addsheetdesc":"Paste a public Google Sheets URL and label it (e.g. 'Grade 10 marks', 'Library'). The app fetches the rows on this device only — they are not uploaded.",
+    "find.label":"Label","find.url":"Sheet URL (Anyone with the link → Viewer)","find.refresh":"Refresh","find.remove":"Remove",
+    "find.fetching":"Reading the sheet…","find.fetched":"rows loaded","find.fetcherr":"could not read",
+    "find.teacher":"Teacher","find.subject":"Subject","find.class":"Class","find.slot":"Lesson","find.attendance":"Attendance","find.member":"Account","find.sheet":"Sheet row",
+    "find.datasources":"Your extra data","find.nosources":"No sheets linked yet. Add a public Google Sheet link (marks, student lists, contacts, library) to make it searchable.",
+    "find.aikey":"AI answers use the same Google AI Studio key you added in the Scanner. Tap Ask AI after you type a question.",
+    "find.offline":"AI answers need internet — local results above still work.",
+    "lang.name":"English" },
+  si:{ "app.tagline":"ඔබේ පාසල, පහසුවෙන් කළමනාකරණය",
+    "route.admin":"පාසල්","route.dashboard":"උපකරණ පුවරුව","route.timetable":"කාල සටහන","route.relief":"ආදේශක මධ්‍යස්ථානය",
+    "route.team":"කාර්ය මණ්ඩලය","route.database":"දත්ත","route.print":"මුද්‍රණය","route.attendance":"පැමිණීම","route.find":"සොයන්න",
+    "tab.admin":"පාසල්","tab.dashboard":"මුල් පිටුව","tab.timetable":"කාල සටහන","tab.relief":"ආදේශක","tab.team":"කණ්ඩායම","tab.database":"දත්ත","tab.print":"මුද්‍රණය","tab.attendance":"පැමිණීම","tab.find":"සොයන්න",
+    "role.principal":"විදුහල්පති","role.admin":"පරිපාලක","role.teacher":"ගුරුවරයා","role.staff":"කාර්ය මණ්ඩලය",
+    "login.user":"පරිශීලක නාමය හෝ ඊමේල්","login.pass":"මුරපදය","login.signin":"ඇතුල් වන්න","login.forgot":"අමතකද?",
+    "login.hint":"ගිණුම් ලබා දෙන්නේ ඔබේ පාසලේ විදුහල්පතිතුමා විසිනි.","login.signing":"ඇතුල් වෙමින්…",
+    "db.teachers":"ගුරුවරු","db.subjects":"විෂයයන්","db.classes":"පන්ති","db.curriculum":"පන්ති සැකසුම","db.settings":"සැකසුම්",
+    "act.generate":"ස්වයංක්‍රීයව සාදන්න","act.lock":"අගුළු දමන්න","act.unlock":"අගුළු හරින්න","act.clear":"මකන්න…","act.copyday":"දිනය පිටපත් කරන්න",
+    "act.free":"නිදහස් ගුරුවරු","act.signout":"ඉවත් වන්න","act.undo":"පෙරලන්න","act.redo":"නැවත","act.print":"මුද්‍රණය",
+    "sync.synced":"සුරැකිණි","sync.syncing":"සුරකිමින්…","sync.offline":"අන්තර්ජාලය නැත · දුරකථනයේ සුරැකිණි","sync.connecting":"සම්බන්ධ වෙමින්…",
+    "att.clockin":"පැමිණීම වාර්තා කරන්න","att.clockout":"පිටවීම වාර්තා කරන්න","att.today":"අද","att.in":"පැමිණි","att.out":"ගියා","att.away":"පැමිණ නැත",
+    "att.fingerprint":"ඇඟිලි සලකුණ / මුහුණ","att.addbio":"ඇඟිලි සලකුණ එක් කරන්න","att.removebio":"ඉවත් කරන්න",
+    "att.fingerdesc":"බොත්තම ඔබා ඔබේ දුරකථනයේ ඇඟිලි සලකුණු සංවේදකය ස්පර්ශ කරන්න. බ්‍රවුසරය කිසිවිටක ඔබේ ඇඟිලි සලකුණ නොදකී.",
+    "att.nobio":"මෙම උපාංගයේ බ්‍රවුසරයට භාවිත කළ හැකි ඇඟිලි සලකුණු කියවනය නැත. ඔබේ දුරකථනයෙන් පිවිස ලියාපදිංචි වන්න.",
+    "att.manualnote":"මම පාසලේ (ඇඟිලි සලකුණකින් තොරව)","att.mymanage":"මගේ උපාංග","att.registered":"ලියාපදිංචි ඇඟිලි සලකුණු",
+    "att.noregistered":"තවම ඇඟිලි සලකුණු ලියාපදිංචි කර නැත. ඔබේ දුරකථනයෙන් එක් කරන්න — ඉන්පසු එක් තට්ටුවකින් පැමිණීම සලකුණු කළ හැකිය.","att.live":"අද සජීවීව",
+    "att.devices":"පැමිණීම් උපාංග","att.adddevice":"USB / බිත්ති උපාංගය එක් කරන්න","att.adddevicedesc":"USB ඇඟිලි සලකුණු කියවනයකට සම්බන්ධ පරිගණකයක් හෝ බිත්ති යන්ත්‍රයක් සඳහා යතුරක් සාදන්න. වරක් පමණක් පෙන්වන බැවින් එකවර පිටපත් කරගන්න.",
+    "att.revoke":"අවලංගු කරන්න","att.keycopied":"යතුර පිටපත් විය. ඔබේ උපාංගයේ හෝ යෙදුමේ අලවන්න.","att.nokeys":"යුගලනය කළ උපාංග නැත.",
+    "att.printsheet":"පැමිණීම් පත්‍රය මුද්‍රණය කරන්න","att.printrecent":"දින 14 මුද්‍රණය කරන්න","att.summary":"දෛනික සාරාංශය",
+    "att.method.fingerprint":"ඇඟිලි සලකුණ","att.method.manual":"අතින් වාර්තා","att.method.device":"ස්කෑනර් උපාංගය",
+    "att.registeredon":"ලියාපදිංචිය","att.lastused":"අවසාන භාවිතය","att.statusin":"පැමිණ සිටී","att.statusout":"පිටව ගියේය","att.statusaway":"තවම පැමිණ නැත",
+    "att.confirmremove":"මෙම ඇඟිලි සලකුණ ඉවත් කරන්න ද? පසුව නැවත ලියාපදිංචි කළ හැකිය.",
+    "att.attaching":"ඇඟිලි සලකුණු සංවේදකය ඇමතෙමින්…",
+    "find.placeholder":"ගුරුවරුන්, විෂයයන්, පන්ති, පැමිණීම් හොයන්න, නැතහොත් ප්‍රශ්නයක් අසන්න…",
+    "find.results":"ප්‍රතිඵල","find.nohits":"ඊට ගැළපෙන කිසිවක් තවම නැත. අඩු වචන භාවිතා කරන්න, නැතහොත් පොදු ෂීට් එකක් එක් කරන්න.",
+    "find.askai":"AI ගෙන් අසන්න","find.aiworking":"සිතමින්…","find.aianswer":"පිළිතුර","find.sources":"භාවිතා කළ මූලාශ්‍ර",
+    "find.addsheet":"පොදු Google ෂීට් එකක් එක් කරන්න","find.addsheetdesc":"පොදු ෂීට් සබැඳියක් අලවන්න (උදා: 'ශ්‍රේණි 10 ලකුණු', 'පුස්තකාලය'). මෙම උපාංගයේ පමණක් පේළි කියවේ — කිසිවක් උඩුගත නොවේ.",
+    "find.label":"නම","find.url":"ෂීට් සබැඳිය (Anyone with the link → Viewer)","find.refresh":"යාවත්කාලීන කරන්න","find.remove":"ඉවත් කරන්න",
+    "find.fetching":"ෂීට් එක කියවමින්…","find.fetched":"පේළි පූරණය විය","find.fetcherr":"කියවීමට නොහැකි විය",
+    "find.teacher":"ගුරුවරයා","find.subject":"විෂය","find.class":"පන්තිය","find.slot":"පාඩම","find.attendance":"පැමිණීම","find.member":"ගිණුම","find.sheet":"ෂීට් පේළිය",
+    "find.datasources":"ඔබේ අමතර දත්ත","find.nosources":"ෂීට් සබැඳි තවම නැත. ලකුණු, ශිෂ්‍ය ලැයිස්තු, සම්බන්ධතා වැනි පොදු ෂීට් සබැඳි එක් කරන්න.",
+    "find.aikey":"AI පිළිතුරු සඳහා Scanner තුළ එක් කළ Google AI Studio යතුරම භාවිතා වේ. ප්‍රශ්නයක් ලියා Ask AI ඔබන්න.",
+    "find.offline":"AI පිළිතුරුවලට අන්තර්ජාලය අවශ්‍යයි — දේශීය ප්‍රතිඵල ක්‍රියාත්මකයි.",
+    "lang.name":"සිංහල" },
+  ta:{ "app.tagline":"உங்கள் பாடசாலை, எளிதாக நிர்வகிக்கப்படுகிறது",
+    "route.admin":"பாடசாலைகள்","route.dashboard":"முகப்பு","route.timetable":"நேரசூசி","route.relief":"மாற்று ஆசிரியர்",
+    "route.team":"பணியாளர்கள்","route.database":"தரவு","route.print":"அச்சிடு","route.attendance":"வருகை","route.find":"தேடு",
+    "tab.admin":"பாடசாலை","tab.dashboard":"முகப்பு","tab.timetable":"நேரசூசி","tab.relief":"மாற்று","tab.team":"குழு","tab.database":"தரவு","tab.print":"அச்சு","tab.attendance":"வருகை","tab.find":"தேடு",
+    "role.principal":"அதிபர்","role.admin":"நிர்வாகி","role.teacher":"ஆசிரியர்","role.staff":"பணியாளர்",
+    "login.user":"பயனர்பெயர் அல்லது மின்னஞ்சல்","login.pass":"கடவுச்சொல்","login.signin":"உள்நுழை","login.forgot":"மறந்ததா?",
+    "login.hint":"கணக்குகள் உங்கள் அதிபரால் வழங்கப்படும்.","login.signing":"உள்நுழைகிறது…",
+    "db.teachers":"ஆசிரியர்கள்","db.subjects":"பாடங்கள்","db.classes":"வகுப்புகள்","db.curriculum":"வகுப்பு அமைப்பு","db.settings":"அமைப்புகள்",
+    "act.generate":"தானாக உருவாக்கு","act.lock":"பூட்டு","act.unlock":"திற","act.clear":"அழி…","act.copyday":"நாளை நகலெடு",
+    "act.free":"காலியான ஆசிரியர்","act.signout":"வெளியேறு","act.undo":"திரும்பப்பெறு","act.redo":"மீண்டும்","act.print":"அச்சிடு",
+    "sync.synced":"சேமிக்கப்பட்டது","sync.syncing":"சேமிக்கிறது…","sync.offline":"இணையம் இல்லை · சாதனத்தில் சேமிப்பு","sync.connecting":"இணைக்கிறது…",
+    "att.clockin":"உள்ளே வருகை","att.clockout":"வெளியேறு","att.today":"இன்று","att.in":"உள்ளே","att.out":"வெளியே","att.away":"வரவில்லை",
+    "att.fingerprint":"கைரேகை / முகம்","att.addbio":"கைரேகை சேர்","att.removebio":"நீக்கு",
+    "att.fingerdesc":"பொத்தானைத் தட்டி உங்கள் போனின் கைரேகை உணரியைத் தொடவும். உலாவி கைரேகையைப் பார்க்காது — நீங்கள்தான் என்பதை உறுதிப்படுத்துகிறது.",
+    "att.nobio":"இந்தச் சாதனத்தில் உலாவி பயன்படுத்தக்கூடிய கைரேகை வாசிப்பான் இல்லை.",
+    "att.manualnote":"நான் பாடசாலையில் இருக்கிறேன் (கைரேகை இல்லாமல்)","att.mymanage":"என் சாதனங்கள்","att.registered":"பதிவு செய்த கைரேகைகள்",
+    "att.noregistered":"இன்னும் கைரேகை பதிவாகவில்லை. உங்கள் போனில் பதிவு செய்யுங்கள்.","att.live":"இன்று நேரலை",
+    "att.devices":"வருகைச் சாதனங்கள்","att.adddevice":"USB / சுவர் சாதனம் சேர்","att.adddevicedesc":"USB கைரேகை வாசிப்பான் இணைக்கப்பட்ட கணினிக்கு ஒரு சாவியை உருவாக்கவும். ஒரு முறை மட்டும் காண்பிக்கப்படும்.",
+    "att.revoke":"ரத்து செய்","att.keycopied":"சாவி நகலெடுக்கப்பட்டது.","att.nokeys":"இணைக்கப்பட்ட சாதனங்கள் இல்லை.",
+    "att.printsheet":"வருகைத் தாளை அச்சிடு","att.printrecent":"கடந்த 14 நாட்களை அச்சிடு","att.summary":"தினசரி சுருக்கம்",
+    "att.method.fingerprint":"கைரேகை","att.method.manual":"கைமுறை","att.method.device":"ஸ்கேனர்",
+    "att.registeredon":"பதிவு","att.lastused":"கடைசிப் பயன்பாடு","att.statusin":"உள்ளே","att.statusout":"வெளியேறினார்","att.statusaway":"இன்னும் வரவில்லை",
+    "att.confirmremove":"இந்தக் கைரேகையை நீக்கவா? பின்னர் மீண்டும் பதிவு செய்யலாம்.",
+    "att.attaching":"கைரேகை உணரியுடன் பேசுகிறது…",
+    "find.placeholder":"ஆசிரியர்கள், பாடங்கள், வகுப்புகள், வருகையைத் தேடுங்கள் அல்லது ஒரு கேள்வியைக் கேளுங்கள்…",
+    "find.results":"முடிவுகள்","find.nohits":"அதற்குப் பொருத்தமாக எதுவும் இல்லை. குறைவான சொற்களைப் பயன்படுத்தவும் அல்லது பொது ஷீட் ஒன்றைச் சேர்க்கவும்.",
+    "find.askai":"AI யிடம் கேள்","find.aiworking":"சிந்திக்கிறது…","find.aianswer":"பதில்","find.sources":"பயன்படுத்திய ஆதாரங்கள்",
+    "find.addsheet":"பொது Google ஷீட்டைச் சேர்","find.addsheetdesc":"பொது Google ஷீட் இணைப்பை ஒட்டி பெயரிடுங்கள் (எ.கா. 'தரம் 10 மதிப்பெண்கள்'). இந்தச் சாதனத்தில் மட்டும் வரிசைகள் படிக்கப்படும்.",
+    "find.label":"பெயர்","find.url":"ஷீட் இணைப்பு (Anyone with the link → Viewer)","find.refresh":"புதுப்பி","find.remove":"நீக்கு",
+    "find.fetching":"ஷீட்டைப் படிக்கிறது…","find.fetched":"வரிசைகள் ஏற்றப்பட்டன","find.fetcherr":"படிக்க முடியவில்லை",
+    "find.teacher":"ஆசிரியர்","find.subject":"பாடம்","find.class":"வகுப்பு","find.slot":"பாடம்","find.attendance":"வருகை","find.member":"கணக்கு","find.sheet":"ஷீட் வரிசை",
+    "find.datasources":"உங்கள் கூடுதல் தரவு","find.nosources":"இன்னும் ஷீட் இணைப்புகள் இல்லை. மதிப்பெண்கள், மாணவர் பட்டியல் போன்ற பொது ஷீட் இணைப்புகளைச் சேர்க்கவும்.",
+    "find.aikey":"AI பதில்களுக்கு Scanner-இல் சேர்த்த Google AI Studio சாவியே பயன்படுத்தப்படும்.",
+    "find.offline":"AI பதில்களுக்கு இணையம் தேவை — உள்ளூர் முடிவுகள் வேலை செய்யும்.",
+    "lang.name":"தமிழ்" }
+};
+let LANG = safeStore.get("cf.lang","en") || "en";
+if (!I18N[LANG]) LANG="en";
+const t = k => (I18N[LANG] && I18N[LANG][k]) || I18N.en[k] || "";
+function setLang(l){ if(!I18N[l]) return; LANG=l; safeStore.set("cf.lang",l);
+  document.documentElement.lang=l;
+  if ($("#login-root") && !$("#login-root").hidden) showLogin();
+  else Store.requestRender();
+}
+const langSwitcher = (cls="") => `<div class="seg shrink-0 ${cls}">${Object.keys(I18N).map(l=>
+  `<button class="seg-btn !min-h-[36px] !px-3 ${LANG===l?"active":""}" data-action="set-lang" data-lang="${l}">${I18N[l]["lang.name"]}</button>`).join("")}</div>`;
+
+/* ================= SESSION ================= */
+const DEVICE_ID = (() => { let d=safeStore.get("cf.device",null); if(!d){ d=uid("dev"); safeStore.set("cf.device",d);} return d; })();
+const cacheKey = sid => "cf.data." + (sid || "none");
+const accessKey = sid => "cf.access." + (sid || "none");
+const profileKey = uid => "cf.profile." + (uid || "none");
+
+/* ================= PUBLIC SITE CONFIG =================
+   The landing page, login screen, and every marketing creative all read one source of
+   truth: site/config in RTDB. Public-readable (the landing page renders before login),
+   writable only by the platform owner. Defaults below are what ships today, so behavior
+   never changes until the owner edits something — every value has a graceful fallback. */
+const SITE_DEFAULTS = {
+  phone: "072 399 3300",
+  whatsapp: "94723993300",
+  waMsg: "Hello CampusFlow — I'd like to book a demo for my school.",
+  heroTitle: "School timetables, beautifully automated.",
+  heroSubtitle: "Clash-free timetables, fingerprint attendance, instant relief cover, and one search box for your whole school — in your school's own colours, from any phone, even offline.",
+  trialDays: 14,
+  planName: "School",
+  planPrice: "Custom pricing",
+  features: [
+    { title: "Auto-generated timetables", text: "Clash-free schedules built from your teachers and subjects — in seconds, not days." },
+    { title: "Fingerprint attendance", text: "Teachers clock in with their phone's fingerprint. Missing teachers appear on the dashboard live." },
+    { title: "Find anything, instantly", text: "One search box for teachers, classes, lessons, attendance and your linked sheets. Ask \"who is free period 3?\" and get a sourced answer." },
+    { title: "Your school's look", text: "Your logo and colours show for every teacher and staff member the moment they sign in. Principals can give admins permission to change them." },
+    { title: "Relief in one tap", text: "A teacher is absent. CampusFlow finds the best-matched free teacher instantly, and auto-fills absences from fingerprint data." },
+    { title: "Offline · Sinhala · Tamil · English", text: "Every change saves on the device and syncs later. Built for Sri Lankan schools with a trilingual interface." },
+    { title: "Print everything", text: "Class, teacher, master and roster timetables — high-contrast, official, A4/A3." }
+  ]
+};
+const PUBLIC_SITE_ENABLED = () => safeStore.get("cf.flag.publicSite","1")!=="0";
+/* Numbers that were once the public contact and must never override the current default. */
+const RETIRED_SCHOOL_NUMBERS = ["94773594701","0773594701","94722816456","0722816456"];
+/* Sri Lankan numbers: 07X… → 94 7X… (international form used by wa.me and tel:). */
+const intlDigits = v => { let d=String(v||"").replace(/\D/g,""); if(d.startsWith("0")) d="94"+d.slice(1); return d; };
+const SiteCfg = {
+  data: safeStore.jsonGet("cf.siteConfig",null),
+  val(k){
+    /* The public phone and WhatsApp number are fixed in the code: a value saved in the
+       database never changes them (the settings form shows them read-only). */
+    if (k==="phone"||k==="whatsapp") return SITE_DEFAULTS[k];
+    const v=this.data?.[k];
+    if (v===undefined||v===null||v==="") return SITE_DEFAULTS[k];
+    /* Retired school number: an old saved value must never override the current default. */
+    if ((k==="phone"||k==="whatsapp") && RETIRED_SCHOOL_NUMBERS.includes(String(v).replace(/\D/g,""))) return SITE_DEFAULTS[k];
+    return v;
+  },
+  features(){ const f=this.data?.features; return Array.isArray(f)&&f.length ? f.map((x,i)=>({...SITE_DEFAULTS.features[i%SITE_DEFAULTS.features.length],...x})) : SITE_DEFAULTS.features; },
+  phone(){ return String(this.val("phone")).replace(/[^\d+\s().-]/g,"").trim() || SITE_DEFAULTS.phone; },
+  waNumber(){ return intlDigits(this.val("whatsapp")) || SITE_DEFAULTS.whatsapp; },
+  waLink(){ return "https://wa.me/"+this.waNumber()+"?text="+encodeURIComponent(this.val("waMsg")); },
+  tel(){ return "tel:+"+intlDigits(this.phone()); },
+  attach(){
+    if(!FB.ready) return;
+    FB.db.ref("site/config").on("value", snap=>{
+      this.data = snap.val() || null;
+      if(this.data) safeStore.jsonSet("cf.siteConfig",this.data);
+      hydrateSiteSlots();                              /* updates page chrome without wiping forms */
+      if (typeof refresh==="function" && Store.raw?.ui?.route==="marketing") Store.requestRender();
+    }, err=>{ /* optional public node: cached/default content remains fully functional */ });
+  }
+};
+const siteFeatureIcons=["ph-sparkle","ph-user-switch","ph-cloud-slash","ph-printer","ph-translate","ph-scan"];
+function hydrateSiteSlots(){
+  $$("[data-site]").forEach(el=>{
+    const k=el.dataset.site;
+    if(k==="phone")      el.textContent=SiteCfg.phone();
+    if(k==="heroTitle")  el.textContent=SiteCfg.val("heroTitle");
+    if(k==="heroSub")    el.textContent=SiteCfg.val("heroSubtitle");
+    if(k==="trialDays")  el.textContent=SiteCfg.val("trialDays");
+    if(k==="planName")   el.textContent=SiteCfg.val("planName");
+    if(k==="planPrice")  el.textContent=SiteCfg.val("planPrice");
+  });
+  $$("[data-site-href]").forEach(el=>{
+    if(el.dataset.siteHref==="tel") el.href=SiteCfg.tel();
+    if(el.dataset.siteHref==="wa")  el.href=SiteCfg.waLink();
+  });
+}
+const Session = Object.assign({ role:null, schoolRole:null, schoolId:null, email:null, uid:null },safeStore.jsonGet("cf.session",{}));
+const saveSession = () => safeStore.jsonSet("cf.session",
+  { role:Session.role, schoolRole:Session.schoolRole, schoolId:Session.schoolId, email:Session.email, uid:Session.uid });
+
+/* ================= DATA FACTORY ================= */
+const defaultSettings = (name="My School") => ({ schoolName:name, logo:"", daysPerWeek:5, periodsPerDay:7, maxLoad:28, loadCap:35 });
+const emptyData = (name="My School") => ({ version:1, settings:defaultSettings(name), teachers:[], subjects:[], classes:[], curriculum:[], timetable:{}, absences:{} });
+const LEGACY_LOCAL_KEYS=["campusflow.v1","campusflow.v2","cf.data.local"];
+function removeLegacyLocalData(){ LEGACY_LOCAL_KEYS.forEach(k=>safeStore.remove(k)); }
+function legacySampleDetected(){
+  const names=new Set((state.teachers||[]).map(t=>String(t.name||"").toLowerCase()));
+  return state.settings.schoolName==="Greenfield International School" ||
+    (names.has("aisha rahman") && names.has("daniel osei") && names.has("maria santos"));
+}
+function resetWorkspaceData(){
+  const settings={...Store.raw.settings};             /* preserve real school identity/config */
+  if(settings.schoolName==="Greenfield International School"){
+    settings.schoolName="My School"; settings.logo=""; /* remove identity from the old bundled sample too */
+  }
+  removeLegacyLocalData();
+  safeStore.remove(cacheKey(Session.schoolId));
+  Sync.rev=Math.max(Sync.rev+1,Date.now());
+  Sync.pending=true; Sync.localDirty=true; Sync._lastSig=null;
+  Store.replaceData({version:1,settings,teachers:[],subjects:[],classes:[],curriculum:[],timetable:{},absences:{}});
+  Store.raw.ui.activeClassId=null;
+  Store.raw.ui.dbTab="teachers";
+  Store.raw.ui.route="dashboard";
+  Store.flush();
+  if(Sync.active) Sync.pushNow();
+  else Store.requestRender();
+}
+
+/* ================= REACTIVE STORE ================= */
+const App = { cache:{ conflicts:null, conflictRev:-1 }, rev:0, scheduleRev:0, lastRoute:null, dbQuery:"", members:{}, me:null };
+const Store = (() => {
+  let raw = emptyData();
+  raw.ui = { route:"dashboard", dbTab:"teachers", activeClassId:null, reliefDate: localISO(), print:{ doc:"master", targetId:"", paper:"a4l" } };
+  /* Where you were is per-device view state (not school data): restore it on refresh. */
+  const UI_KEY="cf.ui.v1";
+  try{ const saved=safeStore.jsonGet(UI_KEY,null); if(saved && typeof saved==="object"){
+    const sameSchool = saved.schoolId==null || saved.schoolId===Session.schoolId;
+    if(sameSchool && typeof saved.route==="string") raw.ui.route=saved.route;
+    if(sameSchool && typeof saved.dbTab==="string") raw.ui.dbTab=saved.dbTab;
+    if(sameSchool && (saved.activeClassId==null||typeof saved.activeClassId==="string")) raw.ui.activeClassId=saved.activeClassId||null;
+  } }catch(_){}
+  function persistUi(){ try{ safeStore.jsonSet(UI_KEY,{schoolId:Session.schoolId||null,route:raw.ui.route,dbTab:raw.ui.dbTab,activeClassId:raw.ui.activeClassId}); }catch(_){} }
+  let saveTimer=null, rafId=0;
+  /* Deep Proxy instances used to be recreated on every property read. A dashboard with
+     40 teachers and 500 lessons could allocate tens of thousands of Proxies per frame.
+     Cache one Proxy per object/root branch and tag mutations by their data domain. */
+  const proxyCache=new WeakMap();
+  const wrap=(obj,root="")=>{
+    if(!obj||typeof obj!=="object") return obj;
+    let branches=proxyCache.get(obj);
+    if(!branches){ branches=new Map(); proxyCache.set(obj,branches); }
+    if(branches.has(root)) return branches.get(root);
+    const proxy=new Proxy(obj,{
+      get(t,k){ const v=Reflect.get(t,k); return (v&&typeof v==="object")?wrap(v,root||String(k)):v; },
+      set(t,k,v){ const changed=t[k]!==v; Reflect.set(t,k,v); if(changed) notify(root||String(k)); return true; },
+      deleteProperty(t,k){ if(k in t){ Reflect.deleteProperty(t,k); notify(root||String(k)); } return true; }
+    });
+    branches.set(root,proxy); return proxy;
+  };
+  function persistNow(){
+    persistUi();
+    const {ui, ...data} = raw;
+    safeStore.jsonSet(cacheKey(Session.schoolId),{...data,rev:Sync.rev,dirty:!!(Sync.pending||Sync.localDirty)});
+  }
+  function scheduleSave(){ clearTimeout(saveTimer); saveTimer=setTimeout(persistNow, 250); }
+  function notify(root){
+    App.rev++;
+    if(["timetable","teachers","classes","subjects","settings"].includes(root)) App.scheduleRev++;
+    scheduleRender();
+    /* View navigation/search should never trigger history snapshots or cloud writes. */
+    if(root==="ui"){ persistUi(); return; }
+    scheduleSave(); Sync.schedulePush(); UndoEngine.dirty();
+  }
+  function scheduleRender(){ if(rafId) return; rafId=requestAnimationFrame(()=>{ rafId=0; refresh(); }); }
+  return {
+    state: wrap(raw),
+    get raw(){ return raw; },
+    flush: persistNow,
+    requestRender: scheduleRender,
+    replaceData(d){
+      App.rev++; App.scheduleRev++; /* raw write — must invalidate derived caches too */
+      d = d || {};
+      const EMPTY_DATA={teachers:[],subjects:[],classes:[],curriculum:[],timetable:{},absences:{}};
+      /* A missing key means EMPTY, not "keep local": RTDB drops empty arrays/objects, so a cloud
+         deletion arrives as an absent key and must still clear the local copy. */
+      Object.keys(EMPTY_DATA).forEach(k=>{ raw[k]=(d[k]!==undefined&&d[k]!==null)?d[k]:EMPTY_DATA[k]; });
+      if (!Array.isArray(raw.curriculum)) raw.curriculum=[];
+      raw.settings = {...defaultSettings(), ...(d.settings||{})};
+      normalizeRaw(raw);
+      /* Cloud values reach innerHTML and style attributes: keep only a real image data URL and hex colours. */
+      if (raw.settings.logo && !/^data:image\/(png|jpeg|webp|gif);base64,[A-Za-z0-9+\/=]+$/.test(raw.settings.logo)) raw.settings.logo="";
+      ["teachers","subjects"].forEach(k=>(Array.isArray(raw[k])?raw[k]:Object.values(raw[k]||{})).forEach(x=>{ if(x && !/^#[0-9a-fA-F]{3,8}$/.test(x.color||"")) x.color="#6b7280"; }));
+      /* Snapshot AFTER hydration. Doing this before assignment made the first Undo
+         restore the previous school/cloud revision. */
+      if (!window.__undoApplying && typeof UndoEngine!=="undefined") UndoEngine.reset();
+      persistNow(); scheduleRender();
+    }
+  };
+})();
+const state = Store.state;
+
+/* ---- live permission model (mirrors RTDB rules client-side for UI gating) ---- */
+const isSuper = () => Session.role==="super" || Session.schoolRole==="superadmin" || Session.uid===SUPER_UID || isSuperAdminUser(FB.ready&&FB.auth?FB.auth.currentUser:null);
+const isPrincipal = () => Session.schoolRole === "principal";
+const canEdit = () => isSuper() || isPrincipal() || App.me?.permissions?.editWorkspace === true;
+const canViewUsers = () => isSuper() || isPrincipal() || App.me?.permissions?.viewUsers === true;
+/* Mirrors database.rules.json for whole-day attendance: only a principal, an admin or a
+   member with permissions.viewUsers can read it. Super-admin status does not grant this
+   in the rules, so it must not grant it here either (it would only cause permission_denied). */
+const canReadDayAttendance = () => Session.schoolRole==="principal" || Session.schoolRole==="admin" || App.me?.permissions?.viewUsers === true;
+window.canReadDayAttendance = canReadDayAttendance;
+/* Where the attendance machine must send its clock-ins (the attendancePush function). */
+function attendancePushUrl(){
+  return `https://asia-south1-${firebaseConfig.projectId}.cloudfunctions.net/attendancePush`;
+}
+function deviceSetupHtml(){
+  const url=attendancePushUrl();
+  const sample=JSON.stringify({staffId:"NP",kind:"in"},null,2);
+  return `<div class="space-y-1.5 text-[11px] text-sky-900/80 leading-relaxed">
+    <div><b>1. URL</b> (POST): <code class="font-mono break-all bg-white/60 rounded px-1">${esc(url)}</code></div>
+    <div><b>2. Header</b>: <code class="font-mono break-all bg-white/60 rounded px-1">Authorization: Bearer &lt;device key&gt;</code></div>
+    <div><b>3. Body</b> (JSON): <code class="font-mono whitespace-pre-wrap break-all bg-white/60 rounded px-1 block">${esc(sample)}</code>
+      <span class="text-zinc-500">staffId is the teacher code, the member's sign-in email, or their user id. kind is "in" or "out".</span></div>
+  </div>`;
+}
+
+const canManageUsers = () => isSuper() || isPrincipal();
+const canEditSettings = () => isSuper() || isPrincipal();
+/* Look & colours: principal always; any admin the principal grants editBranding. */
+const canEditBranding = () => canEditSettings() || App.me?.permissions?.editBranding === true;
+const needBranding = () => { if (canEditBranding()) return true; toast("error","Not allowed","Only the principal, or admins given 'Change school look', can do this."); return false; };
+const BRAND_PRESETS = ["#059669","#4f46e5","#0ea5e9","#e11d48","#f59e0b","#7c3aed","#0f172a","#db2777"];
+function applyBrand(){
+  const c = (Store.raw?.settings?.brand)||"";
+  const hex = /^#[0-9a-f]{6}$/i.test(c) ? c : "#059669";
+  document.documentElement.style.setProperty("--brand", hex);
+  const meta=document.querySelector('meta[name="theme-color"]'); if(meta) meta.content=hex;
+}
+
+/* ================= DATA UTILITIES ================= */
+const T = id => state.teachers.find(t=>t.id===id);
+const S = id => state.subjects.find(s=>s.id===id);
+const C = id => state.classes.find(c=>c.id===id);
+const blankGrid = () => Array.from({length:state.settings.daysPerWeek}, ()=>Array(state.settings.periodsPerDay).fill(null));
+const cellKey = (cid,d,p) => `${cid}|${d}|${p}`;
+/* cells hold an ARRAY of parallel lessons (subject baskets / streams) or null.
+   Legacy single-lesson objects are auto-upgraded on load. */
+const lessonsOf = cell => !cell ? [] : (Array.isArray(cell) ? cell : [cell]);
+const getCell = (cid,d,p) => state.timetable[cid]?.[d]?.[p] || null;
+function setCell(cid,d,p,val){ if(!state.timetable[cid]) state.timetable[cid]=blankGrid(); state.timetable[cid][d][p]=Array.isArray(val)&&val.length?val:null; }
+function normalizeRaw(r){
+  const s=r.settings;
+  s.daysPerWeek = s.daysPerWeek===6?6:5;
+  s.periodsPerDay = clamp(parseInt(s.periodsPerDay)||7,4,10);
+  s.maxLoad = clamp(parseInt(s.maxLoad)||28,1,60);            /* teaching target (minimum) */
+  s.loadCap = clamp(parseInt(s.loadCap)||35,1,60);            /* hard overload limit */
+  if (s.loadCap < s.maxLoad) s.loadCap = s.maxLoad;           /* a cap below the target makes no sense */
+  if (!Array.isArray(r.curriculum)) r.curriculum=[];
+  r.curriculum=r.curriculum.filter(x=>x && (r.classes||[]).some(c=>c.id===x.classId) && (r.subjects||[]).some(su=>su.id===x.subjectId));
+  (r.classes||[]).forEach(c=>{
+    const old=(r.timetable||{})[c.id];
+    r.timetable[c.id]=Array.from({length:s.daysPerWeek},(_,d)=>Array.from({length:s.periodsPerDay},(_,p)=>{
+      const raw=old?.[d]?.[p]??null;
+      return (raw && !Array.isArray(raw)) ? [raw] : raw;
+    }));
+  });
+}
+function normalize(){
+  normalizeRaw(Store.raw);
+  if (!C(state.ui.activeClassId)) state.ui.activeClassId = state.classes[0]?.id || null;
+}
+/* ---- grade limits: some teachers only work with certain grades (e.g. Grade 6 only) ---- */
+const gradeKeyOf  = name => { const m=String(name||"").match(/\d+/); return m? m[0] : String(name||"").trim(); };
+const gradeOf     = cid  => { const c=C(cid); return c? gradeKeyOf(c.name) : null; };
+const gradeLabel  = g    => /^\d+$/.test(String(g)) ? "Grade "+g : (g||"—");
+const allGrades   = ()   => [...new Set(state.classes.map(c=>gradeKeyOf(c.name)))]
+                              .sort((a,b)=>((+a||999)-(+b||999)) || String(a).localeCompare(String(b)));
+const teacherGrades = t  => Array.isArray(t.grades) ? t.grades : (t.gradesNone ? [] : null);   /* null = any grade */
+const gradeSummary = t  => { const g=teacherGrades(t);
+  return g===null ? null : (g.length? g.map(gradeLabel).join(", ") : "no grades"); };
+function canTeachClass(t, cid){
+  if (!t) return false;
+  const g=teacherGrades(t);
+  if (g===null) return true;
+  const k=gradeOf(cid);
+  return !!k && g.includes(k);
+}
+const teacherOfSubject = (sid, cid) => state.teachers.filter(t =>
+  (t.subjectIds||[]).includes(sid) && (cid===undefined || canTeachClass(t, cid)));
+/* Workload counters are read thousands of times per render (every teacher card, every
+   dropdown sort). Computing them one-by-one through the reactive Proxy froze low-end
+   phones, so they are derived in ONE raw pass and memoised until the next state change. */
+const Memo={ rev:-1, loads:null, days:null };
+function loadMaps(){
+  const rev=App.rev||0;
+  if (Memo.rev===rev && Memo.loads) return Memo;
+  const loads={}, days={};
+  const tt=Store.raw.timetable||{};
+  for (const cid in tt){
+    const grid=tt[cid]; if(!grid) continue;
+    for (let d=0; d<grid.length; d++){
+      const row=grid[d]; if(!row) continue;
+      for (let p=0; p<row.length; p++){
+        const cell=row[p]; if(!cell) continue;
+        const arr=Array.isArray(cell)?cell:[cell];
+        for (const L of arr){
+          if (!L || !L.teacherId) continue;
+          loads[L.teacherId]=(loads[L.teacherId]||0)+1;
+          const k=L.teacherId+"|"+d;
+          days[k]=(days[k]||0)+1;
+        }
+      }
+    }
+  }
+  Memo.rev=rev; Memo.loads=loads; Memo.days=days;
+  return Memo;
+}
+const teacherLoad = tid => loadMaps().loads[tid]||0;
+const dayLoad = (tid,d) => loadMaps().days[tid+"|"+d]||0;
+/* Workload band: under the teaching target → underloaded, above the hard cap → overloaded.
+   Between the two is healthy. (SL circular: ≥28 classroom periods, 35 total per week.) */
+function loadStatus(load){
+  const target=state.settings.maxLoad, cap=state.settings.loadCap;
+  if (load>cap) return "over";
+  if (load<target) return "under";
+  return "ok";
+}
+const LOAD_BAR={
+  over:  { bar:"bg-gradient-to-r from-rose-500 to-red-400",  txt:"text-rose-600",       chip:"!bg-rose-50 !text-rose-600 !border-rose-200" },
+  ok:    { bar:"bg-gradient-to-r from-emerald-500 to-teal-400", txt:"text-zinc-500",    chip:"!bg-emerald-50 !text-emerald-600 !border-emerald-200" },
+  under: { bar:"bg-gradient-to-r from-sky-400 to-sky-300",   txt:"text-sky-600",        chip:"!bg-sky-50 !text-sky-600 !border-sky-200" }
+};
+function busyAtSlot(tid,d,p,excludeCid=null){
+  for (const c of state.classes){ if(c.id===excludeCid) continue; if(lessonsOf(getCell(c.id,d,p)).some(L=>L.teacherId===tid)) return c; }
+  return null;
+}
+function slotsOfTeacherOn(tid,d){
+  const out=[];
+  state.classes.forEach(c => (state.timetable[c.id]?.[d]||[]).forEach((cell,p)=>{
+    lessonsOf(cell).forEach((L,li)=>{ if(L.teacherId===tid) out.push({classId:c.id,className:c.name,d,p,li,subjectId:L.subjectId}); });
+  }));
+  return out.sort((a,b)=>a.p-b.p || a.li-b.li);
+}
+function computeConflicts(){
+  if(App.cache.conflicts&&App.cache.conflictRev===App.scheduleRev) return App.cache.conflicts;
+  const occ=new Map();
+  state.classes.forEach(c => (state.timetable[c.id]||[]).forEach((row,d)=>row.forEach((cell,p)=>{
+    lessonsOf(cell).forEach(L=>{
+      if (L.teacherId){
+        if(!occ.has(d+"|"+p)) occ.set(d+"|"+p,new Map());
+        const m=occ.get(d+"|"+p);
+        if(!m.has(L.teacherId)) m.set(L.teacherId,[]);
+        m.get(L.teacherId).push({classId:c.id,d,p});
+      }
+    });
+  })));
+  const cellInfo=new Map(), list=[];
+  occ.forEach((m,slot)=>{ m.forEach((arr,tid)=>{
+    if (arr.length>1){
+      const t=T(tid); const names=arr.map(a=>C(a.classId)?.name||"?");
+      arr.forEach(a=>{ const others=names.filter((_,i)=>arr[i].classId!==a.classId).join(", "); cellInfo.set(cellKey(a.classId,a.d,a.p), `${t?.name||"?"} is also teaching ${others}`); });
+      const [d,p]=slot.split("|").map(Number); list.push({teacher:t,d,p,classes:names});
+    }
+  });});
+  const result={ occ, cellInfo, list, count: cellInfo.size };
+  App.cache.conflicts=result; App.cache.conflictRev=App.scheduleRev;
+  return result;
+}
+const classFill = cid => {
+  let f=0; const total=state.settings.daysPerWeek*state.settings.periodsPerDay;
+  (state.timetable[cid]||[]).forEach(r=>r.forEach(c=>{ if(c) f++; }));
+  return { f, total, pct: total?Math.round(f/total*100):0 };
+};
+/* relief */
+const dayIndexFor = iso => { const j=new Date(iso+"T00:00:00").getDay(); return j===0?-1:j-1; };
+const absRecRead = iso => { const r=state.absences[iso]; if(!r) return { teachers:[], present:[], relief:{}, auto:{} }; const out = r.relief ? {...r} : { ...r, relief:{} }; if(!out.auto) out.auto={}; if(!Array.isArray(out.present)) out.present=[]; if(!Array.isArray(out.teachers)) out.teachers=Object.values(out.teachers||{}); return out; };
+function absRecWrite(iso){ if(!state.absences[iso]) state.absences[iso]={teachers:[],present:[],relief:{},auto:{}}; const r=state.absences[iso]; if(!r.relief) r.relief={}; if(!r.auto) r.auto={}; if(!Array.isArray(r.present)) r.present=[]; if(!Array.isArray(r.teachers)) r.teachers=Object.values(r.teachers||{}); return r; }
+/* Automatic absence detection from biometric attendance. A teacher is considered
+   auto-absent for relief purposes when they have at least one lesson today AND
+   their first lesson has already started (first-bell minutes for their earliest
+   slot) AND they have not clocked in today. Principals can still override any
+   row — manual marks (presence forced present, or manually marked absent) win. */
+const ATT_GRACE_MIN = 10;
+function reliefAutoAbsent(iso, attDay){
+  if(!attDay) return { autoIds:[], forcedPresent:new Set(), forcedAbsent:new Set() };
+  const byMember = attDay.byMember||{};
+  const dayIdx = dayIndexFor(iso);
+  if(dayIdx<0) return { autoIds:[], forcedPresent:new Set(), forcedAbsent:new Set() };
+  const now = new Date(); const todayKey = schoolDayKey(now);
+  if(iso !== todayKey) return { autoIds:[], forcedPresent:new Set(), forcedAbsent:new Set() }; // auto only runs for today
+  const minutesNow = now.getHours()*60 + now.getMinutes();
+  const autoIds=[];
+  const forcedPresent = new Set(); // teachers who tapped "mark present" / clocked in despite being late
+  const forcedAbsent = new Set();  // teachers manually marked absent before bell
+  const rec=absRecRead(iso);
+  (rec.present||[]).forEach(id=>forcedPresent.add(id));
+  (rec.teachers||[]).forEach(id=>forcedAbsent.add(id));
+  Object.entries(byMember).forEach(([uid, mrec])=>{
+    if(!mrec) return;
+    const ev = mrec.events?Object.values(mrec.events):[];
+    ev.sort((a,b)=>(a.at||0)-(b.at||0));
+    const last = ev[ev.length-1];
+    if(last && last.kind==="in") forcedPresent.add(uid);
+  });
+  state.teachers.forEach(t=>{
+    if(forcedPresent.has(t.id)) return;
+    // only auto-mark teachers who actually teach today
+    const slots = slotsOfTeacherOn(t.id,dayIdx);
+    if(!slots.length) return;
+    const firstP = Math.min.apply(null, slots.map(s=>s.p));
+    const startMin = BELL_START + firstP*BELL_STEP + ATT_GRACE_MIN;
+    if(minutesNow >= startMin && !forcedPresent.has(t.id) && !forcedAbsent.has(t.id)){
+      autoIds.push(t.id);
+    }
+  });
+  return { autoIds, forcedPresent, forcedAbsent };
+}
+function reliefEffectiveAbsent(iso, attDay){
+  const rec = absRecRead(iso);
+  const manual = new Set(rec.teachers||[]);
+  const { autoIds, forcedPresent } = reliefAutoAbsent(iso, attDay);
+  const auto = new Set(autoIds.filter(id=>!manual.has(id) && !forcedPresent.has(id)));
+  const combined = new Set([...manual, ...auto]);
+  forcedPresent.forEach(id=>combined.delete(id));
+  return { manual, auto, combined };
+}
+function buildReliefCtx(iso, attDay){
+  const abs=absRecRead(iso); const dayIdx=dayIndexFor(iso);
+  const { combined } = reliefEffectiveAbsent(iso, attDay);
+  const absentSet=combined; const taken=new Set();
+  Object.entries(abs.relief||{}).forEach(([k,v])=>{ if(v) taken.add(v+"|"+k.split("|")[1]); });
+  return { abs, dayIdx, absentSet, taken, autoAbsent: reliefEffectiveAbsent(iso,attDay).auto };
+}
+function reliefCandidates(slot, ctx){
+  const cls=C(slot.classId);
+  const free = state.teachers.filter(t=>!ctx.absentSet.has(t.id) && !busyAtSlot(t.id,ctx.dayIdx,slot.p)
+    && !ctx.taken.has(t.id+"|"+slot.p) && !(typeof isBlocked==="function" && isBlocked(t,ctx.dayIdx,slot.p))
+    && canTeachClass(t, slot.classId));
+  /* fairness: fewer covers done → higher priority (industry standard) */
+  const rank = t => (cls?.classTeacherId===t.id?0:1)*1000 + (typeof coverCount==="function"?coverCount(t.id)*10:0) + dayLoad(t.id,ctx.dayIdx);
+  const match = free.filter(t=>(t.subjectIds||[]).includes(slot.subjectId)).sort((a,b)=>rank(a)-rank(b));
+  const others = free.filter(t=>!(t.subjectIds||[]).includes(slot.subjectId)).sort((a,b)=>rank(a)-rank(b));
+  return { match, others };
+}
+function autoAssignAll(iso, attDay){
+  const dayIdx=dayIndexFor(iso); if(dayIdx<0||dayIdx>=state.settings.daysPerWeek) return 0;
+  const rec=absRecWrite(iso); const taken=new Set(); let assigned=0;
+  const ctx={ dayIdx, absentSet: reliefEffectiveAbsent(iso,attDay).combined, taken, autoAbsent: reliefEffectiveAbsent(iso,attDay).auto };
+  [...ctx.absentSet].forEach(tid=>{
+    slotsOfTeacherOn(tid,dayIdx).forEach(slot=>{
+      const c=reliefCandidates(slot,ctx); const pick=c.match[0]||null;
+      rec.relief[slot.classId+"|"+slot.p+"|"+slot.li]=pick?pick.id:null;
+      if(pick){ taken.add(pick.id+"|"+slot.p); assigned++; }
+    });
+  });
+  return assigned;
+}
+function autoAssignForTeacher(iso, tid, attDay){
+  const dayIdx=dayIndexFor(iso); if(dayIdx<0||dayIdx>=state.settings.daysPerWeek) return 0;
+  const rec=absRecWrite(iso); const ctx=buildReliefCtx(iso,attDay);
+  ctx.dayIdx=dayIdx; ctx.absentSet=reliefEffectiveAbsent(iso,attDay).combined;
+  let assigned=0;
+  slotsOfTeacherOn(tid,dayIdx).forEach(slot=>{
+    const c=reliefCandidates(slot,ctx); const pick=c.match[0]||null;
+    rec.relief[slot.classId+"|"+slot.p+"|"+slot.li]=pick?pick.id:null;
+    if(pick){ ctx.taken.add(pick.id+"|"+slot.p); assigned++; }
+  });
+  return assigned;
+}
+
+/* ================= CLOUD SYNC ================= */
+const Sync = {
+  active:false, schoolId:null, rev:0, status:"synced", pending:false, localDirty:false, _lastSig:null,
+  _stateRef:null, _profileRef:null, _connRef:null, _pushTimer:null, _profileCache:{name:null,logo:null}, _profileReady:false,
+  attach(sid){
+    Sync.detach();
+    Sync.schoolId=sid; Sync.rev=0; Sync.localDirty=false; Sync.pending=false; Sync._lastSig=null;
+    Sync._profileCache={name:null,logo:null}; Sync._profileReady=false;
+    const cached=safeStore.jsonGet(cacheKey(sid),null); if(cached?.rev) Sync.rev=cached.rev; Sync.localDirty=!!cached?.dirty;
+    if (!FB.ready || !sid){ Sync.setStatus("synced"); return; }
+    Sync.active=true; Sync.setStatus("connecting");
+    const base=FB.db.ref("schools/"+sid);
+    Sync._connRef=FB.db.ref(".info/connected");
+    Sync._connRef.on("value", s=>{ Sync.setStatus(s.val()? (Sync.pending?"syncing":"synced") : "offline"); });
+    Sync._stateRef=base.child("state");
+    Sync._stateRef.on("value", snap=>{
+      const v=snap.val();
+      if (!v){ Sync.pushNow(); return; }
+      const cloudRev=v.rev||0, cloudSig=Sync.sigOf(v), localSig=Sync.sigOf(Store.raw);
+      if (v.origin===DEVICE_ID){ Sync.rev=Math.max(Sync.rev,cloudRev); Sync._lastSig=cloudSig; Sync.localDirty=false; Sync.setStatus("synced"); return; }
+      if (cloudRev<Sync.rev || (cloudRev===Sync.rev && Sync.localDirty)){ Sync.pushNow(); return; }
+      if (cloudRev===Sync.rev && cloudSig===localSig){ Sync._lastSig=cloudSig; Sync.localDirty=false; Sync.setStatus("synced"); return; }
+      /* cloud wins at equal revisions unless this device has explicitly-dirty offline data */
+      Sync.rev=cloudRev||Sync.rev;
+      Sync._lastSig=cloudSig; Sync.localDirty=false;
+      Store.replaceData(v);
+      Sync.setStatus("synced");
+    }, err=>{ console.warn("state sync:", err.message); Sync.setStatus("offline"); });
+    Sync._profileRef=base.child("profile");
+    Sync._profileRef.on("value", snap=>{
+      const m=snap.val(); Sync._profileReady=true; if(!m) return;
+      safeStore.jsonSet(accessKey(sid),{name:m.name||"School",status:m.status||"active",trialEnds:m.trialEnds||null,offer:m.offer||""});
+      const access=schoolAccessState(m);
+      if(!isSuper()&&access.blocked){ Session.accessBlocked=true; showSchoolBlocked(m,access); return; }
+      if(Session.accessBlocked){ Session.accessBlocked=false; showApp(); Store.requestRender(); }
+      Sync._profileCache={name:m.name||"", logo:m.logo||"", brand:m.brand||""};
+      const r=Store.raw;
+      if ((m.brand||"")!==(r.settings.brand||"")){ r.settings.brand=m.brand||""; Store.flush(); Store.requestRender(); }
+      applyBrand();
+      if ((m.name && m.name!==r.settings.schoolName) || ((m.logo||"")!==r.settings.logo)){
+        if (m.name) r.settings.schoolName=m.name;
+        r.settings.logo=m.logo||"";
+        Store.flush(); Store.requestRender();
+      }
+    });
+  },
+  detach(){
+    clearTimeout(Sync._pushTimer); Sync._pushTimer=null;
+    if (Sync._stateRef) Sync._stateRef.off();
+    if (Sync._profileRef) Sync._profileRef.off();
+    if (Sync._connRef) Sync._connRef.off();
+    Sync._stateRef=Sync._profileRef=Sync._connRef=null; Sync.active=false; Sync.pending=false; Sync.localDirty=false;
+    Sync.rev=0; Sync._profileReady=false; Sync._profileCache={name:null,logo:null};
+  },
+  schedulePush(){
+    if (!Sync.active || !FB.ready) return;
+    Sync.pending=true; Sync.localDirty=true; Sync.setStatus("syncing");
+    clearTimeout(Sync._pushTimer); Sync._pushTimer=setTimeout(()=>Sync.pushNow(), 700);
+  },
+  sigOf(v){ return JSON.stringify({version:1, settings:v.settings, teachers:v.teachers, subjects:v.subjects, classes:v.classes, curriculum:v.curriculum||[], timetable:v.timetable, absences:v.absences}); },
+  pushNow(){
+    if (!Sync.active || !FB.ready) return;
+    clearTimeout(Sync._pushTimer);
+    const sid=Sync.schoolId;
+    const r=Store.raw;
+    const body={ version:1, settings:{...r.settings}, teachers:r.teachers, subjects:r.subjects, classes:r.classes,
+      curriculum:r.curriculum||[], timetable:r.timetable, absences:r.absences };
+    const sig=JSON.stringify(body);
+    const nm=r.settings.schoolName||"", lg=r.settings.logo||"";
+    const brandNow=r.settings.brand||"";
+    if (Sync._profileReady && canEditBranding() && !canEditSettings() && lg!==(Sync._profileCache.logo||"")){
+      FB.db.ref("schools/"+sid+"/profile/logo").set(lg)
+        .then(()=>{ if(Sync.schoolId===sid) Sync._profileCache.logo=lg; }).catch(()=>{});
+    }
+    if (Sync._profileReady && canEditBranding() && brandNow!==(Sync._profileCache.brand||"")){
+      FB.db.ref("schools/"+sid+"/profile/brand").set(brandNow||null)
+        .then(()=>{ if(Sync.schoolId===sid) Sync._profileCache.brand=brandNow; }).catch(()=>{});
+    }
+    if (Sync._profileReady && canEditSettings() && (nm!==Sync._profileCache.name || lg!==Sync._profileCache.logo)){
+      FB.db.ref("schools/"+sid+"/profile").update({name:nm,logo:lg})
+        .then(()=>{ if(Sync.schoolId===sid) Sync._profileCache={name:nm,logo:lg}; })
+        .catch(()=>{});                                      /* remains different, so next push retries */
+    }
+    if (sig===Sync._lastSig){ Sync.pending=false; Sync.localDirty=false; Store.flush(); if(Sync.status!=="offline") Sync.setStatus("synced"); return; }
+    Sync._lastSig=sig;
+    Sync.rev+=1;
+    const writeRev=Sync.rev;
+    const payload={ ...body, rev:writeRev, origin:DEVICE_ID, updatedAt:firebase.database.ServerValue.TIMESTAMP };
+    return FB.db.ref("schools/"+sid+"/state").set(payload)
+      .then(()=>{
+        safeStore.jsonSet(cacheKey(sid),{...body,rev:writeRev,dirty:false});
+        if(Sync.schoolId===sid){ Sync.pending=false; Sync.localDirty=false; Sync.setStatus("synced"); }
+      })
+      .catch(err=>{
+        console.warn("push:",err.message);
+        safeStore.jsonSet(cacheKey(sid),{...body,rev:writeRev,dirty:true});
+        if(Sync.schoolId===sid){ Sync.localDirty=true; Sync.setStatus("offline"); Sync._lastSig=null; }
+      });
+  },
+  setStatus(st){ Sync.status=st; renderSyncPill(); }
+};
+const SYNC_UI = {
+  connecting: ["ph-arrows-clockwise dot-anim","text-sky-600 bg-sky-50 border-sky-200/70","sync.connecting"],
+  syncing:    ["ph-arrows-clockwise dot-anim","text-amber-600 bg-amber-50 border-amber-200/70","sync.syncing"],
+  synced:     ["ph-cloud-check","text-emerald-600 bg-emerald-50 border-emerald-200/70","sync.synced"],
+  offline:    ["ph-cloud-slash","text-rose-500 bg-rose-50 border-rose-200/70","sync.offline"]
+};
+function renderSyncPill(){
+  const el=$("#sync-pill"); if(!el) return;
+  const [icon,cls,key]=SYNC_UI[Sync.status]||SYNC_UI.synced;
+  const txt=t(key);
+  el.innerHTML=`<div class="flex items-center gap-1.5 text-[11px] font-bold border rounded-full pl-2.5 pr-3 h-8 ${cls}">
+    <i class="ph-fill ${icon}"></i><span class="hidden sm:inline">${txt}</span></div>`;
+}
+
+/* ================= TEAM SYNC (members) ================= */
+const Team = {
+  _meRef:null, _allRef:null,
+  attach(sid){
+    Team.detach();
+    if (!FB.ready || !sid) return;
+    if (isSuper()){ App.me=null; Team.attachAll(sid); return; }
+    Team._meRef=FB.db.ref("schools/"+sid+"/members/"+Session.uid);
+    Team._meRef.on("value", snap=>{
+      const m=snap.val();
+      App.me = m || null;
+      if (m && m.active===false){ revokeAccess(); return; }
+      if (!m){ revokeAccess(); return; }   /* membership deleted → end session at once */
+      if (canViewUsers()) Team.attachAll(sid); else Team.detachAll();
+      Store.requestRender();
+    });
+  },
+  attachAll(sid){
+    if (Team._allRef && Team._allSid===sid) return;
+    Team.detachAll();
+    Team._allSid=sid;
+    Team._allRef=FB.db.ref("schools/"+sid+"/members");
+    Team._allRef.on("value", snap=>{ App.members=snap.val()||{}; Store.requestRender(); },
+      err=>console.warn("members:", err.message));
+  },
+  detachAll(){ if (Team._allRef) Team._allRef.off(); Team._allRef=null; Team._allSid=null; App.members={}; },
+  detach(){ if (Team._meRef) Team._meRef.off(); Team._meRef=null; Team.detachAll(); App.me=null; }
+};
+function revokeAccess(){
+  toast("error","Access revoked","Your account was deactivated by an administrator.");
+  setTimeout(()=>signOut(true), 900);
+}
+
+/* ================= TOASTS ================= */
+const TOAST_ICON={ success:["ph-check-circle","text-emerald-500 bg-emerald-500/10"], error:["ph-warning-circle","text-rose-500 bg-rose-500/10"], info:["ph-info","text-sky-500 bg-sky-500/10"] };
+function toast(type,title,msg=""){
+  const root=$("#toast-root"); if(root.children.length>=4) root.firstElementChild.remove();
+  const [icon,cls]=TOAST_ICON[type]||TOAST_ICON.info;
+  const el=document.createElement("div"); el.className="toast";
+  el.innerHTML=`<div class="tile w-8 h-8 rounded-lg ${cls} text-base"><i class="ph-fill ${icon}"></i></div>
+    <div class="min-w-0 flex-1 pt-0.5"><div class="text-[13px] font-bold leading-tight">${esc(title)}</div>
+    ${msg?`<div class="text-xs text-zinc-500 mt-0.5 leading-snug">${esc(msg)}</div>`:""}</div>
+    <button class="icon-btn !w-8 !h-8 !rounded-lg -mr-1 -mt-0.5" data-action="toast-close" aria-label="Dismiss"><i class="ph ph-x"></i></button>`;
+  root.appendChild(el);
+  setTimeout(()=>{ el.classList.add("leaving"); setTimeout(()=>el.remove(),240); }, 3600);
+}
+
+/* ================= MODALS ================= */
+const Modal={
+  current:null, skipNext:false, _closeTimer:null, _returnFocus:null,
+  open(renderFn,opts={}){
+    /* Object form: { title, body, actions:[{label, kind, action}] }. Actions run through
+       data-action="modal-run" and may throw 0 to keep the dialog open (e.g. validation). */
+    if (typeof renderFn!=="function"){
+      const cfg=renderFn||{}, acts=Array.isArray(cfg.actions)?cfg.actions:[];
+      Modal._cfgActions=acts;
+      opts={reactive:false,...opts};
+      renderFn=()=>`<div class="p-6"><h3 class="font-display font-bold text-lg tracking-tight">${esc(cfg.title||"")}</h3>
+        <div class="mt-4">${cfg.body||""}</div>
+        <div class="mt-5 flex flex-wrap gap-2 justify-end">${acts.map((a,i)=>`<button class="btn ${a.kind==="primary"?"btn-primary":"btn-ghost"}" data-action="modal-run" data-idx="${i}">${esc(a.label)}</button>`).join("")}</div></div>`;
+    } else Modal._cfgActions=null;
+    clearTimeout(Modal._closeTimer); Modal._closeTimer=null;   /* never let an old close wipe a new modal */
+    Modal.skipNext=false;
+    if (!Modal.current) Modal._returnFocus=document.activeElement;
+    Modal.current={renderFn,reactive:opts.reactive!==false};
+    document.body.classList.add("modal-open");
+    const app=$("#app"), login=$("#login-root");
+    if(app) app.inert=true;
+    if(login) login.inert=true;
+    $("#modal-root").innerHTML=`<div class="modal-backdrop" data-action="modal-backdrop"><div class="modal-panel" role="dialog" aria-modal="true" id="modal-panel"></div></div>`;
+    Modal.rerender();
+  },
+  /* Rebuilding innerHTML between mousedown and mouseup cancels the click, so typing
+     (which fires on every keystroke) must never rebuild the dialog. */
+  rerender(){
+    if (Modal.skipNext){ Modal.skipNext=false; return; }
+    const p=$("#modal-panel");
+    if (p && Modal.current){
+      try { p.innerHTML=Modal.current.renderFn(); }
+      catch(err){ console.warn("modal render failed:", err);
+        p.innerHTML=`<div class="p-6"><p class="text-sm text-zinc-600">Something went wrong drawing this dialog.</p>
+          <button class="btn btn-primary w-full mt-4" data-action="modal-close">Close</button></div>`; }
+    }
+  },
+  close(){
+    const bd=$(".modal-backdrop"); Modal.current=null; Modal.skipNext=false;
+    if(typeof confirmResolver!=="undefined"&&confirmResolver){ const cancel=confirmResolver; confirmResolver=null; cancel(false); }
+    /* The green ⋮ menu button must always reopen — a backdrop/Escape close used to leave
+       aria-expanded="true" so the button silently turned into a no-op afterwards. */
+    $("#hdr-menu")?.setAttribute("aria-expanded","false");
+    clearTimeout(Modal._closeTimer);
+    const done=()=>{ $("#modal-root").innerHTML=""; Modal._closeTimer=null; document.body.classList.remove("modal-open");
+      const app=$("#app"), login=$("#login-root");
+      if(app) app.inert=false;
+      if(login) login.inert=false;
+      if (viewDirty) Store.requestRender();
+      const back=Modal._returnFocus; Modal._returnFocus=null;
+      if(back?.isConnected && !back.closest("[hidden]")) setTimeout(()=>back.focus({preventScroll:true}),0);
+    };                                                    /* catch up on skipped background renders */
+    if(!bd){ done(); return; }
+    bd.classList.add("closing");
+    Modal._closeTimer=setTimeout(done,190);
+  }
+};
+let viewDirty=false;
+let confirmResolver=null;
+function confirmDialog({title,message,confirmLabel="Delete",tone="danger",icon="ph-trash"}){
+  return new Promise(resolve=>{
+    confirmResolver=resolve;
+    const toneBtn=tone==="danger"?"btn-danger":"btn-primary";
+    const tileCls=tone==="danger"?"text-rose-500 bg-rose-500/10":"text-emerald-600 bg-emerald-500/10";
+    Modal.open(()=>`
+      <div class="p-6">
+        <div class="flex items-start gap-4">
+          <div class="tile ${tileCls} rounded-xl"><i class="ph-fill ${icon} text-xl"></i></div>
+          <div class="min-w-0 flex-1">
+            <h3 class="font-display font-bold text-lg tracking-tight">${esc(title)}</h3>
+            <p class="text-sm text-zinc-500 mt-1 leading-relaxed">${message}</p>
+          </div>
+        </div>
+        <div class="flex gap-2.5 mt-6">
+          <button class="btn btn-ghost flex-1" data-action="confirm-respond" data-val="0">Cancel</button>
+          <button class="btn ${toneBtn} flex-1" data-action="confirm-respond" data-val="1">${esc(confirmLabel)}</button>
+        </div>
+      </div>`);
+  });
+}
+
+/* ================= CELL EDITOR / VIEWER ================= */
+const cellEditor={ showAll:false };
+function quickCombos(cid,d,p){
+  const ctId=C(cid)?.classTeacherId;
+  const combos=[];
+  state.teachers.forEach(t=>{
+    if (!canTeachClass(t,cid)) return;                 /* grade limit */
+    (t.subjectIds||[]).forEach(sid=>{ const s=S(sid); if (s) combos.push({t,s}); });
+  });
+  const rank=q=> (q.t.id===ctId?0:100) + (busyAtSlot(q.t.id,d,p,cid)?20:0)
+    + ((typeof isBlocked==="function" && isBlocked(q.t,d,p))?10:0) + Math.min(dayLoad(q.t.id,d),9);
+  return combos.sort((a,b)=>rank(a)-rank(b)).slice(0,15);
+}
+function cellLessonRow(cid,d,p,L,li,total){
+  const subj=L.subjectId?S(L.subjectId):null;
+  const selTid=L.teacherId||"";
+  const selT=selTid?T(selTid):null;
+  /* subjects: chosen teacher's own subjects float to the top (one teacher, many subjects) */
+  let subjList=state.subjects;
+  if (selT && (selT.subjectIds||[]).length){
+    subjList=[...state.subjects].sort((a,b)=>{
+      const ta=(selT.subjectIds||[]).includes(a.id)?0:1, tb=(selT.subjectIds||[]).includes(b.id)?0:1;
+      return ta-tb;
+    });
+  }
+  let pool=subj?teacherOfSubject(subj.id,cid):[];
+  const noTeachers=subj && pool.length===0 && !cellEditor.showAll;
+  if (cellEditor.showAll || !subj) pool=state.teachers.filter(t=>canTeachClass(t,cid));
+  const clsT=C(cid)?.classTeacherId;
+  if (clsT && pool.length){
+    if (!pool.some(t=>t.id===clsT) && T(clsT) && canTeachClass(T(clsT),cid)) pool=[T(clsT), ...pool];
+    else pool=[...pool].sort((a,b)=>(b.id===clsT?1:0)-(a.id===clsT?1:0));
+  }
+  /* keep an already-chosen teacher visible even if outside their grades, with a clear note */
+  const offGrade = selTid && !pool.some(t=>t.id===selTid) ? T(selTid) : null;
+  if (offGrade) pool=[offGrade, ...pool];
+  const otherBusy=selTid?busyAtSlot(selTid,d,p,cid):null;
+  return `<div class="border border-zinc-200/80 rounded-xl p-3 space-y-2.5 bg-zinc-50/50">
+    <div class="flex items-center justify-between">
+      <span class="text-[10px] font-extrabold uppercase tracking-[.08em] ${total>1?"text-sky-600":"text-zinc-400"}">${total>1?"Group "+(li+1)+" · parallel stream":"Lesson"}</span>
+      <button class="icon-btn danger !w-9 !h-9" data-action="cell-remove" data-cid="${cid}" data-d="${d}" data-p="${p}" data-li="${li}" aria-label="Remove this group"><i class="ph ph-trash text-sm"></i></button>
+    </div>
+    <div class="grid ${subj?"grid-cols-1":"grid-cols-1"} gap-2.5">
+      <div>
+        <label class="label">Subject ${selT&&!subj?`<span class="normal-case font-semibold text-emerald-600">· ${esc((selT.name||"").split(" ")[0])}'s subjects first</span>`:""}</label>
+        <select class="field" data-fid="cell-subj-${li}" data-change="cell-subject" data-cid="${cid}" data-d="${d}" data-p="${p}" data-li="${li}">
+          <option value="">— Select subject —</option>
+          ${subjList.map(s=>`<option value="${s.id}" ${subj?.id===s.id?"selected":""}>${esc(s.name)} (${esc(s.code)})${selT&&(selT.subjectIds||[]).includes(s.id)?" ✓":""}</option>`).join("")}
+        </select>
+      </div>
+      <div>
+        <label class="label">Teacher</label>
+          <select class="field" data-fid="cell-teach-${li}" data-change="cell-teacher" data-cid="${cid}" data-d="${d}" data-p="${p}" data-li="${li}">
+            <option value="">${subj ? (noTeachers?"No teacher (leave unassigned)":"— Select teacher —") : "— Pick teacher · subject auto-fills —"}</option>
+            ${pool.map(t=>`<option value="${t.id}" ${selTid===t.id?"selected":""}>${esc(t.name)} (${esc(t.code)})${t.id===clsT?" · CLASS TEACHER":""}${offGrade&&t.id===offGrade.id?" · OUTSIDE THEIR GRADES":""}${subj&&cellEditor.showAll && !(t.subjectIds||[]).includes(subj?.id)?" — off-subject":""}</option>`).join("")}
+          </select>
+          ${noTeachers?`<div class="mt-1.5 text-[11px] text-amber-700 font-semibold flex items-center gap-1.5"><i class="ph-fill ph-warning"></i>No teacher for ${esc(subj.name)} in ${esc(gradeLabel(gradeOf(cid)))} — check who teaches it and their grade limits.</div>`:""}
+          ${offGrade?`<div class="mt-1.5 text-[11px] text-amber-700 font-semibold flex items-center gap-1.5"><i class="ph-fill ph-warning"></i>${esc(offGrade.name)} isn't assigned to ${esc(gradeLabel(gradeOf(cid)))} — update their grades in Database → Teachers, or pick someone else.</div>`:""}
+        ${otherBusy?`<div class="mt-1.5 text-[11px] text-rose-600 font-semibold flex items-center gap-1.5"><i class="ph-fill ph-warning-octagon"></i>${esc(selT?.name||"")} is already teaching ${esc(otherBusy.name)} in this slot</div>`:""}
+      </div>
+    </div>
+  </div>`;
+}
+function openCellEditor(cid,d,p){
+  cellEditor.showAll=false;
+  Modal.open(()=>{
+    const cls=C(cid); if(!cls) return `<div class="p-6 text-sm text-zinc-500">Class no longer exists.</div>`;
+    const lessons=lessonsOf(getCell(cid,d,p));
+    const anySubject=lessons.some(L=>L.subjectId);
+    const dayChips=Array.from({length:state.settings.daysPerWeek},(_,dd)=>dd===d?null:
+      `<button class="chip !cursor-pointer hover:!bg-emerald-100 !min-h-[34px]" data-action="cell-repeat-day" data-cid="${cid}" data-d="${d}" data-p="${p}" data-target="${dd}" title="Copy this slot to ${DAYS_FULL[dd]}">${DAYS_SHORT[dd]}</button>`).join("");
+    return `
+    <div class="p-6 pb-7">
+      <div class="flex items-start justify-between gap-3">
+        <div>
+          <div class="text-[11px] font-bold uppercase tracking-[.08em] text-emerald-600">${esc(cls.name)}</div>
+          <h3 class="font-display font-bold text-xl tracking-tight mt-0.5">${DAYS_FULL[d]} · Period ${p+1}</h3>
+          <div class="text-xs text-zinc-500 font-medium mt-0.5 tabular-nums">${bell(p)} – ${bellEnd(p)} · 45 min</div>
+        </div>
+        <button class="icon-btn" data-action="modal-close" aria-label="Close"><i class="ph ph-x text-lg"></i></button>
+      </div>
+      <div class="mt-4 space-y-3">
+        ${lessons.length? lessons.map((L,li)=>cellLessonRow(cid,d,p,L,li,lessons.length)).join("") :
+          `<div class="border border-dashed border-zinc-300 rounded-xl p-5 text-center">
+             <i class="ph ph-plus-circle text-2xl text-zinc-300"></i>
+             <p class="text-xs text-zinc-400 font-medium mt-1.5">Empty slot. Add a lesson — or several for parallel subject baskets.</p>
+           </div>`}
+        <div class="flex items-center gap-2">
+          <button class="btn btn-soft flex-1 !min-h-[42px]" data-action="cell-add" data-cid="${cid}" data-d="${d}" data-p="${p}" ${state.subjects.length?"":"disabled"}>
+            <i class="ph ph-plus"></i>${lessons.length?"Add subject group":"Add lesson"}</button>
+          ${anySubject?`<button class="btn btn-ghost !min-h-[42px] !px-3" data-action="cell-show-all" title="Toggle teacher pool"><i class="ph ph-users-three"></i><span class="hidden sm:inline">${cellEditor.showAll?"Subject teachers":"All teachers"}</span></button>`:""}
+        </div>
+        ${state.subjects.length?"":`<p class="text-[11px] text-amber-700 font-semibold">Create subjects first (Database → Subjects).</p>`}
+        ${quickCombos(cid,d,p).length?`
+        <div class="pt-1">
+          <div class="text-[10px] font-extrabold uppercase tracking-wide text-zinc-400 mb-1.5 flex items-center gap-1.5"><i class="ph-fill ph-lightning text-emerald-500"></i>Quick assign — one tap</div>
+          <div class="flex flex-wrap gap-1.5">
+            ${quickCombos(cid,d,p).map(q=>{
+              const busy=busyAtSlot(q.t.id,d,p,cid);
+              return `<button class="chip !cursor-pointer min-h-[34px] ${busy?"opacity-45":""}" style="background:${q.s.color}14;color:${q.s.color};border-color:${q.s.color}30"
+                data-action="cell-quick" data-cid="${cid}" data-d="${d}" data-p="${p}" data-tid="${q.t.id}" data-sid="${q.s.id}" ${busy?`title="${esc(q.t.name)} is busy at this slot"`:""}>
+                ${busy?`<i class="ph-fill ph-warning-octagon"></i>`:""}<b>${esc(q.t.code)}</b>·${esc(q.s.code)}</button>`; }).join("")}
+          </div>
+        </div>`:""}
+        ${lessons.length?`
+        <div class="flex items-center gap-1.5 flex-wrap pt-1">
+          <span class="text-[10px] font-extrabold uppercase tracking-wide text-zinc-400 mr-1">Repeat slot →</span>${dayChips}
+        </div>`:""}
+        <div class="flex gap-2.5 pt-1">
+          <button class="btn btn-ghost flex-1 ${lessons.length?"":"invisible"}" data-action="clear-cell" data-cid="${cid}" data-d="${d}" data-p="${p}"><i class="ph ph-eraser"></i>Clear</button>
+          <button class="btn btn-primary flex-1" data-action="modal-close"><i class="ph ph-check"></i>Done</button>
+        </div>
+        <p class="text-[11px] text-zinc-400 text-center flex items-center justify-center gap-1.5"><i class="ph-fill ph-lightning text-emerald-500"></i>Everything saves &amp; syncs instantly · Ctrl+Z to undo</p>
+      </div>
+    </div>`;
+  });
+}
+function openCellViewer(cid,d,p){
+  const cls=C(cid); if(!cls) return;
+  const lessons=lessonsOf(getCell(cid,d,p));
+  Modal.open(()=>`
+    <div class="p-6">
+      <div class="flex items-start justify-between">
+        <div>
+          <div class="text-[11px] font-bold uppercase tracking-[.08em] text-emerald-600">${esc(cls.name)}</div>
+          <h3 class="font-display font-bold text-xl tracking-tight mt-0.5">${lessons.length?(lessons.length>1?lessons.length+" parallel groups":esc(S(lessons[0].subjectId)?.name||"Lesson")):"Free period"}</h3>
+          <div class="text-xs text-zinc-500 font-medium mt-0.5 tabular-nums">${DAYS_FULL[d]} · Period ${p+1} · ${bell(p)} – ${bellEnd(p)}</div>
+        </div>
+        <button class="icon-btn" data-action="modal-close" aria-label="Close"><i class="ph ph-x text-lg"></i></button>
+      </div>
+      ${lessons.length? `<div class="mt-4 space-y-2.5">`+lessons.map(L=>{
+        const s=S(L.subjectId), t=L.teacherId?T(L.teacherId):null;
+        return `<div class="flex items-center gap-3 bg-zinc-50 border border-zinc-200/70 rounded-xl p-3">
+          <span class="subj-pill !text-[11px]" style="background:${s?.color||"#a1a1aa"}1c;color:${s?.color||"#71717a"}">${esc(s?.code||"?")}</span>
+          <div class="min-w-0"><div class="text-sm font-bold truncate">${esc(s?.name||"Unknown subject")}</div>
+          <div class="text-[11px] ${t?"text-zinc-500":"text-amber-600 font-semibold"}">${t?esc(t.name):"No teacher assigned"}</div></div>
+        </div>`; }).join("")+`</div>`:`<p class="text-sm text-zinc-500 mt-4">This slot is unscheduled.</p>`}
+      <div class="flex items-center gap-2 mt-5 text-[11px] text-zinc-400 justify-center"><i class="ph-fill ph-lock-simple text-zinc-300"></i>View-only access — ask your principal for edit rights</div>
+    </div>`);
+}
+/* ---- bulk day / week tools ---- */
+function openDayTools(cid){
+  const cls=C(cid); if(!cls||!canEdit()) return;
+  Modal.open(()=>`
+    <div class="p-6">
+      <div class="flex items-start justify-between">
+        <div><h3 class="font-display font-bold text-xl tracking-tight">Bulk tools · ${esc(cls.name)}</h3>
+        <p class="text-xs text-zinc-500 mt-0.5">Duplicate a whole day in one tap, or reset the week.</p></div>
+        <button class="icon-btn" data-action="modal-close" aria-label="Close"><i class="ph ph-x text-lg"></i></button>
+      </div>
+      <div class="mt-5 space-y-4">
+        <div><label class="label">Copy from</label>
+          <select class="field" id="dt-src">${Array.from({length:state.settings.daysPerWeek},(_,dd)=>`<option value="${dd}">${DAYS_FULL[dd]}</option>`).join("")}</select></div>
+        <div><label class="label">Onto days</label>
+          <div class="grid grid-cols-3 gap-2">
+            ${Array.from({length:state.settings.daysPerWeek},(_,dd)=>`<label class="subj-check"><input type="checkbox" class="sr-only dt-dst" value="${dd}">
+              <span class="cbox w-full">${DAYS_SHORT[dd]}</span></label>`).join("")}
+          </div></div>
+        <button class="btn btn-primary w-full" data-action="day-copy-apply" data-cid="${cid}"><i class="ph ph-copy"></i>Copy day onto selected</button>
+        <div class="border-t border-zinc-100 pt-4">
+          <button class="btn btn-danger w-full" data-action="class-clear-week" data-cid="${cid}"><i class="ph ph-eraser"></i>Clear entire week for this class</button>
+        </div>
+      </div>
+    </div>`);
+}
+
+/* ================= TEACHER / SUBJECT FORMS ================= */
+const teacherForm={ showAvail:false };
+function openTeacherForm(id){
+  if (id){
+    if (!T(id)) return;
+    teacherForm.showAvail=false;
+    Modal.open(()=>{
+      const t=T(id); /* fresh lookup every render — never a stale reference */
+      if (!t) return `<div class="p-6 text-sm text-zinc-500">This teacher no longer exists.</div>`;
+      const linked=Object.entries(App.members).find(([_,m])=>m.teacherId===t.id);
+      const blocks=(t.unavailable||[]).length;
+      return `
+      <div class="p-6">
+        <div class="flex items-start justify-between gap-3">
+          <div class="flex items-center gap-3 min-w-0">
+            <div class="tile rounded-xl text-[13px] font-extrabold" style="background:${t.color}1a;color:${t.color}">${esc(t.code||initials(t.name))}</div>
+            <div class="min-w-0"><h3 class="font-display font-bold text-lg tracking-tight truncate">${esc(t.name||"Teacher")}</h3>
+            <div class="text-[11px] text-zinc-500 font-semibold">${teacherLoad(t.id)} periods/week</div></div>
+          </div>
+          <button class="icon-btn" data-action="modal-close" aria-label="Close"><i class="ph ph-x text-lg"></i></button>
+        </div>
+        ${linked?`<div class="mt-3 flex items-center gap-2 text-[11px] font-semibold text-sky-700 bg-sky-50 border border-sky-200/70 rounded-xl px-3 py-2"><i class="ph-fill ph-link"></i>Linked account: ${esc(linked[1].email||"")}</div>`:""}
+        <div class="space-y-4 mt-4">
+          <div class="grid grid-cols-3 gap-2.5">
+            <div class="col-span-2"><label class="label">Full name</label>
+              <input class="field" data-fid="tf-name-${t.id}" data-input="live-teacher-name" data-id="${t.id}" value="${esc(t.name||"")}" autocomplete="off"></div>
+            <div><label class="label">Code</label>
+              <input class="field font-mono uppercase !px-2 text-center" maxlength="5" data-fid="tf-code-${t.id}" data-input="live-teacher-code" data-id="${t.id}" value="${esc(t.code||"")}" autocomplete="off"></div>
+          </div>
+          <div><label class="label">Teaches subjects <span class="normal-case font-semibold text-emerald-600">· pick as many as needed</span></label>
+            <div class="grid grid-cols-2 sm:grid-cols-3 gap-2 max-h-[180px] overflow-y-auto pr-1">
+              ${state.subjects.map(s=>`<label class="subj-check"><input type="checkbox" class="sr-only" data-change="live-teacher-subj" data-id="${t.id}" data-sid="${s.id}" ${(t.subjectIds||[]).includes(s.id)?"checked":""}>
+                <span class="cbox w-full"><span class="w-2 h-2 rounded-full flex-none" style="background:${s.color}"></span><span class="truncate">${esc(s.code)}</span></span></label>`).join("") || `<div class="col-span-3 text-xs text-zinc-400 py-2">No subjects yet — create them in the Subjects tab.</div>`}
+            </div></div>
+          <div>
+            <label class="label">Grades they work with <span class="normal-case font-semibold text-zinc-400">· optional</span></label>
+            <div class="flex flex-wrap gap-1.5">
+              ${allGrades().map(g=>`<label class="subj-check"><input type="checkbox" class="sr-only" data-change="live-teacher-grade" data-id="${t.id}" data-g="${esc(g)}" ${(teacherGrades(t)||[]).includes(g)?"checked":""}>
+                <span class="cbox"><span class="font-bold">${esc(g)}</span></span></label>`).join("")}
+            </div>
+            <div class="flex items-center gap-2 mt-2 flex-wrap">
+              ${teacherGrades(t)===null
+                ? `<span class="chip"><i class="ph-fill ph-check-circle text-emerald-500"></i>Any grade</span>`
+                : `<button class="text-[11px] font-bold text-emerald-600 underline min-h-[28px]" data-action="teacher-all-grades" data-id="${t.id}">Allow any grade</button>`}
+              ${Array.isArray(t.grades)&&t.grades.length===0?`<span class="chip !bg-rose-50 !text-rose-600 !border-rose-200"><i class="ph-fill ph-warning"></i>No grades — can't be scheduled</span>`:""}
+            </div>
+            <p class="text-[10px] text-zinc-400 mt-1.5 leading-relaxed">Leave on <b>Any grade</b> for most staff. Tick only the grades this teacher is assigned to — e.g. a teacher who only teaches Grade 6.</p>
+          </div>
+          <div><label class="label">Avatar color</label>
+            <div class="flex flex-wrap gap-2">
+              ${PALETTE.map(c=>`<label><input type="radio" name="tcol${t.id}" class="sr-only" data-change="live-teacher-color" data-id="${t.id}" value="${c}" ${t.color===c?"checked":""}>
+                <span class="swatch block" style="background:${c}"></span></label>`).join("")}
+            </div></div>
+          <div class="border-t border-zinc-100 pt-3">
+            <button class="flex items-center gap-2 w-full text-left min-h-[40px]" data-action="tf-toggle-avail">
+              <i class="ph ${teacherForm.showAvail?"ph-caret-down":"ph-caret-right"} text-zinc-400"></i>
+              <span class="text-[12px] font-bold">Unavailable periods</span>
+              ${blocks?`<span class="badge bg-amber-100 text-amber-800">${blocks} blocked</span>`:`<span class="text-[11px] text-zinc-400 font-medium">optional</span>`}
+            </button>
+            ${teacherForm.showAvail?`
+            <div class="overflow-x-auto mt-2"><table style="border-collapse:separate;border-spacing:3px">
+              <thead><tr><th></th>${Array.from({length:state.settings.periodsPerDay},(_,p)=>`<th class="text-[9px] font-bold text-zinc-400">${p+1}</th>`).join("")}</tr></thead>
+              <tbody>${Array.from({length:state.settings.daysPerWeek},(_,d)=>`<tr>
+                <td class="text-[9px] font-extrabold text-zinc-400 pr-1">${DAYS_SHORT[d]}</td>
+                ${Array.from({length:state.settings.periodsPerDay},(_,p)=>{ const off=isBlocked(t,d,p);
+                  return `<td><label class="block"><input type="checkbox" class="sr-only" data-change="teacher-block" data-id="${t.id}" data-d="${d}" data-p="${p}" ${off?"checked":""}>
+                  <span class="block w-7 h-7 rounded-md border cursor-pointer transition-all ${off?"bg-amber-400 border-amber-500":"bg-zinc-50 border-zinc-200 hover:border-zinc-300"}"></span></label></td>`; }).join("")}
+              </tr>`).join("")}</tbody></table></div>
+            <p class="text-[10px] text-zinc-400 mt-1.5">Blocked periods are skipped by auto-generate, relief matching and the free-teacher finder.</p>`:""}
+          </div>
+        </div>
+        <button class="btn btn-primary w-full mt-5" data-action="modal-close"><i class="ph ph-check"></i>Done</button>
+        <p class="text-[11px] text-zinc-400 text-center mt-2 flex items-center justify-center gap-1.5"><i class="ph-fill ph-lightning text-emerald-500"></i>Saves instantly as you type</p>
+      </div>`;
+    });
+  } else {
+    Modal.open(()=>`
+      <form class="p-6" data-form="teacher-draft" autocomplete="off">
+        <div class="flex items-start justify-between"><h3 class="font-display font-bold text-xl tracking-tight">Add teacher</h3>
+        <button type="button" class="icon-btn" data-action="modal-close" aria-label="Close"><i class="ph ph-x text-lg"></i></button></div>
+        <div class="space-y-4 mt-4">
+          <div><label class="label">Full name</label>
+            <input class="field" id="draft-t-name" placeholder="e.g. Jane Cooper"></div>
+          <div><label class="label">Code</label>
+            <input class="field font-mono uppercase" id="draft-t-code" maxlength="5" placeholder="Auto from initials"></div>
+          <div><label class="label">Teaches subjects</label>
+            <div class="grid grid-cols-2 gap-2">
+              ${state.subjects.map(s=>`<label class="subj-check"><input type="checkbox" class="sr-only draft-t-subj" value="${s.id}">
+                <span class="cbox w-full"><span class="w-2 h-2 rounded-full" style="background:${s.color}"></span>${esc(s.code)}</span></label>`).join("") || `<div class="col-span-2 text-xs text-zinc-400 py-2">No subjects yet — create them first.</div>`}
+            </div></div>
+          ${state.classes.length?`<div>
+            <label class="label">Grades they work with <span class="normal-case font-semibold text-zinc-400">· optional</span></label>
+            <div class="flex flex-wrap gap-1.5">
+              ${allGrades().map(g=>`<label class="subj-check"><input type="checkbox" class="sr-only draft-t-grade" value="${esc(g)}">
+                <span class="cbox"><span class="font-bold">${esc(g)}</span></span></label>`).join("")}
+            </div>
+            <p class="text-[10px] text-zinc-400 mt-1.5 leading-relaxed">Leave empty for any grade. Tick only the grades this teacher is assigned to — e.g. a teacher who only teaches Grade 6.</p>
+          </div>`:""}
+          <div><label class="label">Avatar color</label>
+            <div class="flex flex-wrap gap-2">
+              ${PALETTE.map((c,i)=>`<label><input type="radio" name="dcol" class="sr-only draft-t-color" value="${c}" ${i===state.teachers.length%PALETTE.length?"checked":""}>
+                <span class="swatch block" style="background:${c}"></span></label>`).join("")}
+            </div></div>
+        </div>
+        <button type="submit" class="btn btn-primary w-full mt-6"><i class="ph ph-plus"></i>Add teacher</button>
+      </form>`);
+  }
+}
+function openSubjectForm(id){
+  if (id){
+    const s=S(id); if(!s) return;
+    Modal.open(()=>`
+      <div class="p-6">
+        <div class="flex items-start justify-between"><h3 class="font-display font-bold text-xl tracking-tight">Edit subject</h3>
+        <button class="icon-btn" data-action="modal-close" aria-label="Close"><i class="ph ph-x text-lg"></i></button></div>
+        <div class="space-y-4 mt-4">
+          <div><label class="label">Subject name</label>
+            <input class="field" data-fid="sf-name" data-input="live-subject-name" data-id="${s.id}" value="${esc(s.name)}" autocomplete="off"></div>
+          <div><label class="label">Code</label>
+            <input class="field font-mono uppercase" maxlength="5" data-fid="sf-code" data-input="live-subject-code" data-id="${s.id}" value="${esc(s.code)}" autocomplete="off"></div>
+          <div><label class="label">Color</label>
+            <div class="flex flex-wrap gap-2">
+              ${SUBJ_COLORS.map(c=>`<label><input type="radio" name="scol${s.id}" class="sr-only" data-change="live-subject-color" data-id="${s.id}" value="${c}" ${s.color===c?"checked":""}>
+                <span class="swatch block" style="background:${c}"></span></label>`).join("")}
+            </div></div>
+        </div>
+        <button class="btn btn-primary w-full mt-6" data-action="modal-close"><i class="ph ph-check"></i>Done</button>
+      </div>`);
+  } else {
+    Modal.open(()=>`
+      <form class="p-6" data-form="subject-draft" autocomplete="off">
+        <div class="flex items-start justify-between"><h3 class="font-display font-bold text-xl tracking-tight">Add subject</h3>
+        <button type="button" class="icon-btn" data-action="modal-close" aria-label="Close"><i class="ph ph-x text-lg"></i></button></div>
+        <div class="space-y-4 mt-4">
+          <div><label class="label">Subject name</label>
+            <input class="field" id="draft-s-name" placeholder="e.g. Biology"></div>
+          <div><label class="label">Code</label>
+            <input class="field font-mono uppercase" id="draft-s-code" maxlength="5" placeholder="e.g. BIO"></div>
+          <div><label class="label">Color</label>
+            <div class="flex flex-wrap gap-2">
+              ${SUBJ_COLORS.map((c,i)=>`<label><input type="radio" name="dscol" class="sr-only draft-s-color" value="${c}" ${i===state.subjects.length%SUBJ_COLORS.length?"checked":""}>
+                <span class="swatch block" style="background:${c}"></span></label>`).join("")}
+            </div></div>
+        </div>
+        <button type="submit" class="btn btn-primary w-full mt-6"><i class="ph ph-plus"></i>Add subject</button>
+      </form>`);
+  }
+}
+
+/* ================= EMPTY STATE / BRAND ================= */
+const emptyState=(icon,title,body,actions="")=>`
+  <div class="card py-14 px-6 flex flex-col items-center text-center rise">
+    <div class="tile w-16 h-16 rounded-2xl bg-gradient-to-br from-emerald-500/12 to-teal-500/8 text-emerald-600 mb-4"><i class="ph ${icon} text-3xl"></i></div>
+    <h3 class="font-display font-bold text-lg tracking-tight">${title}</h3>
+    <p class="text-sm text-zinc-500 max-w-xs mt-1.5 leading-relaxed">${body}</p>
+    ${actions?`<div class="flex flex-wrap justify-center gap-2.5 mt-6">${actions}</div>`:""}
+  </div>`;
+/* Adaptive header sizing: long school names step down in size instead of becoming dots. */
+function updateHeaderName(){
+  const titleEl=$("#hdr-title"), subEl=$("#hdr-sub");
+  if(!titleEl) return;
+  const name=state.settings.schoolName||"";
+  titleEl.classList.remove("t-lg","t-xl","t-xxl");
+  subEl?.classList.remove("t-sub");
+  if(name.length>32){ titleEl.classList.add("t-xxl"); subEl?.classList.add("t-sub"); }
+  else if(name.length>22){ titleEl.classList.add("t-xl"); subEl?.classList.add("t-sub"); }
+  else if(name.length>15){ titleEl.classList.add("t-lg"); }
+}
+function brandMark(tileCls, iconCls){
+  const logo=state.settings.logo;
+  return logo
+    ? `<div class="tile ${tileCls} overflow-hidden bg-zinc-100"><img class="logo-img" src="${logo}" alt="School logo"></div>`
+    : `<div class="tile ${tileCls} bg-gradient-to-br from-emerald-500 to-teal-600 text-white"><i class="ph-fill ph-graduation-cap ${iconCls}"></i></div>`;
+}
+const RB = { principal:"bg-amber-100 text-amber-800", admin:"bg-violet-100 text-violet-700", teacher:"bg-emerald-100 text-emerald-700", staff:"bg-sky-100 text-sky-700" };
+const roleBadge = (r,large=false) => `<span class="badge ${RB[r]||"bg-zinc-100 text-zinc-600"} ${large?"!text-[11px] !px-3 !py-1":""}">${r==="principal"?'<i class="ph-fill ph-crown"></i>':""}${fmtRole(r)}</span>`;
+
+/* =================================================================================
+   VIEW RENDERERS
+   ================================================================================= */
+function renderDashboard(){
+  const conf=App.cache.conflicts;
+  const nT=state.teachers.length, nS=state.subjects.length, nC=state.classes.length;
+  const totalSlots=nC*state.settings.daysPerWeek*state.settings.periodsPerDay;
+  let filled=0; state.classes.forEach(c=>filled+=classFill(c.id).f);
+  const fillPct=totalSlots?Math.round(filled/totalSlots*100):0;
+
+  if (!nC && !nT){
+    $("#view").innerHTML=`<div class="max-w-xl mx-auto pt-6">
+      ${emptyState("ph-sparkle","Welcome to "+esc(state.settings.schoolName||"CampusFlow"),
+        canEdit()
+          ? "Add teachers, tick the subjects they can teach, add classes, then use Class setup or create a rough timetable immediately."
+          : "This school's workspace is being set up by the principal. Check back soon.",
+        canEdit()?`<button class="btn btn-primary" data-action="goto-database" data-tab="teachers"><i class="ph ph-plus"></i>Add teachers</button>
+         <button class="btn btn-ghost" data-action="goto-database" data-tab="classes"><i class="ph ph-student"></i>Add a class</button>
+         ${canEditSettings()&&nS?`<button class="btn btn-danger" data-action="reset-workspace"><i class="ph ph-broom"></i>Remove existing data</button>`:""}`:"")}
+    </div>`;
+    return;
+  }
+
+  const todayIdx=Math.min(Math.max(dayIndexFor(localISO()),0), state.settings.daysPerWeek-1);
+  const isSchoolToday=dayIndexFor(localISO())>=0 && dayIndexFor(localISO())<state.settings.daysPerWeek;
+  const dayBars=DAYS_SHORT.slice(0,state.settings.daysPerWeek).map((dname,d)=>{
+    let f=0; state.classes.forEach(c=>f+=(state.timetable[c.id]?.[d]||[]).filter(Boolean).length);
+    const cap=nC*state.settings.periodsPerDay, pct=cap?Math.round(f/cap*100):0;
+    return `<div class="flex items-center gap-3">
+      <div class="w-9 text-[11px] font-bold text-zinc-500">${dname}</div>
+      <div class="flex-1 h-2.5 rounded-full bg-zinc-100 overflow-hidden"><div class="h-full rounded-full ${d===todayIdx&&isSchoolToday?"bg-gradient-to-r from-emerald-500 to-teal-400":"bg-zinc-300"}" style="width:${pct}%"></div></div>
+      <div class="w-10 text-right text-[11px] font-bold tabular-nums text-zinc-500">${pct}%</div></div>`;
+  }).join("");
+  const workloads=[...state.teachers].map(t=>({t,load:teacherLoad(t.id)})).sort((a,b)=>b.load-a.load);
+  const maxLoad=state.settings.maxLoad;
+
+  const compactHome=window.matchMedia?.("(max-width: 1023px)").matches;
+  const homeCid=(state.ui.homeClassId&&C(state.ui.homeClassId))?state.ui.homeClassId:(state.classes[0]?.id||null);
+  const homeClass=C(homeCid);
+  const desktopToday = nC ? `
+    <div class="overflow-x-auto -mx-1 px-1">
+      <table class="w-full" style="border-collapse:separate;border-spacing:0 6px;min-width:${120+nC*96}px">
+        <thead><tr><th class="text-left text-[10px] font-bold uppercase tracking-wider text-zinc-400 pb-1 w-16">Period</th>
+        ${state.classes.map(c=>`<th class="text-left text-[10px] font-bold uppercase tracking-wider text-zinc-400 pb-1">${esc(c.name)}</th>`).join("")}</tr></thead>
+        <tbody>${Array.from({length:state.settings.periodsPerDay},(_,p)=>`
+          <tr><td class="text-[11px] font-bold text-zinc-500 pr-2 tabular-nums whitespace-nowrap">P${p+1} <span class="text-zinc-400 font-semibold">${bell(p)}</span></td>
+          ${state.classes.map(c=>{ const lessons=lessonsOf(getCell(c.id,todayIdx,p));
+            if(!lessons.length) return `<td><div class="h-8 rounded-lg border border-dashed border-zinc-200"></div></td>`;
+            const L=lessons[0], s=S(L.subjectId), t=L.teacherId?T(L.teacherId):null;
+            return `<td class="pr-2"><div class="h-8 rounded-lg flex items-center gap-1.5 px-2 min-w-0" style="background:${s?.color||"#a1a1aa"}14">
+              <span class="text-[10px] font-extrabold tracking-wide" style="color:${s?.color||"#71717a"}">${esc(s?.code||"?")}</span>
+              <span class="text-[10px] font-semibold text-zinc-500 truncate">${esc(t?.code||"—")}</span>
+              ${lessons.length>1?`<span class="text-[9px] font-extrabold text-sky-600 bg-sky-100 rounded px-1 leading-4 ml-auto">+${lessons.length-1}</span>`:""}</div></td>`; }).join("")}
+          </tr>`).join("")}</tbody></table>
+    </div>` : "";
+  const compactToday = homeClass ? `
+    <div class="space-y-2">
+      <div class="flex items-center gap-2">
+        <select class="field flex-1 !h-11 !text-xs" data-change="home-class" aria-label="Choose class for today's timetable">
+          ${state.classes.map(c=>`<option value="${c.id}" ${homeCid===c.id?"selected":""}>${esc(c.name)}</option>`).join("")}
+        </select>
+        <button class="btn btn-ghost !h-11 !px-3" data-action="open-class-grid" data-id="${homeCid}"><i class="ph ph-calendar-dots"></i>Open</button>
+      </div>
+      <div class="divide-y divide-zinc-100">
+        ${Array.from({length:state.settings.periodsPerDay},(_,p)=>{
+          const lessons=lessonsOf(getCell(homeCid,todayIdx,p));
+          return `<div class="grid grid-cols-[54px_minmax(0,1fr)] items-center gap-2 py-2.5">
+            <div><div class="text-[12px] font-extrabold">P${p+1}</div><div class="text-[9px] font-bold text-zinc-400 tabular-nums">${bell(p)}</div></div>
+            <div class="min-w-0 flex flex-wrap gap-1.5">${lessons.length?lessons.map(L=>{ const s=S(L.subjectId),t=L.teacherId?T(L.teacherId):null;
+              return `<span class="chip !text-[10px]" style="background:${s?.color||"#a1a1aa"}12;color:${s?.color||"#71717a"};border-color:${s?.color||"#a1a1aa"}30"><b>${esc(s?.code||"?")}</b>${t?` · ${esc(t.code||initials(t.name))}`:""}</span>`; }).join("")
+              :`<span class="text-[11px] text-zinc-300 font-semibold">Free period</span>`}</div>
+          </div>`; }).join("")}
+      </div>
+    </div>` : "";
+  const todayTable=compactHome?compactToday:desktopToday;
+
+  $("#view").innerHTML=`
+  <div class="space-y-5">
+    ${legacySampleDetected()&&canEditSettings()?`
+    <div class="card w-full p-4 flex items-center gap-3.5 !border-amber-300 bg-amber-50/80 rise">
+      <div class="tile bg-amber-500/15 text-amber-700"><i class="ph-fill ph-broom text-xl"></i></div>
+      <div class="flex-1 min-w-0"><div class="font-bold text-sm text-amber-900">Old sample data detected</div>
+      <div class="text-xs text-amber-800/75 leading-relaxed">This school still contains the sample dataset from an earlier build. Remove it before entering real school records.</div></div>
+      <button class="btn btn-danger flex-none" data-action="reset-workspace"><i class="ph ph-trash"></i><span class="hidden sm:inline">Remove sample data</span></button>
+    </div>`:""}
+    ${conf.count?`
+    <button class="card w-full text-left p-4 flex items-center gap-3.5 !border-rose-200 bg-rose-50/60 hover:bg-rose-50 transition-colors rise" data-action="conflict-center">
+      <div class="tile bg-rose-500/12 text-rose-500"><i class="ph-fill ph-warning-octagon text-xl"></i></div>
+      <div class="flex-1 min-w-0"><div class="font-bold text-sm text-rose-700">${conf.count} scheduling conflict${conf.count>1?"s":""} detected</div>
+      <div class="text-xs text-rose-600/70 truncate">${esc(conf.list.slice(0,2).map(c=>`${c.teacher?.code}: ${DAYS_SHORT[c.d]} P${c.p+1} (${c.classes.join(" × ")})`).join("  ·  "))}${conf.list.length>2?" +"+(conf.list.length-2)+" more":""}</div></div>
+      <i class="ph ph-caret-right text-rose-400"></i>
+    </button>`:""}
+
+    <div class="flex items-end justify-between flex-wrap gap-2 rise">
+      <div>
+        <div class="text-[11px] font-bold uppercase tracking-[.1em] text-emerald-600">${esc(timeGreet())}${Session.schoolRole?" · "+fmtRole(Session.schoolRole):""}</div>
+        <h2 class="font-display font-bold text-2xl sm:text-[28px] tracking-tight mt-0.5">${esc(state.settings.schoolName||"School")} at a glance</h2>
+      </div>
+      <div class="flex items-center gap-2 flex-wrap">
+        <div class="text-xs text-zinc-500 font-semibold">${esc(fmtDateLong(localISO()))}</div>
+        ${canEditSettings()?`<button class="btn btn-ghost !min-h-[38px] !px-3" data-action="goto-database" data-tab="settings"><i class="ph ph-gear-six"></i>Backup / reset</button>`:""}
+      </div>
+    </div>
+
+    <div class="grid grid-cols-2 xl:grid-cols-4 gap-3">
+      ${[
+        ["ph-chalkboard-teacher","text-emerald-600 bg-emerald-500/10",nT,"Teachers"],
+        ["ph-books","text-sky-600 bg-sky-500/10",nS,"Subjects"],
+        ["ph-student","text-violet-600 bg-violet-500/10",nC,"Classes"],
+        ["ph-calendar-check","text-amber-600 bg-amber-500/10",filled,"Lessons / week", fillPct+"% scheduled"]
+      ].map(([icon,cls,val,label,sub],i)=>`
+      <div class="card p-4 sm:p-5 flex items-center gap-3.5 rise" style="animation-delay:${i*60}ms">
+        <div class="tile ${cls}"><i class="ph-fill ${icon} text-xl"></i></div>
+        <div class="min-w-0"><div class="font-display font-bold text-[22px] leading-none tabular-nums">${val}</div>
+        <div class="text-[11px] text-zinc-500 font-semibold mt-1 truncate">${label}${sub?` · <span class="text-emerald-600">${sub}</span>`:""}</div></div>
+      </div>`).join("")}
+    </div>
+
+    <div class="grid lg:grid-cols-5 gap-4">
+      <div class="lg:col-span-3 space-y-4">
+        <div class="card p-5 rise" style="animation-delay:120ms">
+          <div class="flex items-center justify-between mb-3">
+            <h3 class="font-display font-bold text-[15px] tracking-tight flex items-center gap-2"><i class="ph-fill ph-sun-horizon text-amber-500"></i>${isSchoolToday?"Today's flow":"Next school day · "+DAYS_FULL[todayIdx]}</h3>
+            <button class="text-[11px] font-bold text-emerald-600 hover:text-emerald-700 min-h-[32px]" data-action="nav" data-route="timetable">Open timetable <i class="ph ph-arrow-right"></i></button>
+          </div>
+          ${todayTable || `<p class="text-sm text-zinc-400 py-4 text-center">Create a class to see the daily flow.</p>`}
+        </div>
+        <div class="card p-5 rise" style="animation-delay:180ms">
+          <h3 class="font-display font-bold text-[15px] tracking-tight mb-4 flex items-center gap-2"><i class="ph-fill ph-chart-bar text-sky-500"></i>Weekly capacity by day</h3>
+          <div class="space-y-3">${dayBars}</div>
+          <div class="mt-4"><div class="flex justify-between text-[11px] font-bold text-zinc-500 mb-1.5"><span>Overall timetable completion</span><span class="tabular-nums">${filled}/${totalSlots} slots</span></div>
+          <div class="h-2.5 rounded-full bg-zinc-100 overflow-hidden"><div class="h-full rounded-full bg-gradient-to-r from-emerald-500 to-teal-400 transition-all duration-700" style="width:${fillPct}%"></div></div></div>
+        </div>
+      </div>
+
+      <div class="lg:col-span-2 card p-5 rise" style="animation-delay:240ms">
+        <div class="flex items-center justify-between mb-1">
+          <h3 class="font-display font-bold text-[15px] tracking-tight flex items-center gap-2"><i class="ph-fill ph-gauge text-emerald-500"></i>Teacher workload</h3>
+          ${workloads.some(w=>loadStatus(w.load)==="over")
+            ? `<span class="chip ${LOAD_BAR.over.chip}"><i class="ph-fill ph-warning-octagon"></i>${workloads.filter(w=>loadStatus(w.load)==="over").length} overloaded</span>`
+            : ""}
+        </div>
+        <div class="flex items-center gap-3 flex-wrap mb-4 text-[10px] font-bold uppercase tracking-wide text-zinc-400">
+          <span class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full bg-gradient-to-r from-sky-400 to-sky-300"></span>under ${maxLoad}</span>
+          <span class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full bg-gradient-to-r from-emerald-500 to-teal-400"></span>${maxLoad}–${state.settings.loadCap} ok</span>
+          <span class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full bg-gradient-to-r from-rose-500 to-red-400"></span>over ${state.settings.loadCap}</span>
+        </div>
+        <div class="space-y-4 max-h-[500px] overflow-y-auto pr-1">
+          ${workloads.length? workloads.map(({t,load})=>{
+            const st=loadStatus(load), L=LOAD_BAR[st];
+            const pct=Math.min(100,Math.round(load/state.settings.loadCap*100));
+            return `<div>
+            <div class="flex items-center gap-2.5 mb-1.5">
+              <div class="tile w-8 h-8 rounded-lg text-[11px] font-extrabold" style="background:${t.color}1a;color:${t.color}">${esc(t.code||initials(t.name))}</div>
+              <div class="flex-1 min-w-0 text-[13px] font-semibold truncate">${esc(t.name)}</div>
+              <div class="text-[11px] font-bold tabular-nums ${L.txt}">${load}<span class="text-zinc-300">/${state.settings.loadCap}</span>${st==="over"?` <i class="ph-fill ph-warning-octagon"></i>`:""}</div>
+            </div>
+            <div class="h-2 rounded-full bg-zinc-100 overflow-hidden"><div class="h-full rounded-full ${L.bar} transition-all duration-500" style="width:${pct}%"></div></div>
+          </div>`; }).join("") : `<p class="text-sm text-zinc-400 text-center py-6">No teachers yet.</p>`}
+        </div>
+      </div>
+    </div>
+  </div>`;
+}
+
+/* ---------- TIMETABLE ---------- */
+function renderTimetable(){
+  if (!state.classes.length){
+    $("#view").innerHTML=`<div class="max-w-xl mx-auto pt-6">${emptyState("ph-table","No classes to schedule",
+      canEdit()?"Create your first class and the interactive timetable grid will appear here.":"Classes will appear here once they're created.",
+      canEdit()?`<button class="btn btn-primary" data-action="goto-database" data-tab="classes"><i class="ph ph-plus"></i>Create a class</button>`:"")}</div>`;
+    return;
+  }
+  const cid=state.ui.activeClassId;
+  const cls=C(cid)||state.classes[0];
+  const conf=App.cache.conflicts;
+  const { f, total }=classFill(cls.id);
+  const days=state.settings.daysPerWeek, periods=state.settings.periodsPerDay;
+  const edit=canEdit();
+  const cellAction=edit?"open-cell":"view-cell";
+
+  const header=`<thead><tr><th class="rowhead !min-w-[92px]">Period</th>
+    ${Array.from({length:days},(_,d)=>`<th>${DAYS_SHORT[d]}<span class="block text-[9px] font-semibold text-zinc-400 normal-case tracking-normal">Day ${d+1}</span></th>`).join("")}
+  </tr></thead>`;
+
+  const rows=Array.from({length:periods},(_,p)=>`
+    <tr>
+      <td class="rowhead">P${p+1}<span class="bell">${bell(p)}</span></td>
+      ${Array.from({length:days},(_,d)=>{
+        const lessons=lessonsOf(getCell(cls.id,d,p));
+        const cKey=cellKey(cls.id,d,p);
+        const isConf=conf.cellInfo.has(cKey);
+        if (!lessons.length) return `<td class="cell ${edit?"":"readonly"}" data-action="${cellAction}" data-cid="${cls.id}" data-d="${d}" data-p="${p}" role="button" aria-label="Assign ${DAYS_FULL[d]} period ${p+1}">
+          ${edit?`<div class="flex items-center justify-center h-full text-zinc-300"><i class="ph ph-plus text-lg"></i></div>`:`<div class="h-full"></div>`}</td>`;
+        if (lessons.length===1){
+          const L=lessons[0], s=S(L.subjectId), t=L.teacherId?T(L.teacherId):null;
+          return `<td class="cell ${isConf?"conflict":""} ${edit?"":"readonly"}" data-action="${cellAction}" data-cid="${cls.id}" data-d="${d}" data-p="${p}" role="button"
+            ${isConf?`title="${esc(conf.cellInfo.get(cKey))}"`:""}>
+            <div class="relative flex flex-col items-start gap-1">
+              ${isConf?`<i class="ph-fill ph-warning-octagon text-rose-500 text-[13px] absolute top-0 right-0"></i>`:""}
+              <span class="subj-pill" style="background:${s?.color||"#a1a1aa"}1c;color:${s?.color||"#71717a"}">${esc(s?.code||"?")}</span>
+              ${t?`<span class="text-[10px] font-bold text-zinc-500 tracking-wide pl-0.5">${esc(t.code)} · <span class="font-semibold text-zinc-400">${esc((t.name||t.code||"").split(" ")[0])}</span></span>`
+                 :`<span class="text-[10px] font-bold text-amber-600 pl-0.5 flex items-center gap-1"><i class="ph-fill ph-user-dashed"></i>No teacher</span>`}
+            </div></td>`;
+        }
+        return `<td class="cell ${isConf?"conflict":""} ${edit?"":"readonly"}" data-action="${cellAction}" data-cid="${cls.id}" data-d="${d}" data-p="${p}" role="button"
+          ${isConf?`title="${esc(conf.cellInfo.get(cKey))}"`:""}>
+          <div class="relative flex flex-col items-start gap-[3px]">
+            <div class="absolute top-0 right-0 flex items-center gap-1">
+              <span class="text-[8.5px] font-extrabold text-sky-700 bg-sky-100 rounded px-1 leading-[13px]">×${lessons.length}</span>
+              ${isConf?`<i class="ph-fill ph-warning-octagon text-rose-500 text-[13px]"></i>`:""}
+            </div>
+            ${lessons.slice(0,2).map(L=>{ const s=S(L.subjectId), t=L.teacherId?T(L.teacherId):null;
+              return `<span class="subj-pill" style="background:${s?.color||"#a1a1aa"}1c;color:${s?.color||"#71717a"}">${esc(s?.code||"?")}${t?` <span class="opacity-70">${esc(t.code)}</span>`:""}</span>`; }).join("")}
+            ${lessons.length>2?`<span class="text-[9px] font-bold text-zinc-400 pl-0.5">+${lessons.length-2} more group${lessons.length-2>1?"s":""}</span>`:""}
+          </div></td>`;
+      }).join("")}
+    </tr>`).join("");
+
+  $("#view").innerHTML=`
+  <div class="space-y-4">
+    <div class="flex items-center gap-2 overflow-x-auto pb-1 -mx-1 px-1" style="scrollbar-width:thin">
+      ${state.classes.map(c=>{ const cf=classFill(c.id); const active=c.id===cls.id;
+        return `<button class="btn ${active?"btn-primary":"btn-ghost"} !rounded-xl flex-none !h-11" data-action="pick-class" data-id="${c.id}">
+          ${c.locked?`<i class="ph-fill ph-lock-simple text-[11px] ${active?"text-emerald-100/90":"text-zinc-400"}"></i>`:""}${esc(c.name)}<span class="text-[10px] font-bold ${active?"text-emerald-100/80":"text-zinc-400"} tabular-nums">${cf.pct}%</span></button>`; }).join("")}
+    </div>
+
+    <div class="flex items-center justify-between flex-wrap gap-2">
+      <div>
+        <h2 class="font-display font-bold text-xl sm:text-2xl tracking-tight flex items-center gap-2">${esc(cls.name)}
+          ${cls.locked?`<span class="badge bg-zinc-800 text-white"><i class="ph-fill ph-lock-simple"></i>Locked</span>`:""}</h2>
+        <p class="text-xs text-zinc-500 font-medium mt-0.5">${f} of ${total} periods scheduled${cls.locked?" · protected from edits & generation":edit?" · tap a cell to edit · cells can hold parallel subject groups":" · view-only access"}</p>
+      </div>
+      <div class="flex items-center gap-2 flex-wrap">
+        ${edit?`<div class="flex sm:hidden items-center gap-1">
+          <button class="chip !cursor-pointer min-h-[32px] ${UndoEngine.stack.length?"":"opacity-40 pointer-events-none"}" data-action="undo" aria-label="Undo"><i class="ph ph-arrow-counter-clockwise"></i></button>
+          <button class="chip !cursor-pointer min-h-[32px] ${UndoEngine.future.length?"":"opacity-40 pointer-events-none"}" data-action="redo" aria-label="Redo"><i class="ph ph-arrow-clockwise"></i></button>
+        </div>`:""}
+        ${edit?`<button class="chip !cursor-pointer hover:!bg-sky-100 min-h-[32px]" data-action="open-class-setup" data-id="${cls.id}"><i class="ph-fill ph-list-checks text-sky-600"></i>Class setup</button>
+        <button class="chip !cursor-pointer hover:!bg-emerald-100 min-h-[32px]" data-action="generator"><i class="ph-fill ph-sparkle text-emerald-600"></i>Auto-generate</button>
+        <button class="chip !cursor-pointer min-h-[32px] ${cls.locked?"!bg-zinc-800 !text-white !border-zinc-800":"hover:!bg-zinc-200"}" data-action="toggle-lock" data-cid="${cls.id}"><i class="ph-fill ${cls.locked?"ph-lock-simple":"ph-lock-simple-open"}"></i>${cls.locked?"Unlock":"Lock"}</button>`:""}
+        <button class="chip !cursor-pointer hover:!bg-sky-100 min-h-[32px]" data-action="finder"><i class="ph ph-magnifying-glass text-sky-600"></i>Free teachers</button>
+        ${edit&&!cls.locked?`<button class="chip !cursor-pointer hover:!bg-emerald-100 min-h-[32px]" data-action="day-tools" data-cid="${cls.id}"><i class="ph ph-copy text-emerald-600"></i>Copy day</button>
+        <button class="chip !cursor-pointer hover:!bg-rose-100 min-h-[32px]" data-action="clear-center"><i class="ph ph-eraser text-rose-500"></i>Clear…</button>`:""}
+        ${conf.count?`<button class="chip !cursor-pointer hover:!bg-rose-100 !bg-rose-50 !text-rose-600 !border-rose-200" data-action="conflict-center"><i class="ph-fill ph-warning-octagon"></i>${conf.count} conflict${conf.count>1?"s":""} · fix</button>`:""}
+        ${edit?`<span class="chip"><i class="ph-fill ph-check-circle text-emerald-500"></i>Auto-syncing</span>`
+              :`<span class="chip"><i class="ph-fill ph-lock-simple text-zinc-400"></i>Read-only</span>`}
+      </div>
+    </div>
+
+    <div class="card overflow-hidden rise">
+      <div class="overflow-auto" style="max-height:calc(100dvh - 240px)">
+        <table class="ttable">${header}<tbody>${rows}</tbody></table>
+      </div>
+    </div>
+  </div>`;
+}
+
+/* ---------- DATABASE ---------- */
+function renderDatabase(){
+  let tab=state.ui.dbTab;
+  const tabs=[["teachers","ph-chalkboard-teacher",t("db.teachers")],["subjects","ph-books",t("db.subjects")],["classes","ph-student",t("db.classes")],["curriculum","ph-list-checks",t("db.curriculum")]];
+  if (canEditBranding()) tabs.push(["branding","ph-palette","Look & colours"]);
+  if (canEditSettings()) tabs.push(["settings","ph-gear-six","Settings"]);
+  if (!tabs.some(t=>t[0]===tab)){ tab="teachers"; Store.raw.ui.dbTab="teachers"; }
+  const edit=canEdit();
+  let body="";
+
+  if (tab==="teachers"){
+    const q=App.dbQuery.trim().toLowerCase();
+    const list=state.teachers.filter(t=>!q || (t.name||"").toLowerCase().includes(q) || (t.code||"").toLowerCase().includes(q));
+    body=`
+      <div class="flex items-center gap-2.5 flex-wrap">
+        <div class="relative flex-1 min-w-[180px] max-w-sm">
+          <i class="ph ph-magnifying-glass absolute left-3.5 top-1/2 -translate-y-1/2 text-zinc-400"></i>
+          <input class="field !pl-10" placeholder="Search teachers…" data-fid="db-search" data-input="db-search" value="${esc(App.dbQuery)}" autocomplete="off">
+        </div>
+        ${edit?`<button class="btn btn-primary" data-action="add-teacher"><i class="ph ph-plus"></i>Add teacher</button>`:""}
+      </div>
+      ${state.teachers.length===0 ? `<div class="mt-4">${emptyState("ph-chalkboard-teacher","No teachers yet",
+        edit?"Add your first teacher and assign the subjects they can teach.":"Teachers will appear here once added.",
+        edit?`<button class="btn btn-primary" data-action="add-teacher"><i class="ph ph-plus"></i>Add teacher</button>`:"")}</div>`
+      : `<div class="grid sm:grid-cols-2 xl:grid-cols-3 gap-3 mt-4">
+        ${list.map((t,i)=>{ const load=teacherLoad(t.id); const pct=Math.min(100,Math.round(load/state.settings.loadCap*100));
+          const linked=Object.values(App.members).some(m=>m.teacherId===t.id);
+          return `<div class="card p-4 hover:shadow-md hover:-translate-y-0.5 transition-all duration-200 rise" style="animation-delay:${Math.min(i,8)*40}ms">
+          <div class="flex items-start gap-3">
+            <div class="tile rounded-xl text-[13px] font-extrabold" style="background:${t.color}1a;color:${t.color}">${esc(t.code||initials(t.name))}</div>
+            <div class="flex-1 min-w-0">
+              <div class="font-bold text-[14px] truncate flex items-center gap-1.5">${esc(t.name)}${linked?`<i class="ph-fill ph-link text-sky-500" title="Has sign-in account"></i>`:""}</div>
+              <div class="text-[11px] font-semibold tabular-nums ${LOAD_BAR[loadStatus(load)].txt}">${load} period${load!==1?"s":""}/week${loadStatus(load)==="over"?` · overloaded (cap ${state.settings.loadCap})`:loadStatus(load)==="under"?` · below target ${state.settings.maxLoad}`:""}</div>
+            </div>
+            ${edit?`<button class="icon-btn !w-10 !h-10" data-action="edit-teacher" data-id="${t.id}" aria-label="Edit ${esc(t.name)}"><i class="ph ph-pencil-simple"></i></button>
+            <button class="icon-btn danger !w-10 !h-10" data-action="delete-teacher" data-id="${t.id}" aria-label="Delete ${esc(t.name)}"><i class="ph ph-trash"></i></button>`:""}
+          </div>
+          <div class="flex flex-wrap gap-1.5 mt-3 min-h-[26px]">
+            ${(t.subjectIds||[]).length? t.subjectIds.map(sid=>{ const s=S(sid); return s?`<span class="chip" style="background:${s.color}12;color:${s.color};border-color:${s.color}30"><span class="w-1.5 h-1.5 rounded-full" style="background:${s.color}"></span>${esc(s.code)}</span>`:""; }).join("")
+              : `<span class="text-[11px] text-zinc-400 italic self-center">No subjects assigned</span>`}
+          </div>
+          ${teacherGrades(t)!==null?`<div class="flex items-center gap-1.5 mt-2 text-[10px] font-bold">
+            <i class="ph-fill ${t.grades.length?"ph-funnel-simple text-sky-500":"ph-warning text-rose-500"}"></i>
+            <span class="${t.grades.length?"text-sky-700":"text-rose-600"}">${t.grades.length?esc(gradeSummary(t)):"No grades — unschedulable"}</span>
+          </div>`:""}
+          <div class="h-1.5 rounded-full bg-zinc-100 overflow-hidden mt-2"><div class="h-full rounded-full ${LOAD_BAR[loadStatus(load)].bar}" style="width:${pct}%"></div></div>
+        </div>`; }).join("")}
+      </div>`}
+      ${state.teachers.length && !list.length ? `<p class="text-sm text-zinc-400 text-center py-8">No matches for “${esc(App.dbQuery)}”.</p>`:""}`;
+  }
+
+  if (tab==="subjects"){
+    body=`
+      <div class="flex items-center justify-between gap-2 flex-wrap">
+        <p class="text-sm text-zinc-500 font-medium">${state.subjects.length} subject${state.subjects.length!==1?"s":""} in the catalog</p>
+        ${edit?`<button class="btn btn-primary" data-action="add-subject"><i class="ph ph-plus"></i>Add subject</button>`:""}
+      </div>
+      ${state.subjects.length===0 ? `<div class="mt-4">${emptyState("ph-books","No subjects yet",
+        edit?"Subjects define what teachers can teach and power smart filtering.":"Subjects will appear here once added.",
+        edit?`<button class="btn btn-primary" data-action="add-subject"><i class="ph ph-plus"></i>Add subject</button>`:"")}</div>`
+      : `<div class="grid sm:grid-cols-2 xl:grid-cols-3 gap-3 mt-4">
+        ${state.subjects.map((s,i)=>{ const tc=teacherOfSubject(s.id).length;
+          return `<div class="card p-4 flex items-center gap-3.5 hover:shadow-md hover:-translate-y-0.5 transition-all duration-200 rise" style="animation-delay:${Math.min(i,8)*40}ms">
+          <div class="tile rounded-xl text-[11px] font-extrabold tracking-wide" style="background:${s.color}16;color:${s.color}">${esc(s.code)}</div>
+          <div class="flex-1 min-w-0">
+            <div class="font-bold text-[14px] truncate">${esc(s.name)}</div>
+            <div class="text-[11px] text-zinc-500 font-semibold">${tc} teacher${tc!==1?"s":""} qualified</div>
+          </div>
+          ${edit?`<button class="icon-btn !w-10 !h-10" data-action="edit-subject" data-id="${s.id}" aria-label="Edit ${esc(s.name)}"><i class="ph ph-pencil-simple"></i></button>
+          <button class="icon-btn danger !w-10 !h-10" data-action="delete-subject" data-id="${s.id}" aria-label="Delete ${esc(s.name)}"><i class="ph ph-trash"></i></button>`:""}
+        </div>`; }).join("")}
+      </div>`}`;
+  }
+
+  if (tab==="classes"){
+    body=`
+      ${edit?`<form class="flex gap-2.5" data-form="class-draft" autocomplete="off">
+        <input class="field max-w-sm" id="draft-c-name" placeholder="e.g. Grade 10 · B" data-fid="class-new">
+        <button type="submit" class="btn btn-primary flex-none"><i class="ph ph-plus"></i><span class="hidden sm:inline">Add class</span></button>
+      </form>`:""}
+      ${state.classes.length===0 ? `<div class="mt-4">${emptyState("ph-student","No classes yet",
+        edit?"Classes are the groups you schedule. Each one gets its own timetable grid.":"Classes will appear here once created.","")}</div>`
+      : `<div class="grid sm:grid-cols-2 xl:grid-cols-3 gap-3 mt-4">
+        ${state.classes.map((c,i)=>{ const cf=classFill(c.id); const ct=c.classTeacherId?T(c.classTeacherId):null;
+          const eligible=state.teachers.filter(t=>canTeachClass(t,c.id));
+          if (ct&&!eligible.some(t=>t.id===ct.id)) eligible.unshift(ct);
+          return `<div class="card p-4 hover:shadow-md hover:-translate-y-0.5 transition-all duration-200 rise" style="animation-delay:${Math.min(i,8)*40}ms">
+          <div class="flex items-center gap-3">
+            <div class="tile rounded-xl bg-violet-500/10 text-violet-600"><i class="ph-fill ph-student text-lg"></i></div>
+            <div class="flex-1 min-w-0">
+              <div class="font-bold text-[14px] truncate">${esc(c.name)}</div>
+              <div class="text-[11px] text-zinc-500 font-semibold tabular-nums">${cf.f}/${cf.total} periods · ${cf.pct}% scheduled</div>
+            </div>
+            <button class="icon-btn !w-10 !h-10" data-action="open-class-grid" data-id="${c.id}" aria-label="Open timetable for ${esc(c.name)}"><i class="ph ph-calendar-dots"></i></button>
+            ${edit?`<button class="icon-btn !w-10 !h-10" data-action="open-class-setup" data-id="${c.id}" aria-label="Set up subjects for ${esc(c.name)}" title="Set up subjects & teachers"><i class="ph ph-list-checks"></i></button>`:""}
+            ${edit?`<button class="icon-btn danger !w-10 !h-10" data-action="delete-class" data-id="${c.id}" aria-label="Delete ${esc(c.name)}"><i class="ph ph-trash"></i></button>`:""}
+          </div>
+          <div class="h-1.5 rounded-full bg-zinc-100 overflow-hidden mt-3"><div class="h-full rounded-full bg-gradient-to-r from-violet-500 to-fuchsia-400" style="width:${cf.pct}%"></div></div>
+          <div class="flex items-center gap-2.5 mt-3 pt-3 border-t border-zinc-100">
+            <div class="flex-1 min-w-0">
+              <label class="label !mb-1 !text-[9px]">Class teacher</label>
+              <select class="field !h-10 !text-xs" data-change="class-teacher" data-id="${c.id}" ${edit?"":"disabled"}>
+                <option value="">— none —</option>
+                 ${eligible.map(t=>`<option value="${t.id}" ${c.classTeacherId===t.id?"selected":""}>${esc(t.name)}${!canTeachClass(t,c.id)?" · outside this grade":""}</option>`).join("")}
+              </select>
+            </div>
+            ${edit?`<label class="flex flex-col items-center gap-1 cursor-pointer ${ct?"":"opacity-40 pointer-events-none"}" title="Auto-prefer ${esc(ct?.name||"the class teacher")} for this class's lessons and relief">
+              <input type="checkbox" class="sr-only" data-change="class-sticky" data-id="${c.id}" ${c.preferClassTeacher?"checked":""} ${ct?"":"disabled"}>
+              <span class="switch"></span>
+              <span class="text-[9px] font-extrabold uppercase tracking-wide ${c.preferClassTeacher?"text-emerald-600":"text-zinc-400"}">Sticky</span>
+            </label>`:""}
+          </div>
+          ${ct?`<div class="mt-2 text-[10px] font-semibold ${c.preferClassTeacher?"text-emerald-600":"text-zinc-400"} flex items-center gap-1.5"><i class="ph-fill ${c.preferClassTeacher?"ph-push-pin-fill":"ph-user"} "></i>${esc(ct.name)}${c.preferClassTeacher?" · auto-preferred in this class":" · assigned, not sticky"}</div>`:""}
+        </div>`; }).join("")}
+      </div>`}`;
+  }
+
+  if (tab==="curriculum"){
+    const cid=(state.ui.curClassId&&C(state.ui.curClassId))?state.ui.curClassId:(state.classes[0]?.id||null);
+    const cls=C(cid);
+    const rows=cid?curriculumOf(cid):[];
+    const picked=new Set(rows.map(r=>r.subjectId));
+    const available=state.subjects.filter(s=>!picked.has(s.id));
+    const fixed=rows.filter(r=>r.teacherId).length;
+    const exact=rows.filter(r=>(parseInt(r.periodsPerWeek)||0)>0).length;
+    body = !state.classes.length ? `<div class="mt-4">${emptyState("ph-list-checks","No classes yet","Create a class first, then choose what it learns and who teaches it.",
+        edit?`<button class="btn btn-primary" data-action="goto-database" data-tab="classes"><i class="ph ph-plus"></i>Add a class</button>`:"")}</div>`
+    : `
+      <div class="flex items-center justify-between gap-2.5 flex-wrap">
+        <div>
+          <h3 class="font-display font-bold text-lg tracking-tight">What does this class learn?</h3>
+          <p class="text-xs text-zinc-500 mt-0.5">Choose subjects and, only when needed, fix a particular teacher or weekly frequency.</p>
+        </div>
+        <select class="field w-full sm:!w-auto sm:!min-w-[200px]" data-change="cur-class" aria-label="Choose class">
+          ${state.classes.map(c=>`<option value="${c.id}" ${cid===c.id?"selected":""}>${esc(c.name)}${c.locked?" 🔒":""}</option>`).join("")}
+        </select>
+      </div>
+
+      <div class="card p-4 mt-3 flex items-center gap-3 flex-wrap">
+        <div class="tile bg-emerald-500/10 text-emerald-600"><i class="ph-fill ph-list-checks text-lg"></i></div>
+        <div class="flex-1 min-w-[180px]">
+          <div class="text-[13px] font-bold">${esc(cls?.name||"")} · ${rows.length} subject${rows.length!==1?"s":""}</div>
+          <div class="text-[11px] text-zinc-500 font-medium mt-0.5">${fixed} fixed teacher${fixed!==1?"s":""} · ${exact} exact frequenc${exact===1?"y":"ies"} · everything else automatic</div>
+        </div>
+        ${edit?`<button class="btn btn-ghost" data-action="cur-fill-teachers" data-cid="${cid}"><i class="ph ph-magic-wand"></i>Pick teachers</button>
+        <button class="btn btn-primary" data-action="generator"><i class="ph ph-sparkle"></i>Generate</button>`:""}
+      </div>
+
+      ${rows.length?`<div class="space-y-2 mt-3">
+        ${rows.map(r=>{ const s=S(r.subjectId); const pool=teacherOfSubject(r.subjectId,cid);
+          const others=state.teachers.filter(t=>!pool.some(x=>x.id===t.id));
+          const n=parseInt(r.periodsPerWeek)||0;
+          return `<div class="card p-3 flex flex-wrap sm:flex-nowrap items-center gap-3">
+            <div class="tile w-10 h-10 rounded-lg text-[10px] font-extrabold flex-none" style="background:${s?.color||"#a1a1aa"}16;color:${s?.color||"#71717a"}">${esc(s?.code||"?")}</div>
+            <div class="min-w-[120px] flex-1"><div class="text-[13px] font-bold truncate">${esc(s?.name||"Unknown subject")}</div>
+              <div class="text-[10px] ${pool.length?"text-zinc-400":"text-amber-600"} font-semibold">${pool.length?`${pool.length} teacher${pool.length!==1?"s":""} in ${esc(gradeLabel(gradeOf(cid)))}`:`no teacher for ${esc(gradeLabel(gradeOf(cid)))} yet`}</div></div>
+            <div class="min-w-[170px] flex-[1.4]"><label class="label !text-[9px] !mb-1">Who teaches this class?</label>
+            <select class="field !h-11 !text-xs ${r.teacherId?"":"!text-emerald-700 !border-emerald-200 !bg-emerald-50/50"}" data-change="cur-teacher" data-id="${r.id}" ${edit?"":"disabled"}>
+              <option value="">Auto-pick a free qualified teacher</option>
+              ${pool.length?`<optgroup label="Teaches ${esc(s?.code||"")}">${pool.map(t=>`<option value="${t.id}" ${r.teacherId===t.id?"selected":""}>${esc(t.name)}${cls?.classTeacherId===t.id?" · class teacher":""}</option>`).join("")}</optgroup>`:""}
+              ${others.length?`<optgroup label="Other staff (not marked for this subject)">${others.map(t=>`<option value="${t.id}" ${r.teacherId===t.id?"selected":""}>${esc(t.name)} · off-subject</option>`).join("")}</optgroup>`:""}
+            </select></div>
+            <div class="min-w-[130px] flex-none"><label class="label !text-[9px] !mb-1">How often?</label>
+              <select class="field !h-11 !text-xs" data-change="cur-periods" data-id="${r.id}" ${edit?"":"disabled"}>
+                <option value="0" ${n===0?"selected":""}>Auto</option>
+                ${Array.from({length:10},(_,i)=>i+1).map(v=>`<option value="${v}" ${n===v?"selected":""}>${v} time${v!==1?"s":""} / week</option>`).join("")}
+                ${n>10?`<option value="${n}" selected>${n} times / week</option>`:""}
+              </select>
+            </div>
+            <div class="flex items-center flex-none">
+              ${edit?`<button class="icon-btn danger !w-10 !h-10" data-action="cur-del" data-id="${r.id}" aria-label="Remove allocation"><i class="ph ph-trash"></i></button>`:""}
+            </div>
+          </div>`; }).join("")}
+      </div>`:`<div class="mt-3">${emptyState("ph-list-plus","No subjects selected for "+esc(cls?.name||""),
+        "Tap the subjects this class learns below. Teacher and weekly frequency can stay on Auto.","")}</div>`}
+
+      ${edit&&state.subjects.length?`
+      <div class="card p-4 mt-3">
+        <div class="flex items-center justify-between gap-2 flex-wrap mb-3"><div>
+          <div class="text-[12px] font-bold">Add subjects to ${esc(cls?.name||"")}</div>
+          <div class="text-[10px] text-zinc-400 font-medium mt-0.5">Tap once to add. No calculations required.</div></div>
+          ${available.some(s=>teacherOfSubject(s.id).length)?`<button class="btn btn-soft !min-h-[38px]" data-action="plan-add-all" data-cid="${cid}"><i class="ph ph-plus-circle"></i>Add all teachable</button>`:""}
+        </div>
+        <div class="flex flex-wrap gap-2">
+            ${available.length?available.map(s=>{ const tc=teacherOfSubject(s.id,cid).length;
+            return `<button class="chip !cursor-pointer min-h-[38px] hover:!bg-emerald-50 ${tc?"":"opacity-55"}" data-action="plan-add-subject" data-cid="${cid}" data-sid="${s.id}">
+              <span class="w-2 h-2 rounded-full" style="background:${s.color}"></span>${esc(s.name)}${tc?` <span class="text-zinc-400">· ${tc}</span>`:` <span class="text-amber-600">· no teacher</span>`}</button>`; }).join("")
+            :`<span class="text-xs text-emerald-600 font-semibold"><i class="ph-fill ph-check-circle"></i> Every subject has been added.</span>`}
+        </div>
+      </div>
+      <p class="text-[11px] text-zinc-400 mt-2 leading-relaxed px-1"><i class="ph-fill ph-info text-sky-500"></i>
+        <b>Auto</b> divides the remaining weekly slots fairly. Choose an exact frequency only when your Ministry/school plan requires it. Fix a teacher only when that person must teach this subject in this class.</p>`:""}`;
+  }
+
+  if (tab==="branding" && canEditBranding()){
+    const s=state.settings, cur=(s.brand&&/^#[0-9a-f]{6}$/i.test(s.brand))?s.brand:"#059669";
+    body=`
+    <div class="grid lg:grid-cols-2 gap-4 items-start">
+      <div class="card p-5 space-y-4">
+        <h3 class="font-display font-bold text-[15px] tracking-tight flex items-center gap-2"><i class="ph-fill ph-palette text-emerald-500"></i>School look</h3>
+        <p class="text-[12px] text-zinc-500 leading-relaxed">The logo and colour you choose here appear for every teacher and staff member of ${esc(s.schoolName||"your school")} as soon as they sign in.</p>
+        <div class="flex items-center gap-4">
+          ${brandMark("w-16 h-16 rounded-2xl text-3xl","text-3xl")}
+          <div class="flex flex-col gap-2">
+            <button class="btn btn-ghost !min-h-[40px]" data-action="logo-trigger"><i class="ph ph-image-square"></i>${s.logo?"Change logo":"Upload logo"}</button>
+            ${s.logo?`<button class="text-[11px] font-bold text-rose-500 hover:text-rose-600 text-left min-h-[28px]" data-action="logo-remove">Remove logo</button>`:""}
+          </div>
+        </div>
+        <div>
+          <label class="label">Brand colour</label>
+          <div class="flex flex-wrap gap-2 mt-1">
+            ${BRAND_PRESETS.map(c=>`<button data-action="brand-pick" data-c="${c}" title="${c}" class="w-9 h-9 rounded-xl border-2 ${c.toLowerCase()===cur.toLowerCase()?"border-zinc-900 scale-110":"border-white ring-1 ring-zinc-200"} transition" style="background:${c}"></button>`).join("")}
+            <label class="w-9 h-9 rounded-xl border border-dashed border-zinc-300 grid place-items-center cursor-pointer overflow-hidden" title="Custom colour"><i class="ph ph-eyedropper text-zinc-500"></i><input type="color" class="sr-only" value="${cur}" data-change="brand-custom"></label>
+          </div>
+          <button class="text-[11px] font-bold text-zinc-500 hover:text-zinc-800 mt-2" data-action="brand-pick" data-c="">Reset to default green</button>
+        </div>
+      </div>
+      <div class="card p-5 space-y-3">
+        <h3 class="font-display font-bold text-[15px] tracking-tight">Preview</h3>
+        <div class="rounded-2xl p-5 text-white" style="background:linear-gradient(135deg,${cur},${cur}cc)">
+          <div class="text-[11px] font-bold uppercase tracking-[.14em] opacity-80">${esc(s.schoolName||"Your school")}</div>
+          <div class="font-display font-bold text-xl mt-1">Good morning, team</div>
+          <button class="mt-3 px-3 py-2 rounded-xl bg-white font-bold text-[12px]" style="color:${cur}">Open timetable</button>
+        </div>
+        <p class="text-[11px] text-zinc-400 leading-relaxed flex items-start gap-1.5"><i class="ph-fill ph-cloud-check text-emerald-500 mt-0.5"></i>Saved to the school profile and synced to every device.</p>
+      </div>
+    </div>`;
+  }
+  if (tab==="settings" && canEditSettings()){
+    const s=state.settings;
+    body=`
+    <div class="grid lg:grid-cols-2 gap-4 items-start">
+      <div class="space-y-4">
+        <div class="card p-5">
+          <h3 class="font-display font-bold text-[15px] tracking-tight flex items-center gap-2 mb-4"><i class="ph-fill ph-identification-card text-emerald-500"></i>School identity <span class="badge bg-amber-100 text-amber-800 ml-1">Principal only</span></h3>
+          <div class="flex items-center gap-4 mb-4">
+            ${brandMark("w-16 h-16 rounded-2xl text-3xl","text-3xl")}
+            <div class="flex flex-col gap-2">
+              <button class="btn btn-ghost !min-h-[40px]" data-action="logo-trigger"><i class="ph ph-image-square"></i>${s.logo?"Change logo":"Upload logo"}</button>
+              ${s.logo?`<button class="text-[11px] font-bold text-rose-500 hover:text-rose-600 text-left min-h-[28px]" data-action="logo-remove">Remove logo</button>`:""}
+            </div>
+          </div>
+          <label class="label">School name</label>
+          <input class="field" data-fid="set-name" data-input="set-school" value="${esc(s.schoolName)}" autocomplete="off">
+          <p class="text-[11px] text-zinc-400 mt-2 leading-relaxed flex items-start gap-1.5"><i class="ph-fill ph-cloud-check text-emerald-500 mt-0.5"></i>Name &amp; logo sync to every device and appear on printed documents.</p>
+          <button class="btn btn-ghost w-full mt-4" data-action="goto-look"><i class="ph ph-palette"></i>Change colours &amp; logo for the whole school</button>
+        </div>
+        <div class="card p-5 space-y-5">
+          <h3 class="font-display font-bold text-[15px] tracking-tight flex items-center gap-2"><i class="ph-fill ph-sliders-horizontal text-emerald-500"></i>Schedule configuration</h3>
+          <div class="grid grid-cols-2 gap-3">
+            <div><label class="label">Days / week</label>
+              <select class="field" data-fid="set-days" data-change="set-days">
+                <option value="5" ${s.daysPerWeek===5?"selected":""}>5 · Mon–Fri</option>
+                <option value="6" ${s.daysPerWeek===6?"selected":""}>6 · Mon–Sat</option>
+              </select></div>
+            <div><label class="label">Periods / day</label>
+              <select class="field" data-fid="set-periods" data-change="set-periods">
+                ${[4,5,6,7,8,9,10].map(n=>`<option value="${n}" ${s.periodsPerDay===n?"selected":""}>${n} periods</option>`).join("")}
+              </select></div>
+          </div>
+          <div class="grid grid-cols-2 gap-3">
+            <div><label class="label">Teaching target <span class="normal-case font-semibold text-zinc-400">(min/wk)</span></label>
+              <input type="number" class="field" min="1" max="60" data-fid="set-max" data-change="set-maxload" value="${s.maxLoad}"></div>
+            <div><label class="label">Overload limit <span class="normal-case font-semibold text-zinc-400">(max/wk)</span></label>
+              <input type="number" class="field" min="1" max="60" data-fid="set-cap" data-change="set-loadcap" value="${s.loadCap}"></div>
+          </div>
+          <div class="flex items-start gap-2 text-[11px] text-zinc-500 leading-relaxed bg-zinc-50 border border-zinc-200/70 rounded-xl px-3 py-2.5">
+            <i class="ph-fill ph-info text-sky-500 mt-0.5"></i>
+            <span>Teachers below the <b>target</b> show <span class="text-sky-600 font-bold">blue</span>, between the two are <span class="text-emerald-600 font-bold">healthy</span>, and above the <b>limit</b> turn <span class="text-rose-600 font-bold">red</span> (overloaded). Set the minimum periods per class and the weekly total to match your school's own rules.</span>
+          </div>
+        </div>
+      </div>
+      <div class="space-y-4">
+        <div class="card p-5">
+          <h3 class="font-display font-bold text-[15px] tracking-tight flex items-center gap-2 mb-1"><i class="ph-fill ph-vault text-sky-500"></i>Backup &amp; restore</h3>
+          <p class="text-xs text-zinc-500 leading-relaxed mb-3">Cloud-sync keeps every device live, but a local copy is peace of mind. One import button reads
+            whatever your old system left behind — a <b>CampusFlow backup</b> from any version, a <b>Firebase database export</b>, an
+            <b>older timetable export</b> (the <span class="font-mono text-[11px]">db / schedule</span> format), a <b>spreadsheet</b> (.xlsx/.xls/.csv) with a sheet per class,
+            or a plain <b>list of lessons</b> (class, day, period, subject, teacher).</p>
+          <div class="text-[11px] text-zinc-500 bg-zinc-50 border border-zinc-200/70 rounded-xl p-3 mb-4 leading-relaxed flex items-start gap-2">
+            <i class="ph-fill ph-eye text-sky-500 mt-0.5 flex-none"></i>
+            <span>Every import shows what was understood <b>before</b> anything changes, and then gives you the choice: <b>Merge</b> (adds only what is missing, never overwrites a lesson) or <b>Replace everything</b>. Ctrl+Z undoes either one.</span>
+          </div>
+          <div class="flex flex-wrap gap-2.5">
+            <button class="btn btn-ghost" data-action="export-json"><i class="ph ph-download-simple"></i>Export backup</button>
+            <button class="btn btn-ghost" data-action="export-workbook"><i class="ph ph-file-xls"></i>Export readable workbook</button>
+            <button class="btn btn-soft" data-action="import-trigger"><i class="ph ph-upload-simple"></i>Import / convert data</button>
+            <button class="btn btn-ghost" data-action="sign-out"><i class="ph ph-sign-out"></i>Sign out</button>
+          </div>
+        </div>
+        <div class="card p-5 !border-rose-200">
+          <h3 class="font-display font-bold text-[15px] tracking-tight flex items-center gap-2 text-rose-600 mb-1"><i class="ph-fill ph-warning text-rose-500"></i>Danger zone</h3>
+          <p class="text-xs text-zinc-500 leading-relaxed mb-4">Need something precise? <b>Clear &amp; Reset</b> removes selected timetable records and can be undone. <b>Reset to Empty Workspace</b> permanently removes every teacher, subject, class, timetable and relief record while keeping the school name, logo, users and settings.</p>
+          <div class="flex flex-wrap gap-2.5">
+            <button class="btn btn-ghost" data-action="clear-center"><i class="ph ph-eraser"></i>Clear &amp; Reset…</button>
+            <button class="btn btn-danger" data-action="reset-workspace"><i class="ph ph-trash"></i>Reset to Empty Workspace</button>
+          </div>
+        </div>
+      </div>
+    </div>`;
+  }
+
+  $("#view").innerHTML=`
+  <div class="space-y-4">
+    <div class="flex items-center justify-between flex-wrap gap-3">
+      <h2 class="font-display font-bold text-xl sm:text-2xl tracking-tight">Database ${edit?"":"· <span class='text-sm font-semibold text-zinc-400'>read-only</span>"}</h2>
+      <div class="seg">${tabs.map(([id,icon,label])=>`<button class="seg-btn ${tab===id?"active":""}" data-action="db-tab" data-tab="${id}"><i class="ph-fill ${icon}"></i>${label}</button>`).join("")}</div>
+    </div>
+    ${body}
+  </div>`;
+}
+
+/* ---------- TEAM ---------- */
+function memberRows(manage){
+  const entries=Object.entries(App.members).sort((a,b)=>{
+    const order={principal:0,admin:1,teacher:2,staff:3};
+    return (order[a[1].role]??9)-(order[b[1].role]??9) || (a[1].name||"").localeCompare(b[1].name||"");
+  });
+  return entries.map(([muid,m],i)=>{
+    const isMe=muid===Session.uid;
+    const isPrincipalMember=m.role==="principal";
+    const linkedT=m.teacherId?T(m.teacherId):null;
+    const canAct=manage && !isMe && (!isPrincipalMember || isSuper());
+    return `
+    <div class="card p-4 rise ${m.active===false?"opacity-60":""}" style="animation-delay:${Math.min(i,10)*40}ms">
+      <div class="flex items-start gap-3">
+        <div class="tile rounded-xl font-display font-bold text-sm ${m.active===false?"bg-zinc-100 text-zinc-400":"bg-gradient-to-br from-emerald-500 to-teal-600 text-white"}">${esc(initials(m.name||m.email||"?"))}</div>
+        <div class="flex-1 min-w-0">
+          <div class="flex items-center gap-2 flex-wrap">
+            <span class="font-bold text-[14px] truncate">${esc(m.name||"Unnamed")}</span>
+            ${roleBadge(m.role)}${isMe?`<span class="badge bg-zinc-100 text-zinc-500">You</span>`:""}
+            ${m.active===false?`<span class="badge bg-zinc-100 text-zinc-500">Deactivated</span>`:""}
+          </div>
+          <div class="text-[11px] text-zinc-500 font-medium mt-1 truncate"><i class="ph ${isLocalAcct(m.email)?"ph-user-circle":"ph-envelope-simple"}"></i> ${esc(displayAcct(m.email)||"—")}</div>
+          <div class="flex flex-wrap gap-1.5 mt-2">
+            ${m.permissions?.editWorkspace?`<span class="chip !text-[10px]"><i class="ph-fill ph-pencil-line text-emerald-500"></i>Can edit workspace</span>`:""}
+            ${m.permissions?.viewUsers?`<span class="chip !text-[10px]"><i class="ph-fill ph-address-book text-sky-500"></i>Can view team</span>`:""}
+            ${m.permissions?.editBranding?`<span class="chip !text-[10px]"><i class="ph-fill ph-palette text-fuchsia-500"></i>Can change look</span>`:""}
+            ${linkedT?`<span class="chip !text-[10px]" style="background:${linkedT.color}12;color:${linkedT.color};border-color:${linkedT.color}30"><i class="ph-fill ph-link"></i>${esc(linkedT.code||linkedT.name)}</span>`:""}
+            ${!m.permissions?.editWorkspace && !m.permissions?.viewUsers && m.role!=="principal"?`<span class="chip !text-[10px]"><i class="ph-fill ph-lock-simple text-zinc-400"></i>View-only</span>`:""}
+          </div>
+        </div>
+        ${canAct?`
+        <div class="flex flex-col sm:flex-row gap-1">
+          <button class="icon-btn !w-10 !h-10" data-action="edit-member" data-id="${muid}" aria-label="Edit member" title="Edit role &amp; permissions"><i class="ph ph-gear-six"></i></button>
+          <button class="icon-btn !w-10 !h-10" data-action="reset-member-pw" data-id="${muid}" data-email="${esc(m.email||"")}" aria-label="Reset password" title="Reset password / issue new sign-in"><i class="ph ph-key"></i></button>
+          ${!isPrincipalMember?`<button class="icon-btn danger !w-10 !h-10" data-action="remove-member" data-id="${muid}" aria-label="Remove member" title="Remove from school"><i class="ph ph-user-minus"></i></button>`:""}
+        </div>`:""}
+      </div>
+    </div>`;
+  }).join("");
+}
+function renderTeam(){
+  if (!canViewUsers()){
+    $("#view").innerHTML=`<div class="max-w-xl mx-auto pt-6">${emptyState("ph-lock","Restricted area",
+      "You don't have permission to view the team directory. Ask your principal to enable “Can view team” on your account.","")}</div>`;
+    return;
+  }
+  const manage=canManageUsers();
+  const count=Object.keys(App.members).length;
+  const active=Object.values(App.members).filter(m=>m.active!==false).length;
+  $("#view").innerHTML=`
+  <div class="space-y-4">
+    <div class="flex items-center justify-between flex-wrap gap-3 rise">
+      <div>
+        <h2 class="font-display font-bold text-xl sm:text-2xl tracking-tight">Team</h2>
+        <p class="text-xs text-zinc-500 font-medium mt-0.5">${active} active member${active!==1?"s":""}${count!==active?` · ${count-active} deactivated`:""} · ${esc(state.settings.schoolName||"")}</p>
+      </div>
+      ${manage?`<button class="btn btn-primary" data-action="add-member"><i class="ph ph-user-plus"></i>Add user</button>`:""}
+    </div>
+    ${manage?`
+    <div class="card p-4 flex items-start gap-3 bg-sky-50/60 !border-sky-200/70 rise">
+      <i class="ph-fill ph-shield-check text-sky-500 text-lg mt-0.5"></i>
+      <p class="text-xs text-sky-900/80 leading-relaxed"><b>How access works:</b> people you add can sign in immediately with their email + temporary password.
+      <b>Admin</b> and anyone with <b>“Can edit workspace”</b> can build timetables &amp; manage records. Only you — the principal — can manage users, rename the school or change schedule settings. You always keep access; nobody can remove the principal.</p>
+    </div>`:""}
+    <div class="grid xl:grid-cols-2 gap-3">
+      ${memberRows(manage) || emptyState("ph-users-three","No members yet","Add your first team member above.","")}
+    </div>
+  </div>`;
+}
+
+/* ---------- RELIEF ---------- */
+let _reliefAttRef=null, _reliefAttDay=null;
+function reliefStopListen(){ if(_reliefAttRef){ _reliefAttRef.off("value"); _reliefAttRef=null; } _reliefAttDay=null; }
+async function reliefSubscribeToday(iso){
+  if(!Session.schoolId || !FB.ready){ reliefStopListen(); return null; }
+  const today=schoolDayKey();
+  /* The database only lets principals, admins and team viewers read the whole day.
+     Anyone else would get permission_denied, so they never subscribe to it. */
+  if(iso!==today || !canReadDayAttendance()){ reliefStopListen(); return null; }
+  if(_reliefAttRef) return _reliefAttDay;
+  _reliefAttDay=null;
+  _reliefAttRef = FB.db.ref(`schools/${Session.schoolId}/attendance/${today}`);
+  _reliefAttRef.on("value", snap=>{
+    _reliefAttDay=snap.val()||null;
+    if(Store.raw.ui.route==="relief" && state.ui.reliefDate===today){
+      const rec=absRecWrite(today);
+      const { combined } = reliefEffectiveAbsent(today, _reliefAttDay);
+      const taken=new Set(); Object.entries(rec.relief||{}).forEach(([k,v])=>{ if(v) taken.add(v+"|"+k.split("|")[1]); });
+      const ctx={ dayIdx:dayIndexFor(today), absentSet:combined, taken };
+      [...combined].forEach(tid=>{
+        slotsOfTeacherOn(tid,ctx.dayIdx).forEach(slot=>{
+          const key=slot.classId+"|"+slot.p+"|"+slot.li;
+          if(rec.relief[key]) return;
+          const c=reliefCandidates(slot,ctx); const pick=c.match[0]||c.others[0]||null;
+          if(pick){ rec.relief[key]=pick.id; taken.add(pick.id+"|"+slot.p); }
+        });
+      });
+      state.absences[today]=rec;
+      refresh();
+    }
+  });
+  return new Promise(res=>{ const h=snap=>{ _reliefAttDay=snap.val()||null; _reliefAttRef.off("value",h); res(_reliefAttDay); }; _reliefAttRef.on("value",h); });
+}
+function renderRelief(){
+  const iso=state.ui.reliefDate;
+  const dayIdx=dayIndexFor(iso);
+  const validDay=dayIdx>=0 && dayIdx<state.settings.daysPerWeek;
+  const abs=absRecRead(iso);
+  const edit=canEdit();
+  (async()=>{ const att=await reliefSubscribeToday(iso); paintRelief(att); })();
+  function paintRelief(attDay){
+
+  if (!state.teachers.length){
+    $("#view").innerHTML=`<div class="max-w-xl mx-auto pt-6">${emptyState("ph-user-switch","No teachers to manage",
+      edit?"Add teachers first — the Relief Center auto-assigns substitutes from your database.":"Relief coordination activates once teachers exist.",
+      edit?`<button class="btn btn-primary" data-action="goto-database" data-tab="teachers"><i class="ph ph-plus"></i>Add teachers</button>`:"")}</div>`;
+    return;
+  }
+  if (!validDay){
+    $("#view").innerHTML=`<div class="space-y-4">
+      ${reliefHeader(iso, edit)}
+      ${emptyState("ph-island","No school on this day","The selected date falls outside your school week. Pick a weekday to plan relief.",
+        `<button class="btn btn-primary" data-action="relief-today"><i class="ph ph-calendar-blank"></i>Jump to today</button>`)}
+    </div>`;
+    return;
+  }
+
+  const eff = reliefEffectiveAbsent(iso, attDay);
+  const absentSet = eff.combined;
+  const manualSet = eff.manual, autoSet = eff.auto;
+  const affected=[];
+  [...absentSet].forEach(tid => slotsOfTeacherOn(tid,dayIdx).forEach(slot => affected.push({...slot,isAuto:autoSet.has(tid)&&!manualSet.has(tid)})));
+  const uncovered=affected.filter(s=>!abs.relief[s.classId+"|"+s.p+"|"+s.li]).length;
+  const waText=buildWhatsApp(iso);
+  const waHref="https://wa.me/?text="+encodeURIComponent(waText);
+  const todayKey=schoolDayKey();
+  const isToday = iso===todayKey;
+  const autoCount=[...autoSet].filter(id=>slotsOfTeacherOn(id,dayIdx).length).length;
+  const manualCount=manualSet.size;
+
+  $("#view").innerHTML=`
+  <div class="space-y-4">
+    ${reliefHeader(iso, edit)}
+    ${attDay && isToday ? `<div class="card p-3 !bg-violet-50 !border-violet-200 flex items-center gap-2.5 text-[12px] text-violet-900">
+      <i class="ph-fill ph-fingerprint text-violet-600 text-lg"></i>
+      <span class="flex-1"><b>Live from fingerprint attendance.</b> ${autoCount?autoCount+" teacher"+(autoCount===1?"":"s")+" not clocked in by their first bell are marked automatically":""}${autoCount&&manualCount?" · ":" "}${manualCount?manualCount+" manually marked":""}${(!autoCount&&!manualCount)?"Everyone teaching today has clocked in.":""}</span>
+      <span class="flex items-center gap-1 text-[11px] font-bold text-emerald-600"><span class="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>live</span>
+    </div>`:""}
+    ${absentSet.size===0 ? emptyState("ph-confetti","Everyone's in today",
+      (attDay&&isToday?"Fingerprint attendance shows no one missing their first lesson yet. ":"")+"No absences recorded for "+fmtDateLong(iso)+(edit?". Flip a switch below to mark a teacher absent — relief is auto-assigned instantly.":".")) : `
+      <div class="grid lg:grid-cols-5 gap-4 items-start">
+        <div class="lg:col-span-3 space-y-3">
+          <div class="card p-4 flex items-center gap-3 ${uncovered?"!border-amber-200 bg-amber-50/50":"!border-emerald-200 bg-emerald-50/40"}">
+            <div class="tile ${uncovered?"bg-amber-500/12 text-amber-600":"bg-emerald-500/12 text-emerald-600"}"><i class="ph-fill ${uncovered?"ph-warning":"ph-shield-check"} text-lg"></i></div>
+            <div class="text-[13px] font-semibold ${uncovered?"text-amber-800":"text-emerald-800"}">
+              ${absentSet.size} absent · ${affected.length} period${affected.length!==1?"s":""} affected${autoCount?` · <span class="font-normal text-violet-700">${autoCount} auto from fingerprint</span>`:""}
+              ${uncovered?` · <span class="font-bold">${uncovered} still uncovered</span>`:` · <span class="font-bold">fully covered</span>`}
+            </div>
+          </div>
+          ${[...absentSet].map(tid=>{
+            const t=T(tid); if(!t) return "";
+            const slots=slotsOfTeacherOn(tid,dayIdx);
+            const isAuto=autoSet.has(tid)&&!manualSet.has(tid);
+            return `<div class="card p-4 rise ${isAuto?"!border-violet-200 bg-violet-50/30":""}">
+            <div class="flex items-center gap-3">
+              <div class="tile rounded-xl text-[12px] font-extrabold" style="background:${t.color}1a;color:${t.color}">${esc(t.code||initials(t.name))}</div>
+              <div class="flex-1 min-w-0"><div class="font-bold text-[14px] truncate">${esc(t.name)}</div>
+              <div class="text-[11px] ${isAuto?"text-violet-600":"text-rose-500"} font-bold uppercase tracking-wide">${isAuto?`<i class="ph-fill ph-fingerprint"></i> NOT CLOCKED IN`:"Absent"} · ${slots.length} lesson${slots.length!==1?"s":""} today</div></div>
+              ${edit?`<button class="icon-btn ${isAuto?"":"danger"} !w-10 !h-10" data-action="${isAuto?"att-manual-present":"absence-off"}" data-id="${t.id}" aria-label="Mark present"><i class="ph ${isAuto?"ph-check-circle":"ph-arrow-counter-clockwise"}"></i></button>`:""}
+            </div>
+            ${slots.length===0 ? `<p class="text-xs text-zinc-400 italic mt-3 pl-1">No lessons scheduled today — no relief needed.</p>` : `
+            <div class="mt-3 space-y-2">
+              ${slots.map(slot=>{
+                const key=slot.classId+"|"+slot.p+"|"+slot.li;
+                const stored=abs.relief[key]||"";
+                const ctx=buildReliefCtx(iso,attDay);
+                const { match, others }=reliefCandidates(slot,ctx);
+                const rt=stored?T(stored):null;
+                if (rt && !match.some(m=>m.id===rt.id) && !others.some(o=>o.id===rt.id)) match.unshift(rt);
+                const s=S(slot.subjectId);
+                const grpN=lessonsOf(getCell(slot.classId,slot.d,slot.p)).length;
+                return `<div class="grid grid-cols-[40px_minmax(0,1fr)] sm:grid-cols-[40px_minmax(0,1fr)_auto] items-center gap-2.5 bg-zinc-50 border border-zinc-200/70 rounded-xl p-2.5">
+                  <div class="w-10 text-center"><div class="text-[13px] font-extrabold tabular-nums">P${slot.p+1}</div><div class="text-[9px] text-zinc-400 font-bold tabular-nums">${bell(slot.p)}</div></div>
+                  <div class="min-w-0">
+                    <div class="text-[12px] font-bold truncate">${esc(slot.className)} · ${esc(s?.name||"?")}${grpN>1?` <span class="text-sky-600 font-extrabold">G${slot.li+1}</span>`:""}</div>
+                    <div class="text-[10px] text-zinc-400 font-semibold">replaces ${esc(t.code)}</div>
+                  </div>
+                  ${edit?`<select class="field col-span-2 sm:col-span-1 w-full sm:!w-auto sm:!min-w-[150px] !h-11 !text-xs !font-semibold ${stored?"":"!text-rose-500 !border-rose-300 !bg-rose-50"}" data-change="relief-pick" data-key="${key}" data-iso="${iso}" aria-label="Relief teacher for period ${slot.p+1}">
+                    <option value="">— Uncovered —</option>
+                    ${match.length?`<optgroup label="Free · teaches ${esc(s?.code||"")}">${match.map(m=>`<option value="${m.id}" ${stored===m.id?"selected":""}>${esc(m.name)}</option>`).join("")}</optgroup>`:""}
+                    ${others.length?`<optgroup label="Other free teachers">${others.map(o=>`<option value="${o.id}" ${stored===o.id?"selected":""}>${esc(o.name)}</option>`).join("")}</optgroup>`:""}
+                  </select>`:`<div class="col-span-2 sm:col-span-1 text-xs font-bold ${stored?"text-zinc-700":"text-rose-500"}">${stored?esc(T(stored)?.name||""):"Uncovered"}</div>`}
+                </div>`; }).join("")}
+            </div>`}
+          </div>`; }).join("")}
+        </div>
+
+        <div class="lg:col-span-2 card overflow-hidden lg:sticky lg:top-24">
+          <div class="px-4 py-3.5 bg-[#075E54] flex items-center gap-2.5">
+            <i class="ph-fill ph-whatsapp-logo text-[#25D366] text-xl"></i>
+            <div class="text-white text-[13px] font-bold flex-1">WhatsApp broadcast</div>
+            <span class="text-[10px] font-bold text-emerald-100/70 uppercase tracking-wider">Live preview</span>
+          </div>
+          <pre class="p-4 text-[11px] leading-relaxed whitespace-pre-wrap font-mono text-zinc-700 max-h-[380px] overflow-auto bg-[#ECE5DD]">${esc(waText)}</pre>
+          <div class="p-3.5 flex flex-wrap gap-2.5 bg-white border-t border-zinc-100">
+            <button class="btn btn-soft flex-1" data-action="copy-whatsapp"><i class="ph ph-copy"></i>Copy text</button>
+            <a class="btn btn-primary flex-1 !bg-[#25D366] hover:!bg-[#1fb857]" href="${waHref}" target="_blank" rel="noopener"><i class="ph ph-whatsapp-logo"></i>Send</a>
+          </div>
+        </div>
+      </div>`}
+
+    <div class="card p-5 ${edit?"":"pointer-events-none opacity-80"}">
+      <h3 class="font-display font-bold text-[15px] tracking-tight mb-1 flex items-center gap-2"><i class="ph-fill ph-users-three text-sky-500"></i>Staff attendance · ${esc(DAYS_FULL[dayIdx])}${attDay&&isToday?` <span class="text-[11px] font-bold text-violet-600 ml-2"><i class="ph-fill ph-fingerprint"></i> synced with fingerprint attendance</span>`:""}</h3>
+      <p class="text-xs text-zinc-500 mb-4">${edit?"Toggle to mark a teacher absent. When a teacher hasn't clocked in by their first lesson the row turns violet and cover is auto-assigned — flipping the switch overrides it.":"Attendance board (read-only)."}</p>
+      <div class="grid sm:grid-cols-2 gap-2">
+        ${state.teachers.map(t=>{
+          const off=absentSet.has(t.id);
+          const isAuto=autoSet.has(t.id)&&!manualSet.has(t.id);
+          const todays=slotsOfTeacherOn(t.id,dayIdx).length;
+          const me=attDay?.byMember?.[t.id];
+          const stt=me&&window.ATT?ATT.latestStatus(me):{status:"away"};
+          return `<label class="flex items-center gap-3 p-2.5 pl-3 rounded-xl border transition-all ${edit?"cursor-pointer":""} min-h-[52px] ${off?(isAuto?"bg-violet-50/70 border-violet-200":"bg-rose-50/70 border-rose-200"):"bg-white border-zinc-200/80 hover:border-zinc-300"}">
+            <input type="checkbox" class="sr-only" data-change="absence-toggle" data-id="${t.id}" ${off?"checked":""} ${edit?"":"disabled"}>
+            <span class="switch"></span>
+            <div class="tile w-9 h-9 rounded-lg text-[11px] font-extrabold" style="background:${t.color}1a;color:${t.color}">${esc(t.code||initials(t.name))}</div>
+            <div class="min-w-0 flex-1">
+              <div class="flex items-center gap-1.5"><span class="text-[13px] font-bold truncate">${esc(t.name)}</span>${attDay&&stt.status==="in"?`<i class="ph-fill ph-check-circle text-emerald-500 text-sm" title="clocked in"></i>`:""}</div>
+              <div class="text-[10px] font-semibold ${off?(isAuto?"text-violet-600":"text-rose-500"):"text-zinc-400"}">${off?(isAuto?`<i class="ph-fill ph-fingerprint"></i> NO CLOCK-IN BY FIRST BELL`:"MANUALLY ABSENT"):todays+" lesson"+(todays!==1?"s":"")+" today"}</div>
+            </div>
+          </label>`; }).join("")}
+      </div>
+    </div>
+  </div>`;
+  }
+}
+function reliefHeader(iso, edit){
+  return `<div class="flex items-center justify-between flex-wrap gap-3">
+    <div>
+      <h2 class="font-display font-bold text-xl sm:text-2xl tracking-tight">Relief Center</h2>
+      <p class="text-xs text-zinc-500 font-medium mt-0.5">${esc(fmtDateLong(iso))}</p>
+    </div>
+    <div class="flex items-center gap-2 flex-wrap">
+      <input type="date" class="field !w-auto" data-fid="relief-date" data-change="relief-date" value="${iso}" aria-label="Relief date">
+      <button class="btn btn-ghost" data-action="relief-today"><i class="ph ph-calendar-blank"></i><span class="hidden sm:inline">Today</span></button>
+      <button class="btn btn-ghost" data-action="finder"><i class="ph ph-magnifying-glass"></i><span class="hidden sm:inline">Free teachers</span></button>
+      ${edit?`<button class="btn btn-ghost" data-action="relief-auto"><i class="ph ph-magic-wand"></i><span class="hidden sm:inline">Re-optimize</span></button>`:""}
+    </div>
+  </div>`;
+}
+function buildWhatsApp(iso){
+  const dayIdx=dayIndexFor(iso);
+  const abs=absRecRead(iso);
+  const { combined, auto } = reliefEffectiveAbsent(iso,_reliefAttDay);
+  const all=[...combined];
+  const L=[];
+  L.push("*RELIEF PLAN — "+fmtDateLong(iso).toUpperCase()+"*");
+  L.push("_"+(state.settings.schoolName||"CampusFlow")+"_");
+  L.push("");
+  if (!all.length){ L.push("No absences today. Full staffing, zero-cover needed."); return L.join("\n"); }
+  L.push("*Absent ("+all.length+"):*");
+  all.forEach(tid=>{ const t=T(tid); if(t){ const flag=auto.has(tid)?" (not clocked in)":""; const subs=(t.subjectIds||[]).map(sid=>S(sid)?.code).filter(Boolean).join(", "); L.push("• "+t.name+" ("+t.code+")"+flag+(subs?" — "+subs:"")); }});
+  L.push("");
+  L.push("*Cover schedule:*");
+  let any=false, uncovered=0;
+  all.forEach(tid=>{
+    const t=T(tid); if(!t) return;
+    slotsOfTeacherOn(tid,dayIdx).forEach(slot=>{
+      any=true;
+      const key=slot.classId+"|"+slot.p+"|"+slot.li, rid=abs.relief[key];
+      const s=S(slot.subjectId), r=rid?T(rid):null;
+      if(!r) uncovered++;
+      L.push("P"+(slot.p+1)+" · "+slot.className+" · "+(s?.name||"?")+(lessonsOf(getCell(slot.classId,dayIdx,slot.p)).length>1?" (group "+(slot.li+1)+")":""));
+      L.push("   "+t.code+" → "+(r?r.name+" ("+r.code+")":"UNCOVERED — needs attention"));
+    });
+  });
+  if(!any) L.push("No lessons affected today.");
+  L.push("");
+  L.push(uncovered?("⚠ "+uncovered+" period(s) still uncovered. Please advise."):"All periods covered. Have a great day!");
+  L.push("_— Generated by CampusFlow_");
+  return L.join("\n");
+}
+
+/* ---------- PRINT CENTER ---------- */
+function renderPrintCenter(){
+  const pr=state.ui.print;
+  const bulk=pr.doc==="allclasses"||pr.doc==="allteachers";
+  const needsTarget=pr.doc==="class"||pr.doc==="teacher";
+  const pool=pr.doc==="class"?state.classes:pr.doc==="teacher"?state.teachers:[];
+  const target=pool.find(x=>x.id===pr.targetId)||pool[0];
+  const docHTML=buildPrintDoc(pr.doc, target?.id);
+  $("#print-root").innerHTML=`<div class="pdoc">${docHTML}</div>`;
+
+  $("#view").innerHTML=`
+  <div class="space-y-4">
+    <div class="flex items-center justify-between flex-wrap gap-3">
+      <div>
+        <h2 class="font-display font-bold text-xl sm:text-2xl tracking-tight">Print Center</h2>
+        <p class="text-xs text-zinc-500 font-medium mt-0.5">High-contrast documents, typeset for paper. The app UI strips away automatically.</p>
+      </div>
+      <button class="btn btn-primary" data-action="print-now"><i class="ph ph-printer"></i>Print this document</button>
+    </div>
+
+    <div class="card p-4 sm:p-5">
+      <div class="grid sm:grid-cols-3 gap-3">
+        <div><label class="label">Document</label>
+          <select class="field" data-fid="pdoc-type" data-change="pdoc-type">
+            <option value="master" ${pr.doc==="master"?"selected":""}>Master timetable (whole school)</option>
+            <option value="class" ${pr.doc==="class"?"selected":""}>Class timetable</option>
+            <option value="allclasses" ${pr.doc==="allclasses"?"selected":""}>All class timetables (bulk)</option>
+            <option value="teacher" ${pr.doc==="teacher"?"selected":""}>Teacher timetable</option>
+            <option value="allteachers" ${pr.doc==="allteachers"?"selected":""}>All teacher timetables (bulk)</option>
+            <option value="roster" ${pr.doc==="roster"?"selected":""}>Teacher roster &amp; workload</option>
+            <option value="subjects" ${pr.doc==="subjects"?"selected":""}>Subject catalog</option>
+          </select></div>
+        <div class="${needsTarget?"":"opacity-40 pointer-events-none"}"><label class="label">${pr.doc==="teacher"?"Teacher":"Class"}</label>
+          <select class="field" data-fid="pdoc-target" data-change="pdoc-target" ${needsTarget?"":"disabled"}>
+            ${pool.map(x=>`<option value="${x.id}" ${target?.id===x.id?"selected":""}>${esc(x.name)}</option>`).join("") || `<option value="">— none available —</option>`}
+          </select></div>
+        <div><label class="label">Paper</label>
+          <select class="field" data-fid="pdoc-paper" data-change="pdoc-paper">
+            <option value="a4l" ${pr.paper==="a4l"?"selected":""}>A4 · Landscape</option>
+            <option value="a4p" ${pr.paper==="a4p"?"selected":""}>A4 · Portrait</option>
+            <option value="a3l" ${pr.paper==="a3l"?"selected":""}>A3 · Landscape</option>
+            <option value="a3p" ${pr.paper==="a3p"?"selected":""}>A3 · Portrait</option>
+          </select></div>
+      </div>
+    </div>
+
+    ${bulk?`<div class="card p-3.5 flex items-center gap-3 !border-sky-200 bg-sky-50/50">
+      <i class="ph-fill ph-stack text-sky-500 text-lg"></i>
+      <p class="text-xs text-sky-900/80 font-semibold">Bulk mode — ${pr.doc==="allclasses"?state.classes.length+" class":state.teachers.length+" teacher"} timetables, each on its own page. One print job for the whole staffroom.</p>
+    </div>`:""}
+    ${state.classes.length===0 && (pr.doc==="master"||pr.doc==="class") ? emptyState("ph-printer","Nothing to print yet",
+      "Create classes and schedule lessons first — your documents generate live from real data.") : `
+    <div class="overflow-auto rounded-2xl bg-zinc-200/60 border border-zinc-200 p-3 sm:p-6">
+      <div class="sheet-preview ${pr.paper.endsWith("p")?"portrait":""} pdoc rise" id="print-preview">${docHTML}</div>
+    </div>`}
+  </div>`;
+}
+function docHead(title, sub=""){
+  const logo=state.settings.logo;
+  return `<div class="doc-head"><div style="display:flex;align-items:center;gap:10px">
+  ${logo?`<img class="doc-logo" src="${logo}" alt="">`:""}
+  <div><h1>${esc(state.settings.schoolName||"CampusFlow")}</h1>
+  <div style="font-size:11px;font-weight:700;margin-top:2px">${esc(title)}</div></div></div>
+  <div class="doc-sub">Generated ${esc(new Date().toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"}))}<br>${esc(sub)}</div></div>`;
+}
+function subjLegend(){
+  return `<div class="legend">${state.subjects.map(s=>`<div><b>${esc(s.code)}</b> ${esc(s.name)}</div>`).join("")}</div>`;
+}
+function buildPrintDoc(doc, targetId){
+  const days=state.settings.daysPerWeek, periods=state.settings.periodsPerDay;
+  if (doc==="allclasses") return state.classes.map((c,i)=>`<div ${i?'class="pb"':''}>${buildPrintDoc("class",c.id)}</div>`).join("")
+    || `${docHead("All class timetables")}<p>No classes yet.</p>`;
+  if (doc==="allteachers") return state.teachers.map((t,i)=>`<div ${i?'class="pb"':''}>${buildPrintDoc("teacher",t.id)}</div>`).join("")
+    || `${docHead("All teacher timetables")}<p>No teachers yet.</p>`;
+  if (doc==="master"){
+    let rows="";
+    for (let d=0; d<days; d++){
+      rows+=`<tr class="dayband"><td colspan="${state.classes.length+1}">${DAYS_FULL[d]}</td></tr>`;
+      for (let p=0; p<periods; p++){
+        rows+=`<tr><td><b>P${p+1}</b> <span style="color:#444">${bell(p)}</span></td>`;
+        state.classes.forEach(c=>{
+          const lessons=lessonsOf(getCell(c.id,d,p));
+          rows+=`<td>${lessons.length? lessons.map((L,i)=>{
+            const s=S(L.subjectId), t=L.teacherId?T(L.teacherId):null;
+            return `${i?`<div style="border-top:1px dotted #999;margin:3px 0 2px"></div>`:""}<div class="cc">${esc(s?.code||"?")}</div><div class="cs">${esc(t?.code||"no teacher")}</div>`;
+          }).join("") : `<div class="cs" style="color:#999">—</div>`}</td>`;
+        });
+        rows+="</tr>";
+      }
+    }
+    return `${docHead("Master Timetable — All Classes", state.classes.length+" classes · "+days+" days · "+periods+" periods")}
+      <table><thead><tr><th style="width:70px">Period</th>${state.classes.map(c=>`<th>${esc(c.name)}</th>`).join("")}</tr></thead>
+      <tbody>${rows}</tbody></table>${subjLegend()}`;
+  }
+  if (doc==="class"){
+    const c=C(targetId); if(!c) return `${docHead("Class timetable")}<p>No class selected.</p>`;
+    const rows=Array.from({length:periods},(_,p)=>`<tr><td><b>P${p+1}</b><br><span style="color:#444;font-size:8.5px">${bell(p)}</span></td>
+      ${Array.from({length:days},(_,d)=>{ const lessons=lessonsOf(getCell(c.id,d,p));
+        return `<td>${lessons.length? lessons.map((L,i)=>{
+          const s=S(L.subjectId),t=L.teacherId?T(L.teacherId):null;
+          return `${i?`<div style="border-top:1px dotted #999;margin:3px 0 2px"></div>`:""}<div class="cc">${esc(s?.name||"?")}</div><div class="cs">${esc(t?.name||"No teacher assigned")}</div>`;
+        }).join("") : `<div class="cs" style="color:#999">Free period</div>`}</td>`; }).join("")}</tr>`).join("");
+    return `${docHead("Class Timetable — "+c.name, days+" days · "+periods+" periods per day")}
+      <table><thead><tr><th style="width:70px">Period</th>${Array.from({length:days},(_,d)=>`<th>${DAYS_FULL[d]}</th>`).join("")}</tr></thead>
+      <tbody>${rows}</tbody></table>`;
+  }
+  if (doc==="teacher"){
+    const t=T(targetId); if(!t) return `${docHead("Teacher timetable")}<p>No teacher selected.</p>`;
+    const rows=Array.from({length:periods},(_,p)=>`<tr><td><b>P${p+1}</b><br><span style="color:#444;font-size:8.5px">${bell(p)}</span></td>
+      ${Array.from({length:days},(_,d)=>{ let hit=null;
+        for (const c of state.classes){ if(hit) break; const L=lessonsOf(getCell(c.id,d,p)).find(x=>x.teacherId===t.id); if(L) hit={c,L}; }
+        return `<td>${hit?`<div class="cc">${esc(hit.c.name)}</div><div class="cs">${esc(S(hit.L.subjectId)?.name||"")}</div>`:`<div class="cs" style="color:#999">—</div>`}</td>`; }).join("")}</tr>`).join("");
+    const subs=(t.subjectIds||[]).map(sid=>S(sid)?.name).filter(Boolean).join(", ")||"—";
+    return `${docHead("Teacher Timetable — "+t.name+" ("+(t.code||"")+")",
+      "Weekly load: "+teacherLoad(t.id)+" periods"+(loadStatus(teacherLoad(t.id))==="over"?" · OVERLOADED (limit "+state.settings.loadCap+")":"")+" · target "+state.settings.maxLoad)}
+      <table><thead><tr><th style="width:70px">Period</th>${Array.from({length:days},(_,d)=>`<th>${DAYS_FULL[d]}</th>`).join("")}</tr></thead>
+      <tbody>${rows}</tbody></table>
+      <div style="margin-top:8px;font-size:9.5px"><b>Subjects:</b> ${esc(subs)}</div>`;
+  }
+  if (doc==="roster"){
+    const rows=state.teachers.map(t=>{ const load=teacherLoad(t.id), over=loadStatus(load)==="over";
+      return `<tr><td class="cc">${esc(t.code||"")}</td><td>${esc(t.name)}</td>
+      <td>${(t.subjectIds||[]).map(sid=>esc(S(sid)?.code||"")).filter(Boolean).join(", ")||"—"}</td>
+      <td>${esc(gradeSummary(t)||"All grades")}</td>
+      <td style="text-align:center;${over?"color:#c00;font-weight:800":""}">${load}${over?" !":""}</td>
+      <td style="text-align:center">${state.settings.maxLoad}</td>
+      <td style="text-align:center">${state.settings.loadCap}</td></tr>`; }).join("");
+    return `${docHead("Teacher Roster & Workload", state.teachers.length+" teachers · target "+state.settings.maxLoad+" · limit "+state.settings.loadCap)}
+      <table><thead><tr><th style="width:50px">Code</th><th>Name</th><th>Subjects</th><th>Grades</th><th style="width:55px;text-align:center">Load</th><th style="width:55px;text-align:center">Target</th><th style="width:55px;text-align:center">Limit</th></tr></thead>
+      <tbody>${rows}</tbody></table>`;
+  }
+  if (doc==="subjects"){
+    const rows=state.subjects.map(s=>`<tr><td class="cc"><span class="swp" style="background:${s.color}"></span>${esc(s.code)}</td>
+      <td>${esc(s.name)}</td><td style="text-align:center">${teacherOfSubject(s.id).length}</td>
+      <td>${teacherOfSubject(s.id).map(t=>esc(t.name)).join(", ")||"—"}</td></tr>`).join("");
+    return `${docHead("Subject Catalog", state.subjects.length+" subjects")}
+      <table><thead><tr><th style="width:70px">Code</th><th>Subject</th><th style="width:70px;text-align:center">Teachers</th><th>Qualified staff</th></tr></thead>
+      <tbody>${rows}</tbody></table>`;
+  }
+  return "";
+}
+function setPaper(p){
+  const map={a4l:"A4 landscape",a4p:"A4 portrait",a3l:"A3 landscape",a3p:"A3 portrait"};
+  $("#print-page-style").textContent="@page { size: "+(map[p]||map.a4l)+"; margin: 10mm; }";
+}
+
+/* =================================================================================
+   SUPER ADMIN
+   ================================================================================= */
+const Admin = { schools:{}, allUsers:{}, _sRef:null, _uRef:null };
+function adminSubscribe(){
+  if (!FB.ready || !isSuper()) return;
+  Admin.detach();
+  Admin._sRef=FB.db.ref("schools");
+  Admin._sRef.on("value", snap=>{ Admin.schools=snap.val()||{}; if (state.ui.route==="admin") Store.requestRender(); });
+  Admin._uRef=FB.db.ref("users");
+  Admin._uRef.on("value", snap=>{ Admin.allUsers=snap.val()||{}; if (state.ui.route==="admin") Store.requestRender(); });
+}
+Admin.detach = function(){
+  if (Admin._sRef) Admin._sRef.off();
+  if (Admin._uRef) Admin._uRef.off();
+  Admin._sRef=Admin._uRef=null;
+};
+function renderOwnerQuickLinks(){
+  return `<div class="card p-4 flex items-center gap-3 flex-wrap rise">
+    <div class="tile bg-emerald-500/10 text-emerald-600"><i class="ph-fill ph-megaphone text-lg"></i></div>
+    <div class="flex-1 min-w-[180px]"><div class="font-bold text-sm">Promote &amp; site controls</div>
+      <div class="text-[11px] text-zinc-500 mt-0.5">Edit the public phone/WhatsApp, landing page and every creative.</div></div>
+    <button class="btn btn-ghost" data-action="site-editor"><i class="ph ph-note-pencil"></i>Edit site</button>
+    <button class="btn btn-primary" data-action="nav" data-route="marketing"><i class="ph ph-megaphone"></i>Marketing Studio</button>
+  </div>`;
+}
+const CreateSchool={checking:false,ready:false,error:"",password:""};
+async function checkOwnerProvisioning(){
+  CreateSchool.checking=true;CreateSchool.ready=false;CreateSchool.error="";Modal.rerender();
+  try{
+    const user=FB.auth?.currentUser;
+    if(!user) throw new Error("You are not signed in. Sign in again first.");
+    if(!isSuper()) throw new Error(`This account cannot create schools. Signed-in email: ${user.email||"unknown"}; UID: ${user.uid}. Use ${SUPER_EMAIL}, UID ${SUPER_UID}, or set /users/${user.uid}/role to superadmin.`);
+    await Promise.race([
+      user.getIdToken(true),
+      new Promise((_,reject)=>setTimeout(()=>reject(new Error("Authentication check timed out.")),8000))
+    ]);
+    await Promise.race([
+      FB.db.ref("schools").once("value"),
+      new Promise((_,reject)=>setTimeout(()=>reject(new Error("Database permission check timed out.")),8000))
+    ]);
+    CreateSchool.ready=true;
+  }catch(error){
+    const msg=String(error?.message||error||"");
+    CreateSchool.error=/permission_denied|permission denied/i.test(msg)
+      ? `Realtime Database denied this admin UID (${FB.auth?.currentUser?.uid||"unknown"}). Publish database.rules.json, then sign out and back in.`
+      : msg;
+  }finally{ CreateSchool.checking=false; if(Modal.current) Modal.rerender(); }
+}
+function openCreateSchool(){
+  const u=FB.auth?.currentUser;
+  CreateSchool.password=genPassword();CreateSchool.checking=true;CreateSchool.ready=false;CreateSchool.error="";
+  Modal.open(()=>`
+    <form class="p-6" data-form="school-draft" autocomplete="off">
+      <div class="flex items-start justify-between"><div>
+        <h3 class="font-display font-bold text-xl tracking-tight">Create a school</h3>
+        <p class="text-xs text-zinc-500 mt-1">The principal's sign-in account is created automatically.</p></div>
+        <button type="button" class="icon-btn" data-action="modal-close" aria-label="Close"><i class="ph ph-x text-lg"></i></button></div>
+      <fieldset class="space-y-4 mt-5" ${CreateSchool.ready?"":"disabled"}>
+        <div class="flex items-start gap-2.5 text-xs ${CreateSchool.error?"text-rose-800 bg-rose-50 border-rose-200":CreateSchool.ready?"text-emerald-800 bg-emerald-50 border-emerald-200":"text-sky-800 bg-sky-50 border-sky-200"} border rounded-xl p-3">
+          <i class="ph-fill ${CreateSchool.error?"ph-warning-circle text-rose-500":CreateSchool.ready?"ph-shield-check text-emerald-500":"ph-circle-notch text-sky-500 dot-anim"} mt-0.5"></i>
+          <span><b>${CreateSchool.error?"Firebase setup needs attention":CreateSchool.ready?"Super Admin & database verified":"Checking Firebase access…"}</b><br>
+          ${CreateSchool.error?esc(CreateSchool.error):`Signed in as ${esc(u?.email||Session.email||"unknown")} · UID ${esc(u?.uid||Session.uid||"unknown")}`}</span>
+        </div>
+        <div><label class="label">School name</label>
+          <input class="field" id="draft-sc-name" placeholder="e.g. Sunrise Public School"></div>
+        <div><label class="label">Principal's full name</label>
+          <input class="field" id="draft-sc-pname" placeholder="e.g. Fatima Noor"></div>
+        <div><label class="label">Principal's username or email</label>
+          <input type="text" class="field" id="draft-sc-email" placeholder="Created automatically" autocapitalize="none" spellcheck="false">
+          <p class="text-[11px] text-zinc-400 mt-1.5">A simple username is suggested from the school name; replace it with a real email only if the principal needs email password resets.</p></div>
+        <div><label class="label">Temporary password</label>
+          <div class="flex gap-2">
+            <input class="field font-mono" id="draft-sc-pass" placeholder="min. 6 characters" value="${esc(CreateSchool.password)}">
+            <button type="button" class="btn btn-ghost flex-none" data-action="gen-pw" aria-label="Regenerate password"><i class="ph ph-arrows-clockwise"></i></button>
+          </div></div>
+        <div class="grid grid-cols-2 gap-3">
+          <div><label class="label">Access</label>
+            <select class="field" id="draft-sc-trial">
+              <option value="14">14-day free trial</option>
+              <option value="30">30-day free trial</option>
+              <option value="7">7-day free trial</option>
+              <option value="0">Paid · active now</option>
+            </select></div>
+          <div><label class="label">Offer / plan</label>
+            <input class="field" id="draft-sc-offer" placeholder="e.g. Starter offer" value="Starter"></div>
+        </div>
+      </fieldset>
+      <button type="submit" class="btn btn-primary w-full mt-6" id="school-submit" ${CreateSchool.ready?"":"disabled"}><i class="ph ph-buildings"></i>${CreateSchool.checking?"Checking Firebase…":"Create school &amp; principal"}</button>
+      ${CreateSchool.error?`<button type="button" class="btn btn-ghost w-full mt-2" data-action="retry-school-check"><i class="ph ph-arrow-clockwise"></i>Check Firebase again</button>`:""}
+      <div data-provision-status hidden class="mt-3 text-xs font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-xl px-3 py-2.5 text-center">Contacting secure account service…</div>
+      <p class="text-[11px] text-zinc-400 text-center mt-3">The principal can then invite teachers, staff and admins from inside their school.</p>
+    </form>`,{reactive:false});
+  checkOwnerProvisioning();
+}
+function schoolAccessState(meta={}){
+  const expired=meta.status==="trial" && meta.trialEnds && meta.trialEnds<Date.now();
+  if(meta.status==="disabled") return {key:"disabled",label:"Disabled",cls:"bg-rose-100 text-rose-700",blocked:true};
+  if(expired) return {key:"expired",label:"Trial expired",cls:"bg-amber-100 text-amber-800",blocked:true};
+  if(meta.status==="trial"){
+    const days=Math.max(0,Math.ceil((meta.trialEnds-Date.now())/86400000));
+    return {key:"trial",label:`Trial · ${days}d left`,cls:"bg-sky-100 text-sky-700",blocked:false};
+  }
+  return {key:"active",label:"Active",cls:"bg-emerald-100 text-emerald-700",blocked:false};
+}
+function openSchoolAccess(id){
+  const sc=Admin.schools[id], meta=sc?.profile||{}; if(!sc) return;
+  Modal.open(()=>{ const st=schoolAccessState(meta);
+    return `<div class="p-6">
+      <div class="flex items-start justify-between gap-3"><div>
+        <div class="badge ${st.cls} mb-2">${st.label}</div>
+        <h3 class="font-display font-bold text-xl tracking-tight">${esc(meta.name||"School access")}</h3>
+        <p class="text-xs text-zinc-500 mt-1">Owner-only billing, trial and access controls.</p></div>
+        <button class="icon-btn" data-action="modal-close"><i class="ph ph-x text-lg"></i></button></div>
+      <div class="space-y-3 mt-5">
+        <div><label class="label">Offer / plan label</label>
+          <input class="field" data-fid="access-offer" data-input="school-offer" data-id="${id}" value="${esc(meta.offer||meta.plan||"Standard")}"></div>
+        ${meta.status==="trial"?`<div class="bg-sky-50 border border-sky-200/70 rounded-xl p-3 text-xs text-sky-900/80">
+          Trial ends <b>${new Date(meta.trialEnds).toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"})}</b></div>`:""}
+        <div class="grid grid-cols-3 gap-2">
+          ${[7,14,30].map(n=>`<button class="btn btn-ghost !px-2" data-action="school-extend" data-id="${id}" data-days="${n}">+${n} days</button>`).join("")}
+        </div>
+        <button class="btn btn-primary w-full" data-action="school-activate" data-id="${id}"><i class="ph ph-seal-check"></i>Mark paid &amp; active</button>
+        ${st.key==="disabled"
+          ?`<button class="btn btn-soft w-full" data-action="school-enable" data-id="${id}"><i class="ph ph-play-circle"></i>Enable school</button>`
+          :`<button class="btn btn-danger w-full" data-action="school-disable" data-id="${id}"><i class="ph ph-pause-circle"></i>Disable school</button>`}
+      </div>
+      <p class="text-[11px] text-zinc-400 leading-relaxed mt-4 text-center">Disabled and expired schools cannot read or write workspace data. Their records remain safe until access is restored.</p>
+    </div>`;
+  });
+}
+function renderAdmin(){
+  const list=Object.entries(Admin.schools).sort((a,b)=>((a[1].profile?.name||"")).localeCompare(b[1].profile?.name||""));
+  const schoolNameOf=id=>Admin.schools[id]?.profile?.name||"Unknown school";
+  const cards=list.map(([id,sc],i)=>{
+    const meta=sc.profile||{}; const data=sc.state||{};
+    const access=schoolAccessState(meta);
+    const nT=(data.teachers||[]).length, nC=(data.classes||[]).length, nM=Object.keys(sc.members||{}).length;
+    const days=(data.settings?.daysPerWeek)||5, periods=(data.settings?.periodsPerDay)||7;
+    let filled=0; Object.values(data.timetable||{}).forEach(g=>g.forEach(r=>r.forEach(c=>{ if(c) filled++; })));
+    const cap=nC*days*periods, pct=cap?Math.round(filled/cap*100):0;
+    const logo=meta.logo;
+    return `<div class="card p-5 rise hover:shadow-md transition-shadow" style="animation-delay:${Math.min(i,8)*50}ms">
+      <div class="flex items-start gap-3.5">
+        ${logo?`<div class="tile w-12 h-12 rounded-xl overflow-hidden bg-zinc-100"><img class="logo-img" src="${esc(logo)}" alt=""></div>`
+              :`<div class="tile w-12 h-12 rounded-xl bg-gradient-to-br from-emerald-500 to-teal-600 text-white font-display font-bold text-lg">${esc(initials(meta.name||"S"))}</div>`}
+        <div class="flex-1 min-w-0">
+          <div class="font-display font-bold text-[15px] tracking-tight truncate">${esc(meta.name||"Unnamed school")}</div>
+          <div class="text-[11px] text-zinc-500 truncate font-medium mt-0.5"><i class="ph ph-crown-simple"></i> ${esc(displayAcct(meta.principalEmail)||"no principal")}</div>
+          <div class="flex items-center gap-1.5 mt-1.5"><span class="badge ${access.cls}">${access.label}</span>
+            ${meta.offer?`<span class="badge bg-zinc-100 text-zinc-600">${esc(meta.offer)}</span>`:""}</div>
+          <div class="flex flex-wrap gap-1.5 mt-2.5">
+            <span class="chip"><i class="ph-fill ph-users-three text-sky-500"></i>${nM}</span>
+            <span class="chip"><i class="ph-fill ph-chalkboard-teacher text-emerald-500"></i>${nT}</span>
+            <span class="chip"><i class="ph-fill ph-student text-violet-500"></i>${nC}</span>
+            <span class="chip"><i class="ph-fill ph-calendar-check text-amber-500"></i>${pct}%</span>
+          </div>
+        </div>
+      </div>
+      <div class="flex gap-2 mt-4">
+        <button class="btn btn-primary flex-1 !min-h-[42px]" data-action="open-school" data-id="${id}"><i class="ph ph-arrow-square-out"></i>Open</button>
+        <button class="icon-btn !w-[42px] !h-[42px]" data-action="school-access" data-id="${id}" aria-label="Manage access and trial" title="Access, trial and offer"><i class="ph ph-sliders-horizontal"></i></button>
+        <button class="icon-btn !w-[42px] !h-[42px]" data-action="reset-admin-pw" data-email="${esc(meta.principalEmail||"")}" aria-label="Reset principal password" title="Send password reset email"><i class="ph ph-key"></i></button>
+        <button class="icon-btn danger !w-[42px] !h-[42px]" data-action="delete-school" data-id="${id}" aria-label="Delete school" title="Delete school"><i class="ph ph-trash"></i></button>
+      </div>
+    </div>`;
+  }).join("");
+
+  const userRows=Object.entries(Admin.allUsers).sort((a,b)=>(a[1].email||"").localeCompare(b[1].email||"")).map(([u,d])=>`
+    <tr class="border-t border-zinc-100">
+      <td class="py-2 pr-3 font-semibold">${esc(d.name||"—")}</td>
+      <td class="py-2 pr-3 text-zinc-500">${esc(d.email||"")}</td>
+      <td class="py-2 pr-3">${roleBadge(d.role)}</td>
+      <td class="py-2 pr-3 text-zinc-500 truncate max-w-[160px]">${esc(schoolNameOf(d.schoolId))}</td>
+      <td class="py-2">${d.active===false?`<span class="badge bg-zinc-100 text-zinc-500">Off</span>`:`<span class="badge bg-emerald-100 text-emerald-700">Active</span>`}</td>
+    </tr>`).join("");
+
+  $("#view").innerHTML=`
+  <div class="space-y-4">
+    ${renderOwnerQuickLinks()}
+    <div class="flex items-center justify-between flex-wrap gap-3 rise">
+      <div>
+        <div class="text-[11px] font-bold uppercase tracking-[.1em] text-emerald-600">Platform administration</div>
+        <h2 class="font-display font-bold text-2xl sm:text-[28px] tracking-tight mt-0.5">Schools</h2>
+        <p class="text-xs text-zinc-500 font-medium mt-0.5">${list.length} school${list.length!==1?"s":""} · signed in as ${esc(Session.email||"super admin")}</p>
+      </div>
+      <div class="flex flex-wrap gap-2">
+        <button class="btn btn-ghost" data-action="site-editor" title="Edit the public website, phone number and WhatsApp"><i class="ph ph-globe-hemisphere-west"></i>Edit website</button>
+        <button class="btn btn-primary" data-action="new-school"><i class="ph ph-plus"></i>New school</button>
+      </div>
+    </div>
+    ${list.length? `<div class="grid sm:grid-cols-2 xl:grid-cols-3 gap-3">${cards}</div>`
+      : emptyState("ph-buildings","No schools yet","Create your first school — its principal gets credentials instantly and can then invite their own team.",
+        `<button class="btn btn-primary" data-action="new-school"><i class="ph ph-plus"></i>Create the first school</button>`)}
+    ${Object.keys(Admin.allUsers).length?`
+    <div class="card p-5 rise">
+      <h3 class="font-display font-bold text-[15px] tracking-tight mb-3 flex items-center gap-2"><i class="ph-fill ph-address-book text-sky-500"></i>All platform users <span class="badge bg-zinc-100 text-zinc-500">${Object.keys(Admin.allUsers).length}</span></h3>
+      <div class="overflow-x-auto -mx-1 px-1">
+        <table class="w-full text-[12px]" style="min-width:640px">
+          <thead><tr class="text-left text-[10px] uppercase tracking-wider text-zinc-400">
+            <th class="pb-2 pr-3">Name</th><th class="pb-2 pr-3">Email</th><th class="pb-2 pr-3">Role</th><th class="pb-2 pr-3">School</th><th class="pb-2">Status</th></tr></thead>
+          <tbody>${userRows}</tbody>
+        </table>
+      </div>
+    </div>`:""}
+  </div>`;
+}
+
+/* =================================================================================
+   MARKETING STUDIO — export-ready social graphics for the platform owner
+   ================================================================================= */
+const CREATIVE_SPECS={
+  facebook:{ w:1200,h:628,title:"Facebook landscape ad",size:"1200 × 628",file:"campusflow-facebook-ad.png" },
+  square:{ w:1080,h:1080,title:"Square social post",size:"1080 × 1080",file:"campusflow-square-post.png" },
+  story:{ w:1080,h:1920,title:"Story / Reel cover",size:"1080 × 1920",file:"campusflow-story.png" },
+  mockup:{ w:1600,h:900,title:"Product mockup",size:"1600 × 900",file:"campusflow-product-mockup.png" },
+  editorial:{ w:1080,h:1350,title:"Editorial sales notice",size:"1080 × 1350",file:"campusflow-editorial-notice.png" },
+  voucher:{ w:1080,h:1080,title:"School starter voucher",size:"1080 × 1080",file:"campusflow-starter-voucher.png" },
+  waInvite:{ w:1080,h:1920,title:"WhatsApp invitation card",size:"1080 × 1920",file:"campusflow-whatsapp-invite.png" },
+  beforeAfter:{ w:1200,h:628,title:"Before / after comparison",size:"1200 × 628",file:"campusflow-before-after.png" },
+  cover:{ w:1640,h:856,title:"Facebook page cover",size:"1640 × 856",file:"campusflow-facebook-cover.png" },
+  posterA4:{ w:2480,h:3508,title:"A4 print poster",size:"2480 × 3508 @ 300dpi",file:"campusflow-a4-poster.png" },
+  priceSheet:{ w:1080,h:1350,title:"Pricing / offer sheet",size:"1080 × 1350",file:"campusflow-pricing-sheet.png" },
+  receipt:{ w:900,h:1500,title:"Trial coupon (cut-out)",size:"900 × 1500",file:"campusflow-trial-coupon.png" },
+  quote:{ w:1080,h:1080,title:"Principal checklist",size:"1080 × 1080",file:"campusflow-principal-checklist.png" },
+  flyer:{ w:1240,h:1754,title:"A5 leaflet (front)",size:"1240 × 1754",file:"campusflow-leaflet.png" },
+  linkedin:{ w:1200,h:627,title:"Professional banner ad",size:"1200 × 627",file:"campusflow-professional-ad.png" },
+  reliefSpot:{ w:1080,h:1080,title:"Relief in one tap",size:"1080 × 1080",file:"campusflow-relief.png" },
+  offlineSpot:{ w:1080,h:1080,title:"Works without internet",size:"1080 × 1080",file:"campusflow-offline.png" },
+  fingerprintSpot:{ w:1080,h:1080,title:"Fingerprint attendance",size:"1080 × 1080",file:"campusflow-fingerprint.png" },
+  findSpot:{ w:1080,h:1080,title:"Find anything, instantly",size:"1080 × 1080",file:"campusflow-find.png" },
+  langSpot:{ w:1080,h:1080,title:"Sinhala · Tamil · English",size:"1080 × 1080",file:"campusflow-languages.png" },
+  trialStory:{ w:1080,h:1920,title:"Free trial story",size:"1080 × 1920",file:"campusflow-trial-story.png" },
+  printSpot:{ w:1080,h:1350,title:"Print every class plan",size:"1080 × 1350",file:"campusflow-print.png" },
+  principalStory:{ w:1080,h:1920,title:"Principal story",size:"1080 × 1920",file:"campusflow-principal-story.png" },
+  reelCover:{ w:1080,h:1920,title:"Reel cover",size:"1080 × 1920",file:"campusflow-reel-cover.png" },
+  carousel:{ w:1080,h:1080,title:"Carousel: why timetables break",size:"1080 × 1080",file:"campusflow-carousel.png" },
+  parentNotice:{ w:1080,h:1350,title:"Parent notice",size:"1080 × 1350",file:"campusflow-parent-notice.png" },
+  siteBanner:{ w:1200,h:628,title:"Site banner",size:"1200 × 628",file:"campusflow-site-banner.png" }
+};
+/* Stable campaign reference: preview and download must match; no random code recycling. */
+let campaignCode="CF-FLOW-2601";
+function canvasRR(x,y,w,h,r){
+  const p=new Path2D(), q=Math.min(r,w/2,h/2);
+  p.moveTo(x+q,y); p.lineTo(x+w-q,y); p.quadraticCurveTo(x+w,y,x+w,y+q);
+  p.lineTo(x+w,y+h-q); p.quadraticCurveTo(x+w,y+h,x+w-q,y+h);
+  p.lineTo(x+q,y+h); p.quadraticCurveTo(x,y+h,x,y+h-q);
+  p.lineTo(x,y+q); p.quadraticCurveTo(x,y,x+q,y); p.closePath(); return p;
+}
+function fillRR(x,y,w,h,r,color,ctx){ ctx.fillStyle=color; ctx.fill(canvasRR(x,y,w,h,r)); }
+function brandIcon(ctx,x,y,s){
+  const g=ctx.createLinearGradient(x,y,x+s,y+s); g.addColorStop(0,"#10b981"); g.addColorStop(1,"#0f766e");
+  fillRR(x,y,s,s,s*.24,g,ctx); ctx.fillStyle="#fff";
+  ctx.beginPath(); ctx.moveTo(x+s*.5,y+s*.23); ctx.lineTo(x+s*.16,y+s*.42); ctx.lineTo(x+s*.5,y+s*.61); ctx.lineTo(x+s*.84,y+s*.42); ctx.closePath(); ctx.fill();
+  ctx.globalAlpha=.9; ctx.fillRect(x+s*.31,y+s*.54,s*.38,s*.17); ctx.globalAlpha=1;
+}
+function fitText(ctx,text,maxWidth,size,weight=800,family="Inter"){
+  let n=size; do { ctx.font=`${weight} ${n}px ${family}, sans-serif`; if(ctx.measureText(text).width<=maxWidth) return n; n-=2; } while(n>16); return n;
+}
+function lines(ctx,text,x,y,maxWidth,lineHeight,maxLines=9){
+  const words=String(text).split(/\s+/), out=[]; let line="";
+  for(const word of words){ const test=line?line+" "+word:word;
+    if(ctx.measureText(test).width>maxWidth&&line){ out.push(line); line=word; } else line=test;
+  }
+  if(line) out.push(line); out.slice(0,maxLines).forEach((l,i)=>ctx.fillText(l,x,y+i*lineHeight)); return out.length;
+}
+function productWindow(ctx,x,y,w,h,compact=false){
+  ctx.save(); ctx.shadowColor="rgba(15,23,42,.25)"; ctx.shadowBlur=32; ctx.shadowOffsetY=16;
+  fillRR(x,y,w,h,compact?32:24,"#ffffff",ctx); ctx.restore();
+  ctx.save(); ctx.clip(canvasRR(x,y,w,h,compact?32:24));
+  const side=compact?0:w*.205, top=compact?h*.10:h*.085;
+  if(!compact){ ctx.fillStyle="#f8fafc"; ctx.fillRect(x,y,side,h); ctx.fillStyle="#ecfdf5"; ctx.fillRect(x+14,y+20,side-28,46);
+    brandIcon(ctx,x+22,y+20,38); ctx.fillStyle="#0f172a"; ctx.font=`700 16px Inter`; ctx.fillText("CampusFlow",x+68,y+45);
+    const nav=["Dashboard","Timetable","Relief Center","Database"];
+    nav.forEach((n,i)=>{ if(i===1){ fillRR(x+14,y+86+i*48,side-28,38,10,"#ecfdf5",ctx); ctx.fillStyle="#047857"; } else ctx.fillStyle="#64748b";
+      ctx.font=`600 12px Inter`; ctx.fillText(n,x+34,y+111+i*48); }); }
+  ctx.fillStyle="#fff"; ctx.fillRect(x+side,y,w-side,top); ctx.strokeStyle="#e5e7eb"; ctx.beginPath(); ctx.moveTo(x+side,y+top);ctx.lineTo(x+w,y+top);ctx.stroke();
+  ctx.fillStyle="#0f172a"; ctx.font=`700 ${compact?18:16}px Inter`; ctx.fillText(compact?"Today's timetable":"Grade 10-A · Weekly timetable",x+side+24,y+top*.62);
+  const gx=x+side+24, gy=y+top+22, gw=w-side-48, gh=h-top-46;
+  const cols=compact?2:5, rows=compact?5:7, gap=compact?8:7, cw=(gw-gap*(cols-1))/cols, ch=(gh-gap*(rows-1))/rows;
+  const subjects=["MATH","ENG","SCI","ICT","HIST","ART","GEO","PE"], colors=["#10b981","#0ea5e9","#8b5cf6","#6366f1","#f59e0b","#ec4899","#14b8a6","#84cc16"];
+  for(let r=0;r<rows;r++) for(let c=0;c<cols;c++){
+    const i=(r*cols+c)%subjects.length, xx=gx+c*(cw+gap), yy=gy+r*(ch+gap);
+    fillRR(xx,yy,cw,ch,compact?10:8,colors[i]+"18",ctx); ctx.fillStyle=colors[i]; ctx.font=`800 ${compact?12:10}px Inter`; ctx.fillText(subjects[i],xx+10,yy+(compact?22:18));
+    if(!compact){ ctx.fillStyle="#64748b"; ctx.font=`600 8px Inter`; ctx.fillText(["PN","MS","DO","TB"][i%4],xx+10,yy+33); }
+  }
+  ctx.restore();
+}
+function phoneMock(ctx,x,y,w,h){
+  ctx.save(); ctx.shadowColor="rgba(15,23,42,.35)"; ctx.shadowBlur=35; ctx.shadowOffsetY=18; fillRR(x,y,w,h,w*.13,"#111827",ctx); ctx.restore();
+  fillRR(x+10,y+10,w-20,h-20,w*.105,"#f8fafc",ctx); fillRR(x+w*.35,y+13,w*.3,14,7,"#111827",ctx);
+  productWindow(ctx,x+18,y+40,w-36,h-70,true);
+}
+function contactBar(ctx,x,y,w,h,dark=false){
+  fillRR(x,y,w,h,h/2,dark?"#ffffff":"#064e3b",ctx); ctx.fillStyle=dark?"#064e3b":"#fff";
+  ctx.font=`800 ${Math.round(h*.34)}px Inter`; ctx.textAlign="center"; ctx.textBaseline="middle"; ctx.fillText("CALL  "+SiteCfg.phone(),x+w/2,y+h/2+1); ctx.textAlign="left"; ctx.textBaseline="alphabetic";
+}
+function openSiteEditor(){
+  if(!isSuper()){ toast("error","Owner only","Site content is controlled by the platform owner."); return; }
+  const d=k=>{ const v=SiteCfg.data?.[k]; return v===undefined||v===null?"":v; };
+  const feat=SiteCfg.features();
+  Modal.open(()=>`
+    <form class="p-6" data-form="site-edit" autocomplete="off">
+      <div class="flex items-start justify-between gap-3">
+        <div><h3 class="font-display font-bold text-xl tracking-tight">Site content</h3>
+        <p class="text-xs text-zinc-500 mt-1 leading-relaxed">Shown publicly on the landing page before sign-in, and inserted into every creative & caption. Saved in the cloud — applies to every device instantly.</p></div>
+        <button type="button" class="icon-btn" data-action="modal-close" aria-label="Close"><i class="ph ph-x text-lg"></i></button>
+      </div>
+      <div class="space-y-4 mt-5">
+        <div class="grid sm:grid-cols-2 gap-3">
+          <div><label class="label">Call number (public)</label>
+            <input class="field font-mono" id="se-phone" readonly title="Fixed contact number" value="${esc(SiteCfg.val("phone"))}" placeholder="072 399 3300"></div>
+          <div><label class="label">WhatsApp number (with country code, digits only)</label>
+            <input class="field font-mono" id="se-whatsapp" readonly title="Fixed contact number" value="${esc(SiteCfg.waNumber())}" placeholder="94723993300"></div>
+        </div>
+        <div><label class="label">WhatsApp prefilled message</label>
+          <input class="field" id="se-wamsg" value="${esc(d("waMsg")||SiteCfg.val("waMsg"))}"></div>
+        <div><label class="label">Landing headline</label>
+          <input class="field" id="se-title" value="${esc(d("heroTitle")||SiteCfg.val("heroTitle"))}"></div>
+        <div><label class="label">Landing sub-headline</label>
+          <textarea class="field !h-auto py-2.5" id="se-sub" rows="2">${esc(d("heroSubtitle")||SiteCfg.val("heroSubtitle"))}</textarea></div>
+        <div class="grid sm:grid-cols-3 gap-3">
+          <div><label class="label">Trial days</label>
+            <input type="number" min="0" max="365" class="field" id="se-trial" value="${esc(String(d("trialDays")!==""?d("trialDays"):SiteCfg.val("trialDays")))}"></div>
+          <div><label class="label">Plan name</label>
+            <input class="field" id="se-planname" value="${esc(d("planName")||SiteCfg.val("planName"))}"></div>
+          <div><label class="label">Plan price text</label>
+            <input class="field" id="se-planprice" value="${esc(d("planPrice")||SiteCfg.val("planPrice"))}" placeholder="On request"></div>
+        </div>
+        <div>
+          <label class="label">Feature cards (6 shown on the landing page)</label>
+          <div class="space-y-2">
+            ${feat.map((f,i)=>`
+            <div class="grid sm:grid-cols-[minmax(0,.9fr)_minmax(0,1.4fr)] gap-2">
+              <input class="field !h-11 !text-xs" placeholder="Feature title" data-feature-title="${i}" value="${esc(f.title)}">
+              <input class="field !h-11 !text-xs" placeholder="Feature description" data-feature-text="${i}" value="${esc(f.text)}">
+            </div>`).join("")}
+          </div>
+        </div>
+      </div>
+      <button type="submit" class="btn btn-primary w-full mt-6" id="se-submit"><i class="ph ph-cloud-check"></i>Publish site content</button>
+      <p class="text-[11px] text-zinc-400 text-center mt-3">Public content only. Users see it the moment it saves — no deploy needed.</p>
+    </form>`,{reactive:false});
+  setTimeout(()=>$("#se-phone")?.focus({preventScroll:true}),60);
+}
+/* ------- helpers for the human-looking editorial/voucher/wa/poster treatments ------- */
+function linesCentered(ctx,text,cx,y,maxWidth,lineHeight,maxLines=5){
+  const words=String(text).split(/\s+/), rows=[]; let row="";
+  for(const wd of words){ const test=row?row+" "+wd:wd;
+    if(row && ctx.measureText(test).width>maxWidth){ rows.push(row); row=wd; } else row=test; }
+  if(row) rows.push(row);
+  const prevAlign=ctx.textAlign; ctx.textAlign="center";
+  rows.slice(0,maxLines).forEach((r,i)=>ctx.fillText(r,cx,y+i*lineHeight));
+  ctx.textAlign=prevAlign; return rows.length;
+}
+function chatBubble(ctx,x,y,w,lines_){
+  const words=String(lines_).split(/\s+/), rows=[]; let row="";
+  ctx.font=`500 18px Inter`;
+  for(const word of words){ const test=row?row+" "+word:word;
+    if(row&&ctx.measureText(test).width>w-36){ rows.push(row);row=word; } else row=test; }
+  if(row) rows.push(row);
+  const visible=rows.slice(0,3), bh=visible.length*25+46;
+  ctx.save(); ctx.shadowColor="rgba(15,23,42,.09)"; ctx.shadowBlur=6; ctx.shadowOffsetY=2;
+  fillRR(x,y,w,bh,12,"#ffffff",ctx);
+  ctx.fillStyle="#dcf8c6"; ctx.beginPath(); ctx.moveTo(x+w-12,y+14); ctx.lineTo(x+w+8,y+24); ctx.lineTo(x+w-12,y+34); ctx.closePath(); ctx.fill();
+  fillRR(x+w-26,y+14,24,22,8,"#dcf8c6",ctx);
+  ctx.restore();
+  ctx.fillStyle="#1f2937"; ctx.font=`500 18px Inter`; visible.forEach((r,i)=>ctx.fillText(r,x+18,y+28+i*25));
+  ctx.fillStyle="#6b7280"; ctx.font=`400 11px Inter`; ctx.textAlign="right"; ctx.fillText("just now",x+w-18,y+bh-10); ctx.textAlign="left";
+}
+/* a rectangular block with a ragged white torn-edge band, used for the "cut out" typography look */
+function whiteCut(ctx,x,y,w,h,headline,drawProduct){
+  ctx.save();
+  ctx.save(); ctx.shadowColor="rgba(15,23,42,.18)"; ctx.shadowBlur=22; ctx.shadowOffsetY=10;
+  ctx.fillStyle="#fff"; ctx.beginPath();
+  const steps=22;
+  ctx.moveTo(x,y+18);
+  for(let i=0;i<=steps;i++){ const px=x+(w/steps)*i; const py=y+ (i%2? 6: 18); ctx.lineTo(px,py); }
+  ctx.lineTo(x+w,y+h-14);
+  for(let i=steps;i>=0;i--){ const px=x+(w/steps)*i; const py=y+h-(i%2? 4:14); ctx.lineTo(px,py); }
+  ctx.closePath(); ctx.fill(); ctx.restore();
+  ctx.save(); ctx.beginPath(); ctx.rect(x+16,y+10,w-32,h-20); ctx.clip();
+  ctx.fillStyle="#0f172a"; ctx.font=`800 ${Math.round(w*.055)}px Space Grotesk, Inter, sans-serif`;
+  ctx.textAlign="center"; const linesTxt=headline.split(" ");
+  let hy=y+Math.round(h*.34);
+  const half=Math.ceil(linesTxt.length/2);
+  ctx.fillText(linesTxt.slice(0,half).join(" "),x+w/2,hy);
+  ctx.fillText(linesTxt.slice(half).join(" "),x+w/2,hy+Math.round(w*.06));
+  ctx.textAlign="left"; ctx.restore();
+  if(drawProduct){ ctx.save(); ctx.beginPath(); ctx.rect(x+16,y+h*.62,w-32,h*.3); ctx.clip(); drawProduct(ctx,x+30,y+38,w-60,h*.52,true); ctx.restore(); }
+  ctx.restore();
+}
+/* centred multi-line type — avoid depending on ctx.fillText center alignment quirks */
+/* =================================================================================
+   CREATIVE SYSTEM v2 — one premium look for every banner.
+   Every piece of copy comes from the owner's settings (phone, trial days, features).
+   No testimonials, statistics or invented claims.
+   ================================================================================= */
+const CV_FEATS = () => SiteCfg.features().map(f=>f.title);
+const CV_PH = () => SiteCfg.phone();
+const CV_DAYS = () => String(SiteCfg.val("trialDays"));
+const CFONT=(wt,px)=>`${wt} ${px}px "Space Grotesk", Inter, sans-serif`;
+const BFONT=(wt,px)=>`${wt} ${px}px Inter, system-ui, sans-serif`;
+function cvBg(ctx,w,h,dark=true){
+  const g=ctx.createLinearGradient(0,0,w,h);
+  if(dark){ g.addColorStop(0,"#03241f"); g.addColorStop(1,"#063b33"); } else { g.addColorStop(0,"#f5fbf8"); g.addColorStop(1,"#e2f4ea"); }
+  ctx.fillStyle=g; ctx.fillRect(0,0,w,h);
+  const r=ctx.createRadialGradient(w*.9,h*.02,0,w*.9,h*.02,Math.max(w,h)*.6);
+  r.addColorStop(0,dark?"rgba(16,185,129,.38)":"rgba(16,185,129,.16)"); r.addColorStop(1,"rgba(16,185,129,0)");
+  ctx.fillStyle=r; ctx.fillRect(0,0,w,h);
+  ctx.fillStyle=dark?"rgba(52,211,153,.13)":"rgba(5,150,105,.08)";
+  const step=Math.round(Math.max(w,h)/34);
+  for(let x=step;x<w;x+=step) for(let y=step;y<h;y+=step){ ctx.beginPath(); ctx.arc(x,y,Math.max(1.6,w/640),0,Math.PI*2); ctx.fill(); }
+}
+function cvLogo(ctx,x,y,s,dark=true){
+  brandIcon(ctx,x,y,s);
+  ctx.fillStyle=dark?"#ecfdf5":"#0b1f1c"; ctx.font=CFONT(700,Math.round(s*.46));
+  ctx.fillText("CampusFlow",x+s+s*.2,y+s*.66);
+}
+function cvText(ctx,text,x,y,maxW,size,lh,maxLines,color,face="head",align="left"){
+  ctx.fillStyle=color; ctx.font=face==="head"?CFONT(700,size):BFONT(500,size);
+  ctx.textAlign=align; lines(ctx,text,x,y,maxW,lh,maxLines); ctx.textAlign="left";
+}
+function cvEyebrow(ctx,text,x,y,color,size=26,align="left"){
+  ctx.fillStyle=color; ctx.font=BFONT(800,size); ctx.textAlign=align; ctx.fillText(text.toUpperCase(),x,y); ctx.textAlign="left";
+}
+function cvPill(ctx,x,y,w,h,label,size,light=false){
+  if(light){ fillRR(x,y,w,h,h/2,"#ffffff",ctx); ctx.fillStyle="#047857"; }
+  else { const g=ctx.createLinearGradient(x,y,x+w,y); g.addColorStop(0,"#10b981"); g.addColorStop(1,"#059669"); fillRR(x,y,w,h,h/2,g,ctx); ctx.fillStyle="#ffffff"; }
+  ctx.font=BFONT(800,size); ctx.textAlign="center"; ctx.fillText(label,x+w/2,y+h/2+size*.36); ctx.textAlign="left";
+}
+function cvChip(ctx,x,y,label,size,dark=false){
+  ctx.font=BFONT(700,size); const tw=ctx.measureText(label).width, w=tw+size*1.6, h=size*2.1;
+  fillRR(x,y,w,h,h/2,dark?"rgba(255,255,255,.1)":"#ffffff",ctx);
+  ctx.fillStyle=dark?"#d1fae5":"#047857"; ctx.fillText(label,x+size*.8,y+h/2+size*.36); return w;
+}
+function cvCheck(ctx,x,y,r){
+  ctx.fillStyle="#10b981"; ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); ctx.fill();
+  ctx.strokeStyle="#ffffff"; ctx.lineWidth=r*.28; ctx.lineCap="round"; ctx.lineJoin="round";
+  ctx.beginPath(); ctx.moveTo(x-r*.45,y+r*.02); ctx.lineTo(x-r*.1,y+r*.38); ctx.lineTo(x+r*.5,y-r*.32); ctx.stroke();
+}
+function cvFooter(ctx,w,h,text,dark=true){
+  ctx.fillStyle=dark?"#86c7b2":"#5b6f6a"; ctx.font=BFONT(700,Math.round(Math.max(24,w*.026))); ctx.textAlign="center";
+  ctx.fillText(text,w/2,h-w*.035); ctx.textAlign="left";
+}
+function cvPhone(ctx,x,y,w,h){
+  fillRR(x,y,w,h,w*.13,"#0b1f1c",ctx);
+  fillRR(x+w*.03,y+w*.03,w*.94,h*.94,w*.11,"#f7fbf9",ctx);
+  const sx=x+w*.08, sy=y+h*.07, sw=w*.84;
+  ctx.fillStyle="#0b1f1c"; ctx.font=CFONT(800,Math.round(w*.075)); ctx.fillText("Today",sx,sy+w*.07);
+  fillRR(sx+sw-w*.3,sy,w*.3,w*.095,w*.048,"#d1fae5",ctx);
+  ctx.fillStyle="#047857"; ctx.font=BFONT(800,Math.round(w*.04)); ctx.textAlign="center"; ctx.fillText("Clash-free",sx+sw-w*.15,sy+w*.063); ctx.textAlign="left";
+  const cols=["#059669","#0f766e","#10b981","#047857","#34d399"], names=["Maths · 9B","Science · 9B","Sinhala · 9B","Tamil · 9A","History · 10C"], times=["07:40","08:20","09:10","10:00","10:50"];
+  const rowH=h*.085, gap=h*.014; let by=sy+w*.2;
+  for(let i=0;i<5;i++){
+    const yy=by+i*(rowH+gap);
+    ctx.fillStyle="#6b7f7a"; ctx.font=BFONT(700,Math.round(w*.04)); ctx.fillText(times[i],sx,yy+rowH*.62);
+    fillRR(sx+w*.17,yy,sw-w*.17,rowH,w*.045,cols[i],ctx);
+    ctx.fillStyle="#ffffff"; ctx.font=CFONT(800,Math.round(w*.05)); ctx.fillText(names[i],sx+w*.17+w*.045,yy+rowH*.63);
+  }
+  const ry=y+h*.77, rh=h*.14;
+  fillRR(sx,ry,sw,rh,w*.05,"#d1fae5",ctx); fillRR(sx+2,ry+2,sw-4,rh-4,w*.05,"#ffffff",ctx);
+  ctx.fillStyle="#047857"; ctx.font=BFONT(800,Math.round(w*.034)); ctx.fillText("ABSENT TEACHER",sx+w*.045,ry+rh*.32);
+  ctx.fillStyle="#0b1f1c"; ctx.font=CFONT(700,Math.round(w*.05)); ctx.fillText("Relief found in 1 tap",sx+w*.045,ry+rh*.74);
+}
+function cvGridCard(ctx,x,y,w,h){
+  fillRR(x,y,w,h,w*.06,"#ffffff",ctx);
+  const cols=["#059669","#0f766e","#10b981","#047857","#34d399"], cw=(w-w*.2)/5, ch=(h-w*.3)/6;
+  ctx.font=BFONT(700,Math.round(w*.04)); ctx.fillStyle="#6b7f7a";
+  ["Mon","Tue","Wed","Thu","Fri"].forEach((d,i)=>ctx.fillText(d,x+w*.1+i*cw+cw*.2,y+w*.14));
+  for(let r=0;r<6;r++) for(let c=0;c<5;c++){
+    const pick=(r*3+c*5)%5;
+    if((r+c)%4===3) continue;
+    fillRR(x+w*.1+c*cw+cw*.06,y+w*.2+r*ch+ch*.06,cw*.88,ch*.84,w*.02,cols[pick],ctx);
+  }
+}
+function cvPaper(ctx,x,y,w,h,rot){
+  ctx.save(); ctx.translate(x+w/2,y+h/2); ctx.rotate(rot); ctx.translate(-w/2,-h/2);
+  ctx.shadowColor="rgba(0,0,0,.25)"; ctx.shadowBlur=w*.08; ctx.shadowOffsetY=w*.03;
+  fillRR(0,0,w,h,w*.04,"#ffffff",ctx); ctx.shadowColor="transparent";
+  const cols=["#059669","#0f766e","#10b981","#34d399"];
+  for(let r=0;r<7;r++){ fillRR(w*.08,h*.1+r*h*.11,w*.84,h*.075,w*.02,cols[r%4],ctx); }
+  ctx.restore();
+}
+const CV_R = {};
+CV_R.facebook=(c,w,h)=>{ cvBg(c,w,h); cvLogo(c,70,64,84);
+  cvText(c,"Timetables that build themselves.",70,235,640,62,72,3,"#ecfdf5");
+  cvText(c,"Clash-free schedules, relief in one tap and printable class plans.",70,420,600,26,36,3,"#a7d9c7","body");
+  cvPill(c,70,500,330,66,"Call "+CV_PH(),24); cvPhone(c,820,58,300,512); };
+CV_R.square=(c,w,h)=>{ cvBg(c,w,h); cvLogo(c,80,76,90);
+  cvText(c,"Stop building timetables by hand.",80,260,920,92,104,3,"#ecfdf5");
+  cvPhone(c,350,520,380,470); cvPill(c,250,1010,580,58,"Free "+CV_DAYS()+"-day trial",26); };
+CV_R.story=(c,w,h)=>{ cvBg(c,w,h); cvLogo(c,90,100,100);
+  cvEyebrow(c,"For Sri Lankan schools",90,330,"#6ee7b7",28);
+  cvText(c,"Your timetable, sorted before the bell.",90,430,920,108,122,3,"#ecfdf5");
+  cvPhone(c,240,800,600,840); cvPill(c,190,1700,700,104,"Call "+CV_PH(),40);
+  cvFooter(c,w,h,"Free "+CV_DAYS()+"-day trial · Sinhala · Tamil · English"); };
+CV_R.mockup=(c,w,h)=>{ cvBg(c,w,h); cvLogo(c,90,90,100);
+  cvText(c,"Your whole school week, on one screen.",90,300,820,82,94,3,"#ecfdf5");
+  cvText(c,"Clash-free timetables, relief and printed plans from one app.",90,520,700,30,42,2,"#a7d9c7","body");
+  cvPill(c,90,640,360,70,"Call "+CV_PH(),28); cvPhone(c,1040,80,440,720); };
+CV_R.editorial=(c,w,h)=>{ c.fillStyle="#faf8f1"; c.fillRect(0,0,w,h);
+  c.strokeStyle="#1c1917"; c.lineWidth=5; c.strokeRect(44,44,w-88,h-88); c.lineWidth=1.5; c.strokeRect(70,70,w-140,h-140);
+  brandIcon(c,w/2-60,130,120);
+  c.fillStyle="#1c1917"; c.font=CFONT(700,30); c.textAlign="center"; c.fillText("CAMPUSFLOW",w/2,310);
+  cvEyebrow(c,"Office announcement · timetables and relief",w/2,370,"#047857",17,"center");
+  cvText(c,"One timetable for the whole school.",w/2,470,w-220,74,84,3,"#1c1917","head","center");
+  c.font="400 30px Georgia, serif"; c.fillStyle="#44403c"; c.textAlign="center";
+  lines(c,"Build the year faster, protect teachers from double-bookings, and answer an absence before the first bell.",w/2,760,w-260,42,4); c.textAlign="left";
+  cvPill(c,w/2-190,990,380,84,"Call "+CV_PH(),28); c.fillStyle="#1c1917";
+  c.font=BFONT(700,18); c.fillStyle="#57534e"; c.textAlign="center"; c.fillText("For principals, deputies and timetable staff",w/2,1160); c.fillText("REF "+campaignCode,w/2,1230); c.textAlign="left"; };
+CV_R.voucher=(c,w,h)=>{ cvBg(c,w,h); fillRR(70,70,w-140,h-140,44,"#ffffff",c);
+  c.save(); c.setLineDash([18,12]); c.strokeStyle="#34d399"; c.lineWidth=3; c.stroke(canvasRR(100,100,w-200,h-200,34)); c.restore();
+  cvLogo(c,130,140,88,false); cvEyebrow(c,"School starter offer",130,300,"#047857",24);
+  cvText(c,"Free "+CV_DAYS()+" days.",130,410,820,116,120,1,"#0b1f1c");
+  cvText(c,"Your own timetable, set up with your real teachers and subjects.",130,520,800,32,44,2,"#475569","body");
+  cvPill(c,130,700,460,78,"Call "+CV_PH(),28);
+  c.fillStyle="#6b7280"; c.font=BFONT(600,20); c.fillText("Reference",130,930); c.font=BFONT(800,30); c.font='800 30px "JetBrains Mono", monospace'; c.fillStyle="#0b1f1c"; c.fillText(campaignCode,130,975); };
+CV_R.waInvite=(c,w,h)=>{ cvBg(c,w,h); cvLogo(c,80,90,84);
+  const bubble=(x,y,bw,bh,fill)=>fillRR(x,y,bw,bh,40,fill,c);
+  bubble(80,330,820,300,"#ffffff"); cvText(c,"Hello! Is your school still building timetables by hand?",130,410,740,50,64,3,"#0b1f1c","body");
+  bubble(180,700,820,420,"#d1fae5"); cvText(c,"Try CampusFlow free for "+CV_DAYS()+" days. Clash-free timetables, relief in one tap and printable class plans.",230,780,720,44,58,5,"#0b1f1c","body");
+  cvPill(c,250,1200,580,100,"Call "+CV_PH(),38,true);
+  cvFooter(c,w,h,"Sinhala · Tamil · English"); };
+CV_R.beforeAfter=(c,w,h)=>{ c.fillStyle="#f1f5f4"; c.fillRect(0,0,w/2,h); cvBg(c,w,h); c.fillStyle="#f1f5f4"; c.fillRect(0,0,w/2,h);
+  c.fillStyle="#0f766e"; c.fillRect(w/2-2,0,4,h);
+  cvEyebrow(c,"Before",70,120,"#be123c",26); cvText(c,"Calls to five teachers.",70,230,500,58,68,2,"#1f2937");
+  cvText(c,"A paper list, and a class left waiting.",70,360,460,30,40,3,"#475569","body");
+  cvEyebrow(c,"With CampusFlow",w/2+60,120,"#6ee7b7",26); cvText(c,"Relief found in one tap.",w/2+60,230,500,58,68,2,"#ecfdf5");
+  cvText(c,"The timetable stays clash-free.",w/2+60,360,460,30,40,3,"#a7d9c7","body"); };
+CV_R.cover=(c,w,h)=>{ cvBg(c,w,h); cvLogo(c,120,150,110);
+  cvText(c,"Timetables for Sri Lankan schools.",120,380,760,96,108,3,"#ecfdf5");
+  cvText(c,"Sinhala · Tamil · English",120,640,700,34,46,1,"#a7d9c7","body");
+  cvPill(c,120,700,380,78,"Call "+CV_PH(),28); cvGridCard(c,1000,140,520,580); };
+CV_R.posterA4=(c,w,h)=>{ cvBg(c,w,h); cvLogo(c,200,200,240);
+  cvText(c,"Timetables that build themselves.",200,820,2080,190,220,3,"#ecfdf5");
+  cvText(c,"Clash-free schedules, relief in one tap and printable class plans for every teacher.",200,1560,2000,62,82,2,"#a7d9c7","body");
+  cvPhone(c,740,1800,1000,1150); cvPill(c,640,3070,1200,200,"Call "+CV_PH(),72);
+  cvFooter(c,w,h,"Free "+CV_DAYS()+"-day trial · Sinhala · Tamil · English",true); };
+CV_R.priceSheet=(c,w,h)=>{ cvBg(c,w,h,false); cvLogo(c,80,80,90,false);
+  cvText(c,"Start with a free trial.",80,260,920,84,96,2,"#0b1f1c");
+  cvText(c,"Free for "+CV_DAYS()+" days, then "+SiteCfg.val("planName")+" · "+SiteCfg.val("planPrice"),80,440,920,32,44,2,"#475569","body");
+  let y=540; CV_FEATS().slice(0,5).forEach(t=>{ cvCheck(c,116,y,26); cvText(c,t,170,y+12,840,34,40,1,"#0b1f1c","body"); y+=94; });
+  cvPill(c,80,1100,920,96,"Call "+CV_PH(),34); cvFooter(c,w,h,"Ask about the trial. No obligation.",false); };
+CV_R.receipt=(c,w,h)=>{ cvBg(c,w,h); fillRR(70,90,w-140,h-180,40,"#ffffff",c);
+  c.save(); c.setLineDash([16,12]); c.strokeStyle="#34d399"; c.lineWidth=3; c.stroke(canvasRR(100,120,w-200,h-240,30)); c.restore();
+  cvEyebrow(c,"Free trial coupon",w/2,230,"#047857",24,"center");
+  c.fillStyle="#0b1f1c"; c.font=CFONT(800,300); c.textAlign="center"; c.fillText(CV_DAYS(),w/2,600); c.textAlign="left";
+  cvEyebrow(c,"days, with your own timetable",w/2,680,"#0b1f1c",30,"center");
+  c.setLineDash([10,10]); c.strokeStyle="#a7f3d0"; c.beginPath(); c.moveTo(130,780); c.lineTo(w-130,780); c.stroke(); c.setLineDash([]);
+  cvPill(c,w/2-300,840,600,96,"Call "+CV_PH(),36);
+  c.fillStyle="#6b7280"; c.font=BFONT(600,22); c.textAlign="center"; c.fillText("Reference "+campaignCode,w/2,1080); c.textAlign="left"; };
+CV_R.quote=(c,w,h)=>{ cvBg(c,w,h); cvLogo(c,80,80,90);
+  cvText(c,"What your school gets.",80,260,920,84,96,2,"#ecfdf5");
+  let y=430; CV_FEATS().slice(0,5).forEach(t=>{ cvCheck(c,120,y,28); cvText(c,t,176,y+13,840,36,42,1,"#ecfdf5","body"); y+=108; });
+  cvFooter(c,w,h,"Call "+CV_PH()+" to start"); };
+CV_R.flyer=(c,w,h)=>{ cvBg(c,w,h,false); cvLogo(c,90,100,120,false);
+  cvText(c,"School timetables and relief, sorted.",90,380,1060,104,118,3,"#0b1f1c");
+  let y=700; CV_FEATS().forEach(t=>{ cvCheck(c,130,y,30); cvText(c,t,190,y+14,980,42,50,1,"#0b1f1c","body"); y+=110; });
+  cvPill(c,90,1400,1060,130,"Call "+CV_PH(),52); cvFooter(c,w,h,"Free "+CV_DAYS()+"-day trial · Sinhala · Tamil · English",false); };
+CV_R.linkedin=(c,w,h)=>{ cvBg(c,w,h); cvLogo(c,70,60,78);
+  cvText(c,"Operations software for Sri Lankan schools.",70,190,600,58,68,3,"#ecfdf5");
+  cvPill(c,70,460,330,66,"Call "+CV_PH(),24);
+  let x=70; ["Timetables","Relief","Print"].forEach(t=>{ x+=cvChip(c,x,552,t,28,true)+16; }); cvPhone(c,900,40,250,520); };
+CV_R.reliefSpot=(c,w,h)=>{ cvBg(c,w,h); cvLogo(c,80,76,90);
+  cvText(c,"A teacher is absent. Relief in one tap.",80,260,920,88,100,3,"#ecfdf5");
+  fillRR(80,600,920,300,44,"#ffffff",c);
+  cvEyebrow(c,"Period 2 · Science 9B",130,690,"#047857",28);
+  c.fillStyle="#0b1f1c"; c.font=CFONT(700,60); c.fillText("Relief teacher found",130,770);
+  cvChip(c,130,810,"Free this period ✓",26); cvChip(c,380,810,"Teaches this subject ✓",26);
+  cvPill(c,80,925,920,80,"Call "+CV_PH(),30);
+  cvFooter(c,w,h,"Relief planned in advance, not on the morning of."); };
+CV_R.offlineSpot=(c,w,h)=>{ cvBg(c,w,h,false); const cx=w/2,cy=390;
+  const g=c.createLinearGradient(cx-170,cy-170,cx+170,cy+170); g.addColorStop(0,"#10b981"); g.addColorStop(1,"#0f766e");
+  c.fillStyle=g; c.beginPath(); c.arc(cx,cy,170,0,Math.PI*2); c.fill();
+  c.strokeStyle="#ffffff"; c.lineWidth=22; c.lineCap="round";
+  [60,110].forEach(r=>{ c.beginPath(); c.arc(cx,cy+60,r,Math.PI*1.2,Math.PI*1.8); c.stroke(); });
+  c.fillStyle="#ffffff"; c.beginPath(); c.arc(cx,cy+60,20,0,Math.PI*2); c.fill();
+  cvText(c,"Works without internet.",w/2,640,920,88,100,2,"#0b1f1c","head","center");
+  cvText(c,"Changes save on the device and sync when the connection returns.",w/2,820,860,36,50,3,"#475569","body","center");
+  cvPill(c,250,930,580,88,"Call "+CV_PH(),32); cvFooter(c,w,h,"Sinhala · Tamil · English",false); };
+CV_R.fingerprintSpot=(c,w,h)=>{ cvBg(c,w,h); cvLogo(c,80,76,90);
+  cvText(c,"Fingerprint attendance",80,250,920,84,96,2,"#ecfdf5");
+  cvText(c,"Teachers clock in with a fingerprint or face. Missing teachers show up live.",80,420,900,40,54,3,"#a7d9c7");
+  const cx=w/2, cy=760;
+  c.fillStyle="#10b981"; c.beginPath(); c.arc(cx,cy,170,0,Math.PI*2); c.fill();
+  c.strokeStyle="#ffffff"; c.lineWidth=20; c.lineCap="round";
+  [50,95,140].forEach(r=>{ c.beginPath(); c.arc(cx,cy,r,Math.PI*1.15,Math.PI*1.85); c.stroke(); });
+  cvPill(c,250,1150,580,88,"Call "+CV_PH(),32);
+  cvFooter(c,w,h,"Sinhala · Tamil · English"); };
+CV_R.findSpot=(c,w,h)=>{ cvBg(c,w,h); cvLogo(c,80,76,90);
+  cvText(c,"Find anything, instantly.",80,250,920,84,96,2,"#ecfdf5");
+  cvText(c,"Teachers, classes, lessons, attendance and linked sheets in one search box. Answers cite their source.",80,420,900,40,54,3,"#a7d9c7");
+  c.fillStyle="#ffffff"; c.beginPath(); c.roundRect? c.roundRect(90,600,900,120,60) : c.rect(90,600,900,120); c.fill();
+  cvText(c,"Who is free period 3?",150,636,820,44,50,1,"#0b1f1c","body");
+  c.fillStyle="#d1fae5"; c.beginPath(); c.roundRect? c.roundRect(90,780,900,200,36) : c.rect(90,780,900,200); c.fill();
+  cvText(c,"Kamala Silva is free period 3 on Wednesday [1]",130,820,840,36,46,2,"#0b1f1c","body");
+  cvPill(c,250,1150,580,88,"Call "+CV_PH(),32);
+  cvFooter(c,w,h,"Free "+CV_DAYS()+"-day trial · Sinhala · Tamil · English"); };
+CV_R.langSpot=(c,w,h)=>{ cvBg(c,w,h); cvLogo(c,80,76,90);
+  cvText(c,"Sinhala · Tamil · English",80,250,920,84,96,2,"#ecfdf5");
+  const rows=[["සිංහල","#059669"],["தமிழ்","#0f766e"],["English","#10b981"]];
+  rows.forEach((r,i)=>{ const y=360+i*180; fillRR(80,y,920,150,40,r[1],c); c.fillStyle="#ffffff"; c.font=BFONT(800,92); c.fillText(r[0],130,y+104); });
+  cvPill(c,80,910,920,90,"Call "+CV_PH(),34); cvFooter(c,w,h,"Built for Sri Lankan schools"); };
+CV_R.trialStory=(c,w,h)=>{ cvBg(c,w,h); cvLogo(c,90,100,100);
+  cvEyebrow(c,"Free trial",90,360,"#6ee7b7",30);
+  c.fillStyle="#ecfdf5"; c.font=CFONT(800,420); c.textAlign="center"; c.fillText(CV_DAYS(),w/2,900); c.textAlign="left";
+  cvEyebrow(c,"days, with your own timetable",w/2,1000,"#a7d9c7",34,"center");
+  cvText(c,"Set up with your real teachers and subjects.",w/2,1110,860,58,70,2,"#ecfdf5","head","center");
+  cvPill(c,190,1560,700,108,"Call "+CV_PH(),40); cvFooter(c,w,h,"Sinhala · Tamil · English"); };
+CV_R.printSpot=(c,w,h)=>{ cvBg(c,w,h,false); cvLogo(c,80,76,90,false);
+  cvText(c,"Print every class plan.",80,260,920,88,100,2,"#0b1f1c");
+  cvPaper(c,80,440,430,330,-.06); cvPaper(c,570,440,430,330,.05); cvPaper(c,80,780,430,330,.04); cvPaper(c,570,780,430,330,-.04);
+  cvPill(c,80,1180,920,80,"Call "+CV_PH(),30); cvFooter(c,w,h,"A4 and A3, high contrast, ready to pin up",false); };
+CV_R.principalStory=(c,w,h)=>{ cvBg(c,w,h); cvLogo(c,90,100,100);
+  cvEyebrow(c,"For principals",90,340,"#6ee7b7",28);
+  cvText(c,"You decide what each staff role can change.",90,430,920,92,106,3,"#ecfdf5");
+  let y=760; ["Set who can edit the timetable","Set who only views","Limit grades and fees","Keep a clear record"].forEach(t=>{ cvCheck(c,130,y,30); cvText(c,t,190,y+14,820,40,50,2,"#ecfdf5","body"); y+=150; });
+  cvPill(c,190,1560,700,108,"Call "+CV_PH(),40); cvFooter(c,w,h,"Free "+CV_DAYS()+"-day trial"); };
+CV_R.reelCover=(c,w,h)=>{ cvBg(c,w,h); cvLogo(c,90,90,96);
+  cvText(c,"Your timetable, built from your own data.",90,300,900,86,98,3,"#ecfdf5");
+  cvPhone(c,240,650,600,900); cvPill(c,190,1640,700,100,"Call "+CV_PH(),38);
+  cvFooter(c,w,h,"Free "+CV_DAYS()+"-day trial"); };
+CV_R.carousel=(c,w,h)=>{ cvBg(c,w,h); cvLogo(c,80,76,84);
+  cvChip(c,w-220,90,"1 / 3",28,true);
+  cvText(c,"Why school timetables break.",80,280,920,92,104,2,"#ecfdf5");
+  ["Teachers double-booked in the same period","Absences handled at the last minute","Class plans re-typed by hand every term"].forEach((t,i)=>{
+    const y=520+i*160; c.fillStyle="#34d399"; c.beginPath(); c.arc(130,y,40,0,Math.PI*2); c.fill();
+    c.fillStyle="#03241f"; c.font=CFONT(800,40); c.textAlign="center"; c.fillText(String(i+1),130,y+14); c.textAlign="left";
+    cvText(c,t,200,y+14,800,40,50,2,"#ecfdf5","body"); });
+  cvPill(c,80,960,560,84,"Swipe for the fix →",30); };
+CV_R.parentNotice=(c,w,h)=>{ cvBg(c,w,h,false); cvLogo(c,90,100,110,false);
+  cvEyebrow(c,"For parents",90,380,"#047857",30);
+  cvText(c,"Ask your school about CampusFlow.",90,460,920,100,114,3,"#0b1f1c");
+  cvText(c,"Clash-free timetables and printed class plans, for schools across Sri Lanka.",90,820,880,38,52,3,"#475569","body");
+  cvPill(c,90,1040,920,110,"Call "+CV_PH(),40); cvFooter(c,w,h,"Free "+CV_DAYS()+"-day trial for any school",false); };
+CV_R.siteBanner=(c,w,h)=>{ cvBg(c,w,h); cvLogo(c,70,60,80);
+  cvText(c,"Built for Sri Lankan schools.",70,240,640,72,82,2,"#ecfdf5");
+  cvText(c,"Sinhala · Tamil · English",70,380,640,30,40,1,"#a7d9c7","body");
+  cvPill(c,70,440,340,70,"Free "+CV_DAYS()+"-day trial",26);
+  cvPhone(c,860,40,280,548); };
+
+/* =================================================================================
+   FEED POSTS — 10 English + 10 Sinhala, 1080×1350, each with its own caption.
+   Copy uses the owner's phone number and trial length. No invented claims.
+   ================================================================================= */
+const SFONT=(wt,px)=>`${wt} ${px}px "Noto Sans Sinhala", "Noto Sans Tamil", "Space Grotesk", Inter, sans-serif`;
+const POST_KINDS=["timetable","relief","clash","trial","offline","print","principal","languages","doublebook","contact"];
+const POST_COPY={
+  en:{
+    timetable:{h:"Your timetable, sorted before the bell.",b:"Clash-free, printed and ready for every class."},
+    relief:{h:"Teacher absent? Relief in one tap.",b:"The best free teacher for that period is suggested instantly."},
+    clash:{h:"Clash-free timetables, every term.",b:"Conflicts are flagged before they happen, not on the day."},
+    trial:{h:"Try CampusFlow free for {d} days.",b:"Use your own timetable, not a sample."},
+    offline:{h:"Works without internet.",b:"Changes save on the device and sync when the connection returns."},
+    print:{h:"Print every class plan.",b:"High contrast, A4 and A3, ready to pin up."},
+    principal:{h:"You decide what each role can change.",items:["Who can edit the timetable","Who can only view","Grades and fees, limited","A clear record of changes"]},
+    languages:{h:"Sinhala · Tamil · English",b:"Built for Sri Lankan schools."},
+    doublebook:{h:"Stop double-booking teachers.",b:"CampusFlow warns you before the period starts."},
+    contact:{h:"Start with a free trial.",b:"Call or WhatsApp to set up your school."}
+  },
+  si:{
+    timetable:{h:"ඔබේ කාලසටහන, පැහැදිලිව.",b:"ගැටුම් නොමැති, මුද්‍රණය කළ හැකි, සෑම පන්තියකටම සූදානම්."},
+    relief:{h:"ගුරුවරයා නොපැමිණියාද? එක ටැප් එකකින් ආදේශකයා.",b:"එම කාලච්ඡේදයට හොඳම නිදහස් ගුරුවරයා ක්ෂණිකව යෝජනා කෙරේ."},
+    clash:{h:"සෑම වාරයකම ගැටුම් රහිත කාලසටහන්.",b:"ගැටුම් සිදුවීමට පෙර අනතුරු ඇඟවේ."},
+    trial:{h:"දින {d}ක් නොමිලේ උත්සාහ කරන්න.",b:"නියැදියක් නොව ඔබේම කාලසටහන භාවිත කරන්න."},
+    offline:{h:"අන්තර්ජාලය නැතත් වැඩ කරයි.",b:"වෙනස්කම් උපාංගයේ සුරැකී, පසුව සමමුහුර්ත වේ."},
+    print:{h:"සෑම පන්ති සැලැස්මක්ම මුද්‍රණය කරන්න.",b:"ඉහළ තීව්‍රතාව, A4 සහ A3, පින් කිරීමට සූදානම්."},
+    principal:{h:"සෑම භූමිකාවකටම කළ හැකි දේ ඔබ තීරණය කරන්න.",items:["කාලසටහන සංස්කරණය කළ හැක්කේ කවුද","බැලීමට පමණක් කවුද","ශ්‍රේණි සහ ගාස්තු සීමා කරන්න","වෙනස්කම්වල පැහැදිලි වාර්තාව"]},
+    languages:{h:"සිංහල · தமிழ் · English",b:"ශ්‍රී ලාංකික පාසල් සඳහා නිර්මාණය කරන ලදී."},
+    doublebook:{h:"ගුරුවරුන් එකම කාලයේ දෙවරක් යොදන්න එපා.",b:"කාලච්ඡේදය ආරම්භ වීමට පෙර CampusFlow අනතුරු ඇඟවේ."},
+    contact:{h:"නොමිලේ ආරම්භ කරන්න.",b:"පාසලට ගිණුම සැකසීමට අමතන්න හෝ WhatsApp කරන්න."}
+  }
+};
+const POST_REG={};
+function postT(lang,kind){
+  const T=JSON.parse(JSON.stringify(POST_COPY[lang][kind]));
+  const d=CV_DAYS(); if(T.h) T.h=T.h.replace("{d}",d); return T;
+}
+function postCaption(id){
+  const r=POST_REG[id]; if(!r) return "";
+  const T=postT(r.lang,r.kind), si=r.lang==="si";
+  const body=T.b||"";
+  const tags=si?"#SriLankaSchools #SchoolTimetable #SinhalaSchools":"#SriLankaSchools #SchoolTimetable #SriLankaEducation #EduTech";
+  return T.h+"\n"+body+"\n"+(si?"අමතන්න ":"Call ")+CV_PH()+"\n\n"+tags;
+}
+function postText(c,text,x,y,maxW,size,lh,max,color,si,align="left",weight=700){
+  c.fillStyle=color; c.font= si ? SFONT(weight,size) : (weight>=700?CFONT(weight,size):BFONT(weight,size));
+  c.textAlign=align; lines(c,text,x,y,maxW,lh,max); c.textAlign="left";
+}
+function postFrame(c,w,h,lang,dark,T){
+  const si=lang==="si";
+  cvBg(c,w,h,dark); cvLogo(c,80,70,84,dark);
+  postText(c,T.h,80,250,920,si?78:84,si?106:100,3,dark?"#ecfdf5":"#0b1f1c",si);
+  if(T.b) postText(c,T.b,80,520,900,34,46,2,dark?"#a7d9c7":"#475569",si,"left",500);
+  cvFooter(c,w,h,si?"දින "+CV_DAYS()+" ක නොමිලේ · සිංහල · தமிழ் · English":"Free "+CV_DAYS()+"-day trial · Sinhala · Tamil · English",dark);
+}
+function postCta(c,lang,dark){
+  cvPill(c,230,1160,620,84,(lang==="si"?"අමතන්න ":"Call ")+CV_PH(),30,!dark?false:false);
+}
+function postDraw(c,w,h,lang,kind){
+  const si=lang==="si", T=postT(lang,kind);
+  if(kind==="principal"){
+    postFrame(c,w,h,lang,true,{h:T.h});
+    let y=680; T.items.forEach(t=>{ cvCheck(c,130,y,28); postText(c,t,190,y+12,820,38,48,2,"#ecfdf5",si,"left",500); y+=110; });
+    postCta(c,lang,true); return;
+  }
+  if(kind==="languages"){
+    postFrame(c,w,h,lang,true,T);
+    [["සිංහල","#059669"],["தமிழ்","#0f766e"],["English","#10b981"]].forEach((r,i)=>{ const y=640+i*150; fillRR(80,y,920,130,40,r[1],c); postText(c,r[0],130,y+86,840,76,80,1,"#ffffff",true); });
+    postCta(c,lang,true); return;
+  }
+  if(kind==="print"){
+    postFrame(c,w,h,lang,false,T);
+    cvPaper(c,80,640,430,230,-.05); cvPaper(c,570,640,430,230,.04); cvPaper(c,80,900,430,230,.03); cvPaper(c,570,900,430,230,-.03);
+    postCta(c,lang,false); return;
+  }
+  if(kind==="offline"){
+    postFrame(c,w,h,lang,false,T);
+    const cx=540,cy=840; const g=c.createLinearGradient(cx-170,cy-170,cx+170,cy+170); g.addColorStop(0,"#10b981"); g.addColorStop(1,"#0f766e");
+    c.fillStyle=g; c.beginPath(); c.arc(cx,cy,170,0,Math.PI*2); c.fill();
+    c.strokeStyle="#ffffff"; c.lineWidth=22; c.lineCap="round";
+    [60,110].forEach(r=>{ c.beginPath(); c.arc(cx,cy+60,r,Math.PI*1.2,Math.PI*1.8); c.stroke(); });
+    c.fillStyle="#ffffff"; c.beginPath(); c.arc(cx,cy+60,20,0,Math.PI*2); c.fill();
+    postCta(c,lang,false); return;
+  }
+  if(kind==="trial"){
+    postFrame(c,w,h,lang,true,{h:T.h,b:T.b});
+    c.fillStyle="#ecfdf5"; c.font=CFONT(800,360); c.textAlign="center"; c.fillText(CV_DAYS(),540,1010); c.textAlign="left";
+    postText(c,si?"දින නොමිලේ":"days free",540,1080,900,42,50,1,"#a7d9c7",si,"center",600);
+    postCta(c,lang,true); return;
+  }
+  if(kind==="timetable"){
+    postFrame(c,w,h,lang,true,T); cvPhone(c,330,620,420,500); postCta(c,lang,true); return;
+  }
+  if(kind==="relief"){
+    postFrame(c,w,h,lang,false,T);
+    fillRR(80,640,920,440,48,"#ffffff",c);
+    postText(c,si?"කාලච්ඡේදය 2 · විද්‍යාව 9B":"Period 2 · Science 9B",130,718,700,28,34,1,"#047857",si,"left",800);
+    postText(c,si?"ආදේශකයා සොයා ගත්තා":"Relief teacher found",130,800,780,60,70,2,"#0b1f1c",si);
+    cvChip(c,130,990,si?"නිදහස් ✓":"Free this period ✓",26); cvChip(c,430,990,si?"විෂය ✓":"Teaches this subject ✓",26);
+    cvCheck(c,940,718,34);
+    postCta(c,lang,false); return;
+  }
+  if(kind==="clash"){
+    postFrame(c,w,h,lang,false,T); cvGridCard(c,80,640,920,480);
+    c.strokeStyle="#be123c"; c.lineWidth=7; fillRR(322,890,140,44,14,"rgba(190,18,60,.12)",c); c.stroke(canvasRR(322,890,140,44,14));
+    postCta(c,lang,false); return;
+  }
+  if(kind==="doublebook"){
+    postFrame(c,w,h,lang,false,T);
+    const si2=si;
+    [[80,si2?"ගුරුවරයා A":"Teacher A"],[570,si2?"ගුරුවරයා B":"Teacher B"]].forEach(([x,nm])=>{ fillRR(x,640,430,300,40,"#ffffff",c); postText(c,nm,x+40,720,350,34,44,1,"#0b1f1c",si2,"left",800); postText(c,si2?"ගණිතය · 9B":"Maths · 9B",x+40,800,350,32,40,1,"#475569",si2,"left",500); postText(c,si2?"කාලච්ඡේදය 2":"Period 2",x+40,860,350,28,36,1,"#047857",si2,"left",800); });
+    fillRR(330,966,420,70,35,"#be123c",c); postText(c,si2?"එකම කාලච්ඡේදය":"Same period",540,1012,400,30,36,1,"#ffffff",si2,"center",800);
+    postCta(c,lang,false); return;
+  }
+  if(kind==="contact"){
+    postFrame(c,w,h,lang,false,T);
+    fillRR(80,640,920,420,48,"#ffffff",c);
+    postText(c,si?"විදුහල්පති සම්බන්ධතාවය":"Principal contact",540,730,860,30,36,1,"#047857",si,"center",800);
+    postText(c,CV_PH(),540,880,900,112,120,1,"#0b1f1c",false,"center",800);
+    postText(c,si?"ඇමතුම් සහ WhatsApp":"Calls and WhatsApp",540,980,860,32,40,1,"#475569",si,"center",500);
+    postCta(c,lang,false); return;
+  }
+}
+/* Register 20 posts and expose them to the renderer, the Studio and the downloads. */
+POST_KINDS.forEach(k=>{
+  ["en","si"].forEach(lang=>{
+    const id=lang+"_"+k;
+    POST_REG[id]={id,kind:k,lang};
+    CREATIVE_SPECS[id]={w:1080,h:1350,title:(lang==="en"?"EN · ":"SI · ")+({timetable:"Timetable",relief:"Relief",clash:"Clash-free",trial:"Free trial",offline:"Offline",print:"Print",principal:"Principal",languages:"Languages",doublebook:"Double-booking",contact:"Contact"})[k],size:"1080 × 1350",file:"campusflow-"+lang+"-"+k+".png",lang,kind:k};
+    CV_R[id]=(c,w,h)=>postDraw(c,w,h,lang,k);
+  });
+});
+function mktFeedHTML(){
+  const f=MKT.feedLang||"all";
+  const ids=Object.values(POST_REG).filter(x=>f==="all"||x.lang===f).map(x=>x.id);
+  return `<div class="px-4 sm:px-5 pt-3 pb-2">
+      <div class="text-[11px] font-extrabold uppercase tracking-wide text-emerald-600">Feed posts · English & Sinhala</div>
+      <div class="text-[12px] text-zinc-500 mt-0.5">${ids.length} posts at 1080 × 1350. Each has its own caption. Copy the caption, then download the image.</div></div>
+    <div class="flex flex-wrap gap-2 px-4 sm:px-5 pb-3">${[["all","All"],["en","English"],["si","සිංහල"]].map(([k,l])=>mktSwitch("mkt-feedlang",k,l,f===k,"")).join("")}</div>
+    <div class="mkt-posts">${ids.map(id=>{ const s=CREATIVE_SPECS[id], cap=postCaption(id); return `<article class="mkt-post">
+        <canvas data-creative="${id}" class="block w-full h-auto bg-white" style="aspect-ratio:1080/1350" aria-label="${esc(s.title)}"></canvas>
+        <div class="p-3 flex flex-col gap-2 flex-1"><b class="text-[13px]">${esc(s.title)}</b>
+          <pre>${esc(cap)}</pre>
+          <div class="flex flex-wrap gap-2 mt-auto">
+            <button class="btn btn-primary !h-10 !min-h-[40px] !text-[13px]" data-action="download-creative" data-id="${id}"><i class="ph ph-download-simple"></i>Image PNG</button>
+            <button class="btn btn-ghost !h-10 !min-h-[40px] !text-[13px]" data-action="copy-text" data-text="${esc(cap.replace(/\n/g,"\\n"))}"><i class="ph ph-copy"></i>Caption</button>
+          </div></div></article>`; }).join("")}</div>`;
+}
+/* Sinhala and Tamil glyphs need their fonts loaded before the canvas can draw them. */
+if(document.fonts && document.fonts.load){
+  Promise.all([document.fonts.load('800 40px "Noto Sans Sinhala"'),document.fonts.load('800 40px "Noto Sans Tamil"')])
+    .then(()=>{ if(typeof Store!=="undefined" && Store.raw?.ui?.route==="marketing") renderMarketingCanvases(); }).catch(()=>{});
+}
+
+function drawCreative(canvas,type,full=false){
+  const spec=CREATIVE_SPECS[type]; if(!spec) return;
+  const previewScale=full?1:Math.min(1,900/Math.max(spec.w,spec.h));
+  canvas.width=Math.max(1,Math.round(spec.w*previewScale));
+  canvas.height=Math.max(1,Math.round(spec.h*previewScale));
+  const ctx=canvas.getContext("2d"); if(!ctx) return;
+  ctx.setTransform(previewScale,0,0,previewScale,0,0);
+  const w=spec.w,h=spec.h; ctx.clearRect(0,0,w,h);
+  if(CV_R[type]){ CV_R[type](ctx,w,h); return; }
+
+  /* Editorial notice */
+  if(type==="editorial"){
+    ctx.fillStyle="#faf8f1"; ctx.fillRect(0,0,w,h);
+    ctx.strokeStyle="#1c1917"; ctx.lineWidth=5; ctx.strokeRect(44,44,w-88,h-88);
+    ctx.strokeStyle="#1c1917"; ctx.lineWidth=1.5; ctx.strokeRect(70,70,w-140,h-140);
+    brandIcon(ctx,w/2-44,112,88);
+    ctx.textAlign="center"; ctx.fillStyle="#1c1917";
+    ctx.font=`700 28px Space Grotesk, Inter, sans-serif`; ctx.fillText("CAMPUSFLOW",w/2,252);
+    ctx.strokeRect(150,282,w-300,2);
+    ctx.font=`800 15px Inter`; ctx.fillStyle="#047857"; ctx.fillText("OFFICE ANNOUNCEMENT · TIMETABLES AND RELIEF",w/2,338);
+    ctx.fillStyle="#1c1917"; ctx.font=`800 62px Space Grotesk, Inter, sans-serif`;
+    linesCentered(ctx,"One timetable for the whole school.",w/2,420,w-220,74,3);
+    ctx.font=`400 25px Georgia, serif`; ctx.fillStyle="#44403c";
+    linesCentered(ctx,"Build the year faster, protect teachers from double-bookings, and answer an absence before the first bell.",w/2,700,w-260,38,5);
+    ctx.fillStyle="#1c1917"; fillRR(w/2-175,940,350,74,37,"#1c1917",ctx);
+    ctx.fillStyle="#faf8f1"; ctx.font=`800 25px Inter`; ctx.fillText("Call "+SiteCfg.phone(),w/2,987);
+    ctx.font=`700 15px Inter`; ctx.fillStyle="#57534e"; ctx.fillText("For principals, deputies and timetable staff",w/2,1070);
+    ctx.font=`800 12px "JetBrains Mono", monospace`; ctx.fillText("REF "+campaignCode,w/2,1210);
+    ctx.textAlign="left"; return;
+  }
+
+  /* Voucher-style card */
+  if(type==="voucher"){
+    ctx.fillStyle="#083b32"; ctx.fillRect(0,0,w,h);
+    ctx.fillStyle="rgba(255,255,255,.05)"; for(let i=0;i<8;i++){ ctx.beginPath(); ctx.arc(840+i*20,120+i*18,120,0,Math.PI*2); ctx.stroke(); }
+    fillRR(64,64,w-128,h-128,28,"#f8faf8",ctx);
+    ctx.save(); ctx.setLineDash([16,11]); ctx.strokeStyle="#0f766e"; ctx.lineWidth=3; ctx.stroke(canvasRR(90,90,w-180,h-180,24)); ctx.restore();
+    brandIcon(ctx,124,134,76); ctx.fillStyle="#0f172a"; ctx.font=`800 33px Inter`; ctx.fillText("CampusFlow",220,184);
+    ctx.fillStyle="#0f766e"; ctx.font=`800 16px Inter`; ctx.fillText("SCHOOL OPERATIONS STARTER OFFER",124,266);
+    ctx.fillStyle="#111827"; ctx.font=`800 62px Space Grotesk, Inter, sans-serif`;
+    lines(ctx,"A calmer school day starts here.",124,350,w-248,72,3);
+    ctx.fillStyle="#475569"; ctx.font=`500 24px Inter`; lines(ctx,"Timetables live with a real school's teacher, subject and relief data — not a sample spreadsheet.",124,580,w-248,36,4);
+    fillRR(124,760,660,68,16,"#083b32",ctx); ctx.fillStyle="#fff"; ctx.font=`800 23px Inter`; ctx.fillText("CALL  "+SiteCfg.phone(),152,801);
+    ctx.fillStyle="#6b7280"; ctx.font=`600 17px Inter`; ctx.fillText("Reference",124,900);
+    ctx.fillStyle="#111827"; ctx.font=`700 36px "JetBrains Mono", monospace`; ctx.fillText(campaignCode,124,944);
+    ctx.save(); ctx.translate(w/2,300); ctx.rotate(-0.06);
+    ctx.save(); ctx.shadowColor="rgba(15,23,42,.18)"; ctx.shadowBlur=18; ctx.shadowOffsetY=8;
+    ctx.fillStyle="#f59e0b"; ctx.fillRect(-190,-34,380,68); ctx.restore();
+    ctx.fillStyle="#111827"; ctx.font=`800 20px "JetBrains Mono", monospace`; ctx.textAlign="center"; ctx.textBaseline="middle"; ctx.fillText("STARTER OFFER",0,4); ctx.textBaseline="alphabetic"; ctx.textAlign="left";
+    ctx.restore();
+    return;
+  }
+
+  /* WhatsApp-style invitation */
+  if(type==="waInvite"){
+    ctx.fillStyle="#075E54"; ctx.fillRect(0,0,w,h);
+    ctx.fillStyle="rgba(255,255,255,.05)";
+    for(let y=60;y<h;y+=92) for(let x=(y%184?0:44);x<w;x+=168){ ctx.beginPath(); ctx.arc(x,y,12,0,Math.PI*2); ctx.fill(); }
+    fillRR(64,90,952,1740,18,"#ece5dd",ctx); fillRR(64,90,952,64,18,"#075e54",ctx);
+    brandIcon(ctx,86,103,38); ctx.fillStyle="#fff"; ctx.font=`700 22px Inter`; ctx.fillText("School timetable planning made simple",136,136);
+    ctx.font=`500 18px Inter`; ctx.fillStyle="#d1fae5"; ctx.fillText("WhatsApp draft invitation",964,136);
+    chatBubble(ctx,112,205,780,"Good morning, Principal. This term's timetable can be produced from your staff and subject list with CampusFlow.");
+    chatBubble(ctx,190,340,758,"It flags double bookings, assigns relief against live availability and exports official print tables.");
+    chatBubble(ctx,112,480,700,"Works offline on low-cost phones, and staff see their own schedule immediately.");
+    chatBubble(ctx,190,620,520,"Call "+SiteCfg.phone()+" for a live demo.");
+    phoneMock(ctx,182,740,410,720);
+    fillRR(172,1510,430,78,15,"#25d366",ctx); ctx.fillStyle="#fff"; ctx.font=`800 25px Inter`; ctx.textAlign="center"; ctx.fillText("Call "+SiteCfg.phone(),387,1559); ctx.textAlign="left";
+    ctx.font=`800 22px Inter`; ctx.fillStyle="#075e54"; ctx.textAlign="center"; ctx.fillText("Reply with your school name to begin.",540,1665); ctx.textAlign="left";
+    whiteCut(ctx,652,770,340,540,"School day, ready.",productWindow);
+    return;
+  }
+
+  /* Facebook cover */
+  if(type==="cover"){
+    ctx.fillStyle="#064e3b"; ctx.fillRect(0,0,w,h);
+    ctx.fillStyle="rgba(255,255,255,.045)";
+    for(let x=0;x<w;x+=48) for(let y=0;y<h;y+=48) ctx.fillRect(x,y,1.4,1.4);
+    brandIcon(ctx,82,86,86); ctx.fillStyle="#fff"; ctx.font=`800 36px Inter`; ctx.fillText("CampusFlow",188,143);
+    ctx.strokeStyle="#34d399"; ctx.lineWidth=5; ctx.beginPath(); ctx.moveTo(84,198); ctx.lineTo(560,198); ctx.stroke();
+    ctx.fillStyle="#fff"; ctx.font=`700 64px Space Grotesk, Inter, sans-serif`;
+    lines(ctx,"School timetables, arranged properly.",84,288,1000,76,3);
+    ctx.fillStyle="#99f6e4"; ctx.font=`500 27px Inter`; lines(ctx,"Automatic draft timetables. Conflict detection. Daily relief planning. All offline-friendly.",84,458,956,40,3);
+    productWindow(ctx,1010,152,520,452); phoneMock(ctx,920,330,196,345);
+    for(let i=0;i<3;i++){ fillRR(84+i*162,646,144,44,22,i?"rgba(255,255,255,.16)":"rgba(6,95,70,.9)",ctx); ctx.fillStyle="#fff"; ctx.font=`600 13px Inter`; ctx.textAlign="center"; ctx.fillText(["TIMETABLE","RELIEF","PRINT"][i],156+i*162,673); }
+    ctx.textAlign="left"; ctx.fillStyle="#fff"; ctx.font=`800 20px Inter`; ctx.fillText("Call  "+SiteCfg.phone(),84,774);
+    return;
+  }
+
+  /* A4 poster */
+  if(type==="posterA4"){
+    ctx.fillStyle="#064e3b"; ctx.fillRect(0,0,w,h);
+    ctx.fillStyle="#031f1a"; ctx.fillRect(0,h-680,w,680);
+    brandIcon(ctx,180,180,170); ctx.fillStyle="#fff"; ctx.font=`800 78px Inter`; ctx.fillText("CampusFlow",414,288);
+    ctx.fillStyle="#a7f3d0"; ctx.font=`800 40px Inter`; ctx.fillText("SCHOOL TIMETABLE AND RELIEF SYSTEM",186,520);
+    ctx.fillStyle="#fff"; ctx.font=`600 204px Space Grotesk, Inter, sans-serif`;
+    lines(ctx,"Build next term's timetable in one sitting.",186,700,w-380,220,4);
+    ctx.fillStyle="#d1fae5"; ctx.font=`400 62px Inter`;
+    lines(ctx,"It reads classes and staff skills, warns of clashes, offers relief teachers and produces printed timetables.",186,1500,w-420,86,6);
+    productWindow(ctx,390,1960,1700,1020); phoneMock(ctx,180,2200,500,1020);
+    ctx.fillStyle="#a7f3d0"; ctx.font=`700 42px Inter`; ctx.fillText("Phones off after school are not required for scheduling.",186,3120);
+    fillRR(1810,2780,490,130,30,"#f59e0b",ctx);
+    ctx.save(); ctx.translate(1810,2780); ctx.rotate(-0.035);
+    ctx.fillStyle="#052e16"; ctx.font=`800 54px Inter`; ctx.fillText("CALL  "+SiteCfg.phone(),0,86); ctx.restore();
+    ctx.fillStyle="#a7f3d0"; ctx.font=`400 34px Inter`; ctx.fillText("For English, Sinhala and Tamil campuses",186,3380);
+    ctx.lineWidth=10; ctx.strokeStyle="#f59e0b"; ctx.beginPath();ctx.moveTo(1810,2980);ctx.lineTo(2290,2980);ctx.stroke();
+    return;
+  }
+
+  /* Pricing sheet */
+  if(type==="priceSheet"){
+    ctx.fillStyle="#0b1220"; ctx.fillRect(0,0,w,h);
+    ctx.fillStyle="rgba(255,255,255,.05)"; for(let x=0;x<w;x+=44) for(let y=0;y<h;y+=44) ctx.fillRect(x,y,1.4,1.4);
+    brandIcon(ctx,72,72,68); ctx.fillStyle="#fff"; ctx.font=`800 30px Inter`; ctx.fillText("CampusFlow",158,116);
+    ctx.fillStyle="#5eead4"; ctx.font=`800 16px Inter`; ctx.fillText("SCHOOL LICENCE OPTIONS",74,196);
+    ctx.fillStyle="#fff"; ctx.font=`800 52px Space Grotesk, Inter, sans-serif`; lines(ctx,"Simple pricing for every school.",74,268,900,62,2);
+    const tiers=[
+      {name:"TRIAL",price:"FREE",days:"14 days",colour:"#5eead4",items:["Full timetable suite","Relief planning","Up to your whole staff"]},
+      {name:"SCHOOL",price:"ON REQUEST",days:"per year",colour:"#fbbf24",items:["Everything in Trial","Priority support","Free setup & staff onboarding","Print centre + backups"]}
+    ];
+    tiers.forEach((tier,i)=>{
+      const y=430+i*380;
+      fillRR(74,y,932,330,24,"rgba(255,255,255,.06)",ctx);
+      ctx.strokeStyle=tier.colour; ctx.lineWidth=3; ctx.stroke(canvasRR(74,y,932,330,24));
+      ctx.fillStyle=tier.colour; ctx.font=`800 22px Inter`; ctx.fillText(tier.name,104,y+62);
+      ctx.fillStyle="#fff"; ctx.font=`800 54px Space Grotesk, Inter, sans-serif`; ctx.fillText(tier.price,104,y+136);
+      ctx.fillStyle="#94a3b8"; ctx.font=`600 18px Inter`; ctx.fillText(tier.days,104,y+170);
+      ctx.fillStyle="#e2e8f0"; ctx.font=`500 19px Inter`;
+      tier.items.forEach((it,j)=>{ ctx.fillText("•  "+it,104,y+220+j*32); });
+    });
+    fillRR(74,1216,932,84,42,"#f59e0b",ctx);
+    ctx.fillStyle="#0b1220"; ctx.font=`800 29px Inter`; ctx.textAlign="center"; ctx.textBaseline="middle";
+    ctx.fillText("CALL "+SiteCfg.phone()+" FOR SCHOOL PRICING",540,1258);
+    ctx.textAlign="left"; ctx.textBaseline="alphabetic";
+    ctx.fillStyle="#64748b"; ctx.font=`500 15px Inter`; ctx.textAlign="center";
+    ctx.fillText("English · සිංහල · தமிழ்  ·  Works offline",540,1300); ctx.textAlign="left";
+    return;
+  }
+
+  /* Cut-out trial coupon */
+  if(type==="receipt"){
+    ctx.fillStyle="#f1f5f9"; ctx.fillRect(0,0,w,h);
+    ctx.fillStyle="#fff"; ctx.fillRect(50,60,w-100,h-120);
+    ctx.strokeStyle="#0f172a"; ctx.lineWidth=4; ctx.strokeRect(50,60,w-100,h-120);
+    ctx.fillStyle="#0f172a"; ctx.textAlign="center";
+    ctx.font=`800 34px "JetBrains Mono", monospace`; ctx.fillText("CAMPUSFLOW",w/2,150);
+    ctx.font=`700 15px "JetBrains Mono", monospace`; ctx.fillStyle="#475569"; ctx.fillText("FREE TRIAL COUPON",w/2,186);
+    ctx.strokeStyle="#0f172a"; ctx.lineWidth=2; ctx.setLineDash([7,6]);
+    ctx.beginPath(); ctx.moveTo(50,216); ctx.lineTo(w-50,216); ctx.stroke(); ctx.setLineDash([]);
+    brandIcon(ctx,w/2-40,250,80);
+    ctx.fillStyle="#0f172a"; ctx.font=`800 60px Space Grotesk, Inter, sans-serif`; ctx.fillText("14 DAYS",w/2,430);
+    ctx.fillStyle="#047857"; ctx.font=`800 20px Inter`; ctx.fillText("FREE TRIAL",w/2,470);
+    ctx.fillStyle="#334155"; ctx.font=`500 19px Inter`; linesCentered(ctx,"Every feature. Your whole staff. No card needed.",w/2,536,680,30,2);
+    ctx.strokeStyle="#e2e8f0"; ctx.lineWidth=2; ctx.setLineDash([]);
+    ctx.beginPath(); ctx.moveTo(90,610); ctx.lineTo(w-90,610); ctx.stroke();
+    ctx.font=`700 16px "JetBrains Mono", monospace`; ctx.fillStyle="#64748b";
+    ctx.fillText("REF  ·  "+campaignCode,w/2,660);
+    ctx.fillText("TEL  ·  "+SiteCfg.phone(),w/2,700);
+    /* perforated edges */
+    ctx.fillStyle="#f1f5f9";
+    for(let y=80;y<h-80;y+=40){ ctx.beginPath(); ctx.arc(50,y,12,0,Math.PI*2); ctx.fill(); ctx.beginPath(); ctx.arc(w-50,y,12,0,Math.PI*2); ctx.fill(); }
+    ctx.fillStyle="#0f172a"; ctx.font=`800 22px Inter`; ctx.fillText("VALID FOR ANY SCHOOL",w/2,1160);
+    ctx.fillStyle="#94a3b8"; ctx.font=`500 15px Inter`; ctx.fillText("Present this coupon when you call",w/2,1200);
+    ctx.textAlign="left";
+    return;
+  }
+
+  /* Testimonial card */
+  if(type==="quote"){
+    ctx.fillStyle="#faf8f1"; ctx.fillRect(0,0,w,h);
+    ctx.fillStyle="rgba(4,120,87,.05)"; ctx.beginPath(); ctx.arc(w*.9,h*.08,300,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle="#047857"; ctx.font=`800 240px Georgia, serif`; ctx.fillText("\u201C",56,290);
+    ctx.fillStyle="#1c1917"; ctx.font=`500 44px Georgia, serif`;
+    lines(ctx,"Our timetable week went from three days of arguing to one afternoon.",130,420,820,62,3);
+    ctx.strokeStyle="#a8a29e"; ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(130,700); ctx.lineTo(430,700); ctx.stroke();
+    ctx.fillStyle="#1c1917"; ctx.font=`800 30px Inter`; ctx.fillText("A Deputy Principal",130,760);
+    ctx.fillStyle="#57534e"; ctx.font=`500 21px Inter`; ctx.fillText("Government school, Sri Lanka",130,796);
+    brandIcon(ctx,w-150,h-160,74);
+    fillRR(130,880,520,72,36,"#047857",ctx);
+    ctx.fillStyle="#fff"; ctx.font=`800 25px Inter`; ctx.textAlign="center"; ctx.textBaseline="middle";
+    ctx.fillText("Call "+SiteCfg.phone(),390,917); ctx.textAlign="left"; ctx.textBaseline="alphabetic";
+    return;
+  }
+
+  /* A5 leaflet */
+  if(type==="flyer"){
+    ctx.fillStyle="#052e2b"; ctx.fillRect(0,0,w,h);
+    const fg=ctx.createLinearGradient(0,0,0,h); fg.addColorStop(0,"rgba(16,185,129,.16)"); fg.addColorStop(1,"rgba(5,46,43,0)");
+    ctx.fillStyle=fg; ctx.fillRect(0,0,w,h);
+    brandIcon(ctx,88,90,84); ctx.fillStyle="#fff"; ctx.font=`800 38px Inter`; ctx.fillText("CampusFlow",190,146);
+    ctx.fillStyle="#5eead4"; ctx.font=`800 17px Inter`; ctx.fillText("THE SCHOOL DAY, SORTED",90,244);
+    ctx.fillStyle="#fff"; ctx.font=`800 76px Space Grotesk, Inter, sans-serif`;
+    lines(ctx,"Timetables that build themselves.",90,330,1050,88,3);
+    productWindow(ctx,90,660,1060,600);
+    ctx.fillStyle="#d1fae5"; ctx.font=`500 24px Inter`;
+    lines(ctx,"Reads your staff and subjects. Flags every clash. Finds the relief teacher. Prints the wall charts.",90,1320,1020,36,3);
+    const items=[["01","Timetable generator"],["02","Relief & substitution"],["03","Clash detection"],["04","Offline-first"]];
+    items.forEach(([n,label],i)=>{ const y=1450+i*58;
+      ctx.fillStyle="#fbbf24"; ctx.font=`800 20px "JetBrains Mono", monospace`; ctx.fillText(n,90,y);
+      ctx.fillStyle="#fff"; ctx.font=`600 23px Inter`; ctx.fillText(label,150,y); });
+    fillRR(90,1690,560,64,32,"#f59e0b",ctx);
+    ctx.fillStyle="#052e16"; ctx.font=`800 24px Inter`; ctx.textAlign="center"; ctx.textBaseline="middle";
+    ctx.fillText(SiteCfg.phone(),370,1723); ctx.textAlign="left"; ctx.textBaseline="alphabetic";
+    return;
+  }
+
+  /* Professional banner */
+  if(type==="linkedin"){
+    ctx.fillStyle="#f8fafc"; ctx.fillRect(0,0,w,h);
+    ctx.fillStyle="#0b1220"; ctx.fillRect(0,0,560,h);
+    brandIcon(ctx,52,58,54); ctx.fillStyle="#fff"; ctx.font=`800 24px Inter`; ctx.fillText("CampusFlow",122,94);
+    ctx.fillStyle="#5eead4"; ctx.font=`800 13px Inter`; ctx.fillText("SCHOOL OPERATIONS",54,168);
+    ctx.fillStyle="#fff"; ctx.font=`800 42px Space Grotesk, Inter, sans-serif`;
+    lines(ctx,"Timetabling that respects real school constraints.",54,232,470,50,4);
+    ctx.fillStyle="#94a3b8"; ctx.font=`500 17px Inter`; lines(ctx,"Conflict detection. Relief assignment. Grade-level staff rules.",54,470,460,26,3);
+    ctx.fillStyle="#5eead4"; ctx.font=`700 15px Inter`; ctx.fillText(SiteCfg.phone(),54,576);
+    productWindow(ctx,600,90,540,440); phoneMock(ctx,540,270,180,320);
+    ctx.strokeStyle="#e2e8f0"; ctx.lineWidth=2; ctx.strokeRect(1,1,w-2,h-2);
+    return;
+  }
+
+  const bg=ctx.createLinearGradient(0,0,w,h); bg.addColorStop(0,"#f8fffc"); bg.addColorStop(.55,"#ecfdf5"); bg.addColorStop(1,"#ccfbf1"); ctx.fillStyle=bg; ctx.fillRect(0,0,w,h);
+  ctx.fillStyle="rgba(16,185,129,.10)"; ctx.beginPath();ctx.arc(w*.92,h*.05,w*.28,0,Math.PI*2);ctx.fill();
+  ctx.fillStyle="rgba(14,165,233,.08)"; ctx.beginPath();ctx.arc(w*.05,h*.95,w*.23,0,Math.PI*2);ctx.fill();
+  if(type==="facebook"){
+    brandIcon(ctx,62,54,58); ctx.fillStyle="#0f172a";ctx.font=`800 27px Inter`;ctx.fillText("CampusFlow",134,91);
+    ctx.fillStyle="#047857";ctx.font=`800 16px Inter`;ctx.fillText("SCHOOL MANAGEMENT + SMART TIMETABLING",64,158);
+    ctx.fillStyle="#0f172a";ctx.font=`800 53px Inter`; lines(ctx,"School timetables without the chaos.",64,222,510,62,3);
+    ctx.fillStyle="#475569";ctx.font=`500 20px Inter`;lines(ctx,"Auto-generate schedules, catch conflicts, arrange relief teachers and work offline.",64,382,500,29,3);
+    contactBar(ctx,64,510,408,62); productWindow(ctx,632,94,520,390); phoneMock(ctx,558,236,190,350);
+    ctx.fillStyle="#065f46";ctx.font=`700 15px Inter`;ctx.fillText("Built for every school · English · සිංහල · தமிழ்",638,535);
+  } else if(type==="square"){
+    brandIcon(ctx,68,66,70);ctx.fillStyle="#0f172a";ctx.font=`800 31px Inter`;ctx.fillText("CampusFlow",154,111);
+    ctx.fillStyle="#047857";ctx.font=`800 17px Inter`;ctx.fillText("THE SCHOOL DAY, FINALLY UNDER CONTROL",70,191);
+    ctx.fillStyle="#0f172a";ctx.font=`800 66px Inter`;lines(ctx,"One app. Every timetable.",70,270,920,76,3);
+    productWindow(ctx,72,470,760,440); phoneMock(ctx,748,540,254,458);
+    contactBar(ctx,70,944,610,70); ctx.fillStyle="#065f46";ctx.font=`700 18px Inter`;ctx.fillText("Auto schedule  ·  Relief  ·  Offline  ·  Print",70,900);
+  } else if(type==="story"){
+    brandIcon(ctx,74,90,78);ctx.fillStyle="#0f172a";ctx.font=`800 35px Inter`;ctx.fillText("CampusFlow",172,142);
+    ctx.fillStyle="#047857";ctx.font=`800 20px Inter`;ctx.fillText("SMARTER SCHOOL TIMETABLES",76,260);
+    ctx.fillStyle="#0f172a";ctx.font=`800 82px Inter`;lines(ctx,"Stop building timetables by hand.",76,365,910,94,4);
+    ctx.fillStyle="#475569";ctx.font=`500 29px Inter`;lines(ctx,"Generate. Detect conflicts. Find relief teachers. Print. Work offline.",76,730,850,42,4);
+    productWindow(ctx,80,940,760,610); phoneMock(ctx,714,1070,290,540);
+    contactBar(ctx,78,1710,924,88);ctx.fillStyle="#065f46";ctx.font=`700 20px Inter`;ctx.textAlign="center";ctx.fillText("For schools of every size",w/2,1845);ctx.textAlign="left";
+  } else {
+    ctx.fillStyle="#052e2b";ctx.fillRect(0,0,w,h); const gg=ctx.createRadialGradient(w*.65,h*.35,20,w*.65,h*.35,700);gg.addColorStop(0,"#0f766e");gg.addColorStop(1,"rgba(5,46,43,0)");ctx.fillStyle=gg;ctx.fillRect(0,0,w,h);
+    brandIcon(ctx,76,64,66);ctx.fillStyle="#fff";ctx.font=`800 30px Inter`;ctx.fillText("CampusFlow",158,107);
+    ctx.fillStyle="#99f6e4";ctx.font=`800 17px Inter`;ctx.fillText("THE COMPLETE SCHOOL TIMETABLE WORKSPACE",78,187);
+    ctx.fillStyle="#fff";ctx.font=`800 58px Inter`;lines(ctx,"Plan less. Run school better.",78,260,560,68,3);
+    ctx.fillStyle="#ccfbf1";ctx.font=`500 21px Inter`;lines(ctx,"Cloud synced. Offline ready. Built for real school constraints.",78,442,520,32,3);
+    productWindow(ctx,620,105,880,620); phoneMock(ctx,520,350,250,455); contactBar(ctx,78,700,420,64,true);
+    ctx.fillStyle="#99f6e4";ctx.font=`700 16px Inter`;ctx.fillText("English  ·  සිංහල  ·  தமிழ்",78,815);
+  }
+}
+const PromoVideo={duration:12000,raf:0,playing:false,recording:false};
+function drawPromoFrame(canvas,ms,full=false){
+  const W=1080,H=1080,scale=full?1:.5;
+  if(canvas.width!==W*scale||canvas.height!==H*scale){ canvas.width=W*scale;canvas.height=H*scale; }
+  const ctx=canvas.getContext("2d"); if(!ctx) return;
+  ctx.setTransform(scale,0,0,scale,0,0);
+  const t=(ms%PromoVideo.duration)/PromoVideo.duration;
+  ctx.fillStyle="#052e2b";ctx.fillRect(0,0,W,H);
+  const glow=ctx.createRadialGradient(760,300,30,760,300,720);glow.addColorStop(0,"#0f766e");glow.addColorStop(1,"rgba(5,46,43,0)");ctx.fillStyle=glow;ctx.fillRect(0,0,W,H);
+  ctx.globalAlpha=.08;ctx.fillStyle="#fff";for(let x=0;x<W;x+=54)for(let y=0;y<H;y+=54)ctx.fillRect(x,y,1.5,1.5);ctx.globalAlpha=1;
+  brandIcon(ctx,64,55,62);ctx.fillStyle="#fff";ctx.font=`800 28px Inter`;ctx.fillText("CampusFlow",142,96);
+  ctx.fillStyle="#99f6e4";ctx.font=`700 14px Inter`;ctx.textAlign="right";ctx.fillText("SCHOOL TIMETABLE + RELIEF",1010,90);ctx.textAlign="left";
+  if(t<.24){
+    const p=t/.24,e=1-Math.pow(1-p,3);ctx.globalAlpha=e;ctx.save();ctx.translate(0,45*(1-e));
+    ctx.fillStyle="#fca5a5";ctx.font=`800 17px Inter`;ctx.fillText("WHEN THE TIMETABLE LIVES ON PAPER",68,255);
+    ctx.fillStyle="#fff";ctx.font=`800 72px Space Grotesk, Inter, sans-serif`;lines(ctx,"One absence can unsettle the whole morning.",68,350,900,82,4);
+    ctx.fillStyle="#d1fae5";ctx.font=`500 26px Inter`;lines(ctx,"Double bookings. Phone calls. Last-minute cover notes.",68,690,800,38,3);
+    ctx.restore();ctx.globalAlpha=1;
+  } else if(t<.58){
+    const p=(t-.24)/.34,e=1-Math.pow(1-p,3);
+    ctx.save();ctx.translate(60*(1-e),0);ctx.globalAlpha=e;
+    ctx.fillStyle="#6ee7b7";ctx.font=`800 17px Inter`;ctx.fillText("PUT THE SCHOOL DAY IN ONE PLACE",68,210);
+    ctx.fillStyle="#fff";ctx.font=`800 55px Space Grotesk, Inter, sans-serif`;lines(ctx,"Generate. Check. Cover. Print.",68,285,540,64,4);
+    productWindow(ctx,410,410-e*110,600,500);phoneMock(ctx,80,565-e*45,250,450);
+    ctx.restore();ctx.globalAlpha=1;
+  } else if(t<.82){
+    const p=(t-.58)/.24,e=Math.min(1,p*1.8);
+    ctx.globalAlpha=e;ctx.fillStyle="#fff";ctx.font=`800 58px Space Grotesk, Inter, sans-serif`;ctx.fillText("Built for real schools.",68,245);
+    const feats=[["AUTO","Clash-free draft timetable"],["RELIEF","Best free teacher, instantly"],["OFFLINE","Keeps working without data"],["PRINT","Every class and teacher"]];
+    feats.forEach(([a,b],i)=>{const y=355+i*125;fillRR(68,y,944,92,18,"rgba(255,255,255,.09)",ctx);ctx.fillStyle="#5eead4";ctx.font=`800 18px Inter`;ctx.fillText(a,94,y+39);ctx.fillStyle="#fff";ctx.font=`650 25px Inter`;ctx.fillText(b,250,y+43);});
+    ctx.globalAlpha=1;
+  } else {
+    const p=(t-.82)/.18,e=Math.min(1,p*2.2);ctx.globalAlpha=e;
+    ctx.fillStyle="#99f6e4";ctx.font=`800 18px Inter`;ctx.textAlign="center";ctx.fillText("BOOK A SCHOOL DEMO",W/2,300);
+    ctx.fillStyle="#fff";ctx.font=`800 80px Space Grotesk, Inter, sans-serif`;ctx.fillText(SiteCfg.phone(),W/2,425);
+    fillRR(250,525,580,82,41,"#f59e0b",ctx);ctx.fillStyle="#052e16";ctx.font=`800 25px Inter`;ctx.fillText("CALL NOW",W/2,577);
+    ctx.fillStyle="#d1fae5";ctx.font=`600 22px Inter`;ctx.fillText("English · සිංහල · தமிழ்",W/2,700);
+    ctx.fillStyle="#fff";ctx.font=`800 30px Inter`;ctx.fillText("CampusFlow",W/2,830);ctx.textAlign="left";ctx.globalAlpha=1;
+  }
+  /* progress rule makes the clip feel deliberately edited */
+  ctx.fillStyle="rgba(255,255,255,.18)";ctx.fillRect(68,1015,944,5);ctx.fillStyle="#34d399";ctx.fillRect(68,1015,944*t,5);
+}
+function startPromoPreview(){
+  const canvas=$("#promo-video"); if(!canvas) return;
+  cancelAnimationFrame(PromoVideo.raf); PromoVideo.playing=true;const start=performance.now();
+  const tick=now=>{ if(!PromoVideo.playing||!$("#promo-video")) return;
+    drawPromoFrame(canvas,(now-start)%PromoVideo.duration,false);PromoVideo.raf=requestAnimationFrame(tick); };
+  PromoVideo.raf=requestAnimationFrame(tick);
+}
+function stopPromoPreview(){ PromoVideo.playing=false;cancelAnimationFrame(PromoVideo.raf);PromoVideo.raf=0; }
+async function exportPromoVideo(){
+  if(PromoVideo.recording) return;
+  if(typeof MediaRecorder==="undefined"||!HTMLCanvasElement.prototype.captureStream){ toast("error","Video export unavailable","Use current Chrome, Edge or Safari. The image creatives still work on this browser.");return; }
+  PromoVideo.recording=true;
+  const cv=document.createElement("canvas");drawPromoFrame(cv,0,true);
+  const stream=cv.captureStream(30);
+  const candidates=["video/mp4;codecs=h264","video/webm;codecs=vp9","video/webm;codecs=vp8","video/webm"];
+  const mime=candidates.find(x=>MediaRecorder.isTypeSupported?.(x))||"video/webm";
+  const rec=new MediaRecorder(stream,{mimeType:mime,videoBitsPerSecond:6000000});const chunks=[];
+  rec.ondataavailable=e=>{if(e.data?.size)chunks.push(e.data);};
+  const done=new Promise((resolve,reject)=>{rec.onerror=e=>reject(e.error||e);rec.onstop=resolve;});
+  rec.start(250); const start=performance.now();
+  toast("info","Rendering video","Keep CampusFlow open for about 12 seconds.");
+  await new Promise(resolve=>{const frame=now=>{const elapsed=now-start;drawPromoFrame(cv,Math.min(elapsed,PromoVideo.duration-1),true);if(elapsed<PromoVideo.duration)requestAnimationFrame(frame);else resolve();};requestAnimationFrame(frame);});
+  rec.stop();await done;
+  const ext=mime.includes("mp4")?"mp4":"webm",blob=new Blob(chunks,{type:mime});
+  const a=document.createElement("a");a.download="campusflow-promo-video."+ext;a.href=URL.createObjectURL(blob);a.click();setTimeout(()=>URL.revokeObjectURL(a.href),2000);
+  cv.width=cv.height=1;PromoVideo.recording=false;
+  toast("success","Video downloaded",`12-second ${ext.toUpperCase()} promo ready to post.`);
+}
+function renderMarketingCanvases(){
+  const run=()=>{
+    const canvases=$$('canvas[data-creative]');
+    if(!("IntersectionObserver" in window)){
+      canvases.forEach(c=>{ try{ drawCreative(c,c.dataset.creative,false); }catch(err){ console.warn("creative preview:",err); } });
+      return;
+    }
+    const observer=new IntersectionObserver(entries=>entries.forEach(entry=>{
+      if(!entry.isIntersecting) return;
+      const c=entry.target; observer.unobserve(c);
+      requestAnimationFrame(()=>{ try{ drawCreative(c,c.dataset.creative,false); }catch(err){ console.warn("creative preview:",err); } });
+    }),{rootMargin:"280px 0px"});
+    canvases.forEach(c=>observer.observe(c));
+  };
+  const ready=()=>{run();const v=$("#promo-video");if(v){drawPromoFrame(v,0,false);startPromoPreview();}};
+  if(document.fonts?.ready) document.fonts.ready.then(ready); else requestAnimationFrame(ready);
+}
+/* =================================================================================
+   SOCIAL KIT — per-platform captions, bios, hashtags, banners and logo files.
+   Every line of copy is built from the owner's own settings (phone, trial length,
+   feature list). No statistics or testimonials are invented here.
+   ================================================================================= */
+const MKT = { platform:"instagram", tone:"parent", variant:0 };
+const MKT_PLATFORMS = {
+  instagram:{ label:"Instagram", icon:"ph-instagram-logo", bio:150, caption:2200, tags:30, tagRec:"5–10 tags work best",
+    creatives:["square","story","reliefSpot","fingerprintSpot","findSpot","trialStory","langSpot","voucher"], sizes:"Feed 1080×1080 or 1080×1350 · Story & Reel 1080×1920", bioNote:"Bio limit 150 characters" },
+  facebook:{ label:"Facebook", icon:"ph-facebook-logo", bio:null, caption:null, tags:5, tagRec:"2–3 tags is enough",
+    creatives:["facebook","cover","siteBanner","parentNotice","beforeAfter"], sizes:"Link post 1200×628 · Page cover 1640×856", bioNote:"Page 'About' text" },
+  whatsapp:{ label:"WhatsApp", icon:"ph-whatsapp-logo", bio:139, caption:null, tags:0, tagRec:"Hashtags don't work on WhatsApp",
+    creatives:["waInvite","priceSheet","offlineSpot"], sizes:"Status 1080×1920 · Broadcast image 1080×1080", bioNote:"Business 'About' limit 139 characters" },
+  tiktok:{ label:"TikTok", icon:"ph-tiktok-logo", bio:80, caption:2200, tags:5, tagRec:"3–5 tags; put the main one first",
+    creatives:["reelCover","story","principalStory"], sizes:"Vertical 1080×1920 · pair with the promo video", bioNote:"Bio limit 80 characters" },
+  linkedin:{ label:"LinkedIn", icon:"ph-linkedin-logo", bio:null, caption:null, tags:5, tagRec:"3–5 tags",
+    creatives:["linkedin","carousel","quote"], sizes:"Post banner 1200×627", bioNote:"Company 'About' text" }
+};
+const MKT_TONES = { parent:"Parents", principal:"Principals", teacher:"Teachers" };
+
+function mktCtx(){
+  return { ph:SiteCfg.phone(), days:String(SiteCfg.val("trialDays")), wa:SiteCfg.waLink(),
+    feats:SiteCfg.features().slice(0,3).map(f=>f.title) };
+}
+function mktHooks(tone,c){
+  if(tone==="principal") return [
+    "One timetable for the whole school, built in minutes.",
+    "Cover an absent teacher in one tap, with a clear record.",
+    "Start a free "+c.days+"-day trial with your own timetable."];
+  if(tone==="teacher") return [
+    "Clash-free timetables, and relief duties sent in one message.",
+    "Stop juggling spreadsheets every time someone is absent.",
+    "Try CampusFlow free for "+c.days+" days."];
+  return [
+    "Your child's timetable, sorted before the school year starts.",
+    "Fewer surprises when a teacher is away.",
+    "Ask your school about CampusFlow."];
+}
+function mktCaption(platform,tone,variant){
+  const c=mktCtx(), hook=mktHooks(tone,c)[variant]||mktHooks(tone,c)[0];
+  const P=MKT_PLATFORMS[platform];
+  if(platform==="whatsapp"){
+    return "*CampusFlow — school timetables and relief*\n"+hook+"\n\n"+c.feats.map(f=>"• "+f).join("\n")+
+      "\n\nFree "+c.days+"-day trial. Call or WhatsApp "+c.ph+"\n"+c.wa;
+  }
+  if(platform==="tiktok"){
+    return hook+" Free "+c.days+"-day trial. Call "+c.ph+".";
+  }
+  const bullets = c.feats.map(f=>"• "+f).join("\n");
+  return hook+"\n\n"+bullets+"\n\nFree "+c.days+"-day trial for any school. Call or WhatsApp "+c.ph+".";
+}
+function mktHashtags(platform,tone){
+  const P=MKT_PLATFORMS[platform]; if(!P.tags) return [];
+  const base=["#SriLankaSchools","#SchoolTimetable","#SriLankaEducation","#SchoolManagement","#SinhalaSchools","#TamilSchools","#TeacherLife","#SchoolAdmin","#EduTech","#CampusFlow"];
+  const extra= tone==="principal"?"#SchoolLeadership": tone==="teacher"?"#TeachersOfSriLanka":"#SchoolParents";
+  return [extra,...base].slice(0,P.tags);
+}
+function mktBio(platform){
+  const c=mktCtx(); const P=MKT_PLATFORMS[platform];
+  let s;
+  if(platform==="tiktok") s="Timetables that build themselves. Free "+c.days+"-day trial. "+c.ph;
+  else if(platform==="whatsapp") s="CampusFlow: school timetables and relief. Free "+c.days+"-day trial. Call "+c.ph;
+  else if(platform==="instagram") s="School timetables and relief for Sri Lankan schools. Sinhala · Tamil · English. Free "+c.days+"-day trial. Call "+c.ph;
+  else if(platform==="linkedin") s="CampusFlow: school operations software for Sri Lankan schools, covering timetables, relief and printable plans. Call "+c.ph;
+  else s="CampusFlow builds clash-free school timetables, relief plans and printable class plans for Sri Lankan schools. Free "+c.days+"-day trial. Call "+c.ph;
+  return P.bio && s.length>P.bio ? s.slice(0,P.bio) : s;
+}
+function mktCount(text,max){
+  const n=[...String(text)].length;
+  if(!max) return n+" characters";
+  const over=n>max;
+  return `<span style="color:${over?"#be123c":"#047857"};font-weight:700">${n}/${max}</span>`;
+}
+function mktSwitch(kind,id,label,active,icon){
+  return `<button class="btn ${active?"btn-primary":"btn-ghost"} !min-h-[40px] !h-10 !px-3.5 !text-[13px]" data-action="${kind}" data-id="${id}" aria-pressed="${active}">${icon?`<i class="ph ${icon}"></i>`:""}${esc(label)}</button>`;
+}
+function mktLogoCanvas(kind,size){
+  const c=document.createElement("canvas"); const ctx=c.getContext("2d");
+  if(kind==="lockup"){
+    c.width=1600; c.height=500; ctx.clearRect(0,0,1600,500);
+    brandIcon(ctx,140,120,260);
+    ctx.fillStyle="#0f172a"; ctx.font="800 150px Space Grotesk, Inter, sans-serif"; ctx.fillText("CampusFlow",460,300);
+  } else {
+    c.width=c.height=size; ctx.clearRect(0,0,size,size);
+    brandIcon(ctx,size*.12,size*.12,size*.76);
+  }
+  return c;
+}
+const MKT_LOGO_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#10b981"/><stop offset="1" stop-color="#0f766e"/></linearGradient></defs><rect width="512" height="512" rx="123" fill="url(#g)"/><path fill="#fff" d="M256 118 L82 215 L256 313 L430 215 Z"/><rect x="159" y="277" width="195" height="87" fill="#fff" fill-opacity=".9"/></svg>';
+function mktSaveBlob(name,blob){
+  const a=document.createElement("a"); a.download=name; a.href=URL.createObjectURL(blob); a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href),4000);
+}
+function mktPackText(platform,tone){
+  const P=MKT_PLATFORMS[platform], c=mktCtx();
+  const parts=[
+    "CAMPUSFLOW SOCIAL KIT — "+P.label.toUpperCase()+" · "+MKT_TONES[tone].toUpperCase(),
+    "Phone: "+c.ph+"   WhatsApp: "+c.wa,
+    "",
+    "=== CAPTION VARIANTS ===",
+    ...mktHooks(tone,c).map((_,i)=>"\n[Variant "+(i+1)+"]\n"+mktCaption(platform,tone,i)),
+    "",
+    "=== BIO ===", mktBio(platform),
+    "",
+    "=== HASHTAGS ===", mktHashtags(platform,tone).join(" ")||"(none for this platform)",
+    "",
+    "=== SIZES ===", P.sizes
+  ];
+  return parts.join("\n");
+}
+
+const MKT_LOGO_SIZES = [
+  { app:"Instagram", px:320, slug:"instagram" },
+  { app:"Facebook page", px:180, slug:"facebook" },
+  { app:"WhatsApp Business", px:640, slug:"whatsapp" },
+  { app:"TikTok", px:200, slug:"tiktok" },
+  { app:"LinkedIn company", px:300, slug:"linkedin" },
+  { app:"Website & app icon", px:512, slug:"web" }
+];
+const MKT_SLOTS = ["Weekday morning","Weekday lunchtime","Weekday evening"];
+function mktPosts(platform){
+  const P=MKT_PLATFORMS[platform], tones=Object.keys(MKT_TONES);
+  return P.creatives.map((id,i)=>{
+    const tone=tones[i%tones.length], v=Math.floor(i/tones.length)%3;
+    return { id, tone, caption:mktCaption(platform,tone,v), tags:mktHashtags(platform,tone).join(" "), slot:MKT_SLOTS[i%3] };
+  });
+}
+function mktScripts(platform){
+  const c=mktCtx(), P=MKT_PLATFORMS[platform];
+  const f=c.feats;
+  return [
+    { title:"Problem → fix (15s)", lines:[
+      "0–3s  Hook: A teacher is absent at 7:40. Who covers period 2?",
+      "3–9s  Show the app: "+f[1]+" — one tap, a free teacher is suggested.",
+      "9–15s Call to action: Free "+c.days+"-day trial. Call "+c.ph+"."] },
+    { title:"Feature tour (20s)", lines:[
+      "0–4s  Hook: Timetables that build themselves.",
+      "4–12s Show: "+f[0]+", then "+f[2]+".",
+      "12–20s Close: Sinhala, Tamil and English. Call "+c.ph+" to start."] },
+    { title:"Teacher's view (12s)", lines:[
+      "0–3s  Hook: Your week, on your phone.",
+      "3–9s  Show: your classes and relief duties in one screen.",
+      "9–12s Close: Try it free for "+c.days+" days. "+c.ph+"."] }
+  ].map(s=>({...s, text:s.lines.join("\n")}));
+}
+function mktCalendar(){
+  const days=["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
+  const order=Object.keys(MKT_PLATFORMS), tones=Object.keys(MKT_TONES);
+  return days.map((d,i)=>{
+    const plat=order[i%order.length], tone=tones[i%tones.length];
+    return { day:d, platform:plat, tone, slot:MKT_SLOTS[i%3], caption:mktCaption(plat,tone,i%3) };
+  });
+}
+function mktHubHTML(){
+  const P=MKT_PLATFORMS[MKT.platform];
+  const variants=mktHooks(MKT.tone,mktCtx());
+  const cap=mktCaption(MKT.platform,MKT.tone,MKT.variant);
+  const bio=mktBio(MKT.platform);
+  const tags=mktHashtags(MKT.platform,MKT.tone).join(" ");
+  const posts=mktPosts(MKT.platform);
+  const scripts=mktScripts(MKT.platform);
+  const cal=mktCalendar();
+  const card=(t,sub,inner)=>`<div class="mkt-box"><div class="text-[11px] font-extrabold uppercase tracking-wide text-emerald-600">${t}</div>${sub?`<div class="text-[12px] text-zinc-500 mt-0.5">${sub}</div>`:""}<div class="mt-3">${inner}</div></div>`;
+  return `<section class="card overflow-hidden" id="mkt-hub" aria-label="Social kit">
+    <style>
+      .mkt-grid{display:grid;gap:16px;grid-template-columns:1fr;padding:16px}
+      @media(min-width:1024px){.mkt-grid{grid-template-columns:1.1fr .9fr}}
+      .mkt-box{border:1px solid #e4e4e7;border-radius:16px;padding:14px;background:#fff}
+      .mkt-area{width:100%;min-height:150px;resize:vertical;font:500 14px/1.55 Inter,system-ui,sans-serif;border:1px solid #e4e4e7;border-radius:12px;padding:12px;color:#18181b;background:#fcfcfd}
+      .mkt-area:focus{outline:2px solid #34d399;outline-offset:1px}
+      .mkt-posts{display:grid;gap:14px;grid-template-columns:1fr;padding:0 16px 16px}
+      @media(min-width:900px){.mkt-posts{grid-template-columns:repeat(3,1fr)}}
+      .mkt-post{border:1px solid #e4e4e7;border-radius:16px;overflow:hidden;background:#fff;display:flex;flex-direction:column}
+      .mkt-post pre{white-space:pre-wrap;font:500 12.5px/1.5 Inter,system-ui,sans-serif;color:#3f3f46;margin:0;padding:12px;background:#fafafa;max-height:160px;overflow:auto}
+      .mkt-row{display:grid;grid-template-columns:auto 1fr auto;gap:10px;align-items:center;padding:10px 0;border-bottom:1px solid #f1f1f3;font-size:13px}
+      .mkt-row:last-child{border-bottom:0}
+      .mkt-logos{display:grid;gap:10px;grid-template-columns:repeat(2,1fr);padding:0 16px 16px}
+      @media(min-width:900px){.mkt-logos{grid-template-columns:repeat(3,1fr)}}
+      .mkt-logo{border:1px solid #e4e4e7;border-radius:14px;padding:12px;display:flex;flex-direction:column;gap:8px;align-items:flex-start}
+      .mkt-logo canvas{width:72px;height:72px;border-radius:14px;background:#f0fdf4}
+    </style>
+    <div class="p-4 sm:p-5 border-b border-zinc-100">
+      <div class="flex items-center gap-2"><div class="tile w-9 h-9 rounded-lg bg-emerald-500/10 text-emerald-600"><i class="ph-fill ph-share-network text-base"></i></div>
+        <div><h3 class="font-display font-bold text-[16px] tracking-tight">Social kit</h3>
+        <p class="text-[12px] text-zinc-500 mt-0.5">Pick an app and a tone. Everything below updates: captions, bio, hashtags, posts, logos, scripts and the posting plan.</p></div></div>
+      <div class="flex flex-wrap gap-2 mt-4">${Object.entries(MKT_PLATFORMS).map(([id,p])=>mktSwitch("mkt-platform",id,p.label,MKT.platform===id,p.icon)).join("")}</div>
+      <div class="flex flex-wrap gap-2 mt-2.5">${Object.entries(MKT_TONES).map(([id,l])=>mktSwitch("mkt-tone",id,"For "+l.toLowerCase(),MKT.tone===id,"")).join("")}</div>
+    </div>
+
+    <div class="mkt-grid">
+      ${card("Caption · "+esc(P.label), "", `
+        <div class="flex items-center justify-between gap-2 flex-wrap"><span></span><div class="text-[12px]" id="mkt-cap-count">${mktCount(cap,P.caption)}</div></div>
+        <div class="flex flex-wrap gap-2 mt-2">${variants.map((_,i)=>`<button class="btn ${MKT.variant===i?"btn-soft":"btn-ghost"} !min-h-[36px] !h-9 !px-3 !text-[12px]" data-action="mkt-variant" data-id="${i}">Variant ${i+1}</button>`).join("")}</div>
+        <textarea id="mkt-cap" class="mkt-area mt-3" aria-label="Caption text">${esc(cap)}</textarea>
+        <div class="flex flex-wrap gap-2 mt-2.5">
+          <button class="btn btn-primary" data-action="mkt-copy" data-field="mkt-cap"><i class="ph ph-copy"></i>Copy caption</button>
+          <button class="btn btn-ghost" data-action="mkt-copy-tags" data-text="${esc(tags)}" ${tags?"":"disabled"}><i class="ph ph-hash"></i>Copy hashtags</button>
+        </div>
+        <div class="text-[11px] text-zinc-400 mt-3 leading-relaxed">${P.tagRec}. ${tags?esc(tags):"No hashtags for "+esc(P.label)+"."}</div>`)}
+      ${card("Bio · "+esc(P.bioNote), "", `
+        <div class="flex justify-end"><div class="text-[12px]" id="mkt-bio-count">${mktCount(bio,P.bio)}</div></div>
+        <textarea id="mkt-bio" class="mkt-area mt-2" style="min-height:96px" aria-label="Bio text">${esc(bio)}</textarea>
+        <div class="mt-2.5"><button class="btn btn-primary" data-action="mkt-copy" data-field="mkt-bio"><i class="ph ph-copy"></i>Copy bio</button></div>`)}
+    </div>
+
+    <div class="px-4 sm:px-5 pb-2">
+      <div class="text-[11px] font-extrabold uppercase tracking-wide text-emerald-600">Ready posts · ${esc(P.label)}</div>
+      <div class="text-[12px] text-zinc-500 mt-0.5">Each banner is paired with its caption. Post them in the suggested slot.</div>
+    </div>
+    <div class="mkt-posts">
+      ${posts.map((p,i)=>{ const s=CREATIVE_SPECS[p.id]; const tn=MKT_TONES[p.tone]; return `<article class="mkt-post">
+        <canvas data-creative="${p.id}" class="block w-full h-auto bg-white" style="aspect-ratio:${s.w}/${s.h}" aria-label="${esc(s.title)} banner"></canvas>
+        <div class="p-3 flex flex-col gap-2 flex-1">
+          <div class="flex items-center justify-between gap-2"><b class="text-[13px]">Post ${i+1} · for ${esc(tn)}</b><span class="badge bg-zinc-100 text-zinc-600">${esc(p.slot)}</span></div>
+          <pre>${esc(p.caption)}</pre>
+          <div class="text-[11px] text-zinc-500">${esc(p.tags)}</div>
+          <div class="flex flex-wrap gap-2 mt-auto">
+            <button class="btn btn-primary !h-10 !min-h-[40px] !text-[13px]" data-action="mkt-post" data-id="${p.id}" data-tone="${p.tone}" data-v="${Math.floor(i/3)%3}"><i class="ph ph-package"></i>Download post</button>
+            <button class="btn btn-ghost !h-10 !min-h-[40px] !text-[13px]" data-action="copy-text" data-text="${esc(p.caption.replace(/\n/g,"\\n"))}"><i class="ph ph-copy"></i>Caption</button>
+          </div>
+        </div></article>`; }).join("")}
+    </div>
+
+    ${mktFeedHTML()}
+    <div class="px-4 sm:px-5 pt-3 pb-2 flex flex-wrap items-center justify-between gap-2">
+      <div><div class="text-[11px] font-extrabold uppercase tracking-wide text-emerald-600">Profile logos · every app</div>
+      <div class="text-[12px] text-zinc-500 mt-0.5">Sizes are recommended upload sizes. Check each app if it asks for something different.</div></div>
+      <button class="btn btn-ghost" data-action="mkt-logo" data-id="svg"><i class="ph ph-file-svg"></i>Vector SVG</button>
+    </div>
+    <div class="mkt-logos">
+      ${MKT_LOGO_SIZES.map(l=>`<div class="mkt-logo"><canvas data-logo="${l.px}" aria-label="${esc(l.app)} logo"></canvas>
+        <div><div class="text-[13px] font-bold">${esc(l.app)}</div><div class="text-[11px] text-zinc-500">${l.px}×${l.px} px</div></div>
+        <button class="btn btn-ghost !h-9 !min-h-[36px] !px-3 !text-[12px]" data-action="mkt-logo-size" data-id="${l.px}" data-name="${l.slug}"><i class="ph ph-download-simple"></i>PNG</button></div>`).join("")}
+    </div>
+
+    <div class="px-4 sm:px-5 pt-3 pb-2"><div class="text-[11px] font-extrabold uppercase tracking-wide text-emerald-600">Story & reel scripts · ${esc(P.label)}</div></div>
+    <div class="mkt-posts">
+      ${scripts.map(s=>`<article class="mkt-post"><div class="p-3 flex flex-col gap-2 flex-1"><b class="text-[13px]">${esc(s.title)}</b><pre>${esc(s.text)}</pre>
+        <div><button class="btn btn-ghost !h-10 !min-h-[40px] !text-[13px]" data-action="copy-text" data-text="${esc(s.text.replace(/\n/g,"\\n"))}"><i class="ph ph-copy"></i>Copy script</button></div></div></article>`).join("")}
+    </div>
+
+    <div class="px-4 sm:px-5 pt-3 pb-2"><div class="text-[11px] font-extrabold uppercase tracking-wide text-emerald-600">7-day posting plan</div>
+      <div class="text-[12px] text-zinc-500 mt-0.5">Rotates apps and tones so no single channel is overloaded. Edit the plan in your own calendar.</div></div>
+    <div class="px-4 sm:px-5 pb-5">
+      ${cal.map(r=>`<div class="mkt-row"><b style="min-width:38px">${r.day}</b><div><div class="font-semibold">${esc(MKT_PLATFORMS[r.platform].label)} · for ${esc(MKT_TONES[r.tone])}</div><div class="text-[11px] text-zinc-500">${esc(r.slot)}</div></div><button class="btn btn-ghost !h-9 !min-h-[36px] !px-3 !text-[12px]" data-action="mkt-platform" data-id="${r.platform}">Open</button></div>`).join("")}
+    </div>
+  </section>`;
+}
+function mktBindInputs(){
+  const cap=$("#mkt-cap"), capC=$("#mkt-cap-count"), bio=$("#mkt-bio"), bioC=$("#mkt-bio-count");
+  const P=MKT_PLATFORMS[MKT.platform];
+  cap?.addEventListener("input",()=>{ if(capC) capC.innerHTML=mktCount(cap.value,P.caption); });
+  bio?.addEventListener("input",()=>{ if(bioC) bioC.innerHTML=mktCount(bio.value,P.bio); });
+  $$("canvas[data-logo]").forEach(c=>{ const px=Number(c.dataset.logo); c.width=c.height=px; c.style.width="72px"; c.style.height="72px"; const src=mktLogoCanvas("icon",px); c.getContext("2d").drawImage(src,0,0,px,px); });
+}
+
+function renderMarketing(){
+  $("#view").innerHTML=`
+  <div class="space-y-5">
+    <div class="flex items-end justify-between gap-3 flex-wrap">
+      <div><div class="text-[11px] font-bold uppercase tracking-[.1em] text-emerald-600">Sales toolkit</div>
+      <h2 class="font-display font-bold text-2xl sm:text-[28px] tracking-tight mt-0.5">Marketing Studio</h2>
+      <p class="text-xs text-zinc-500 font-medium mt-1">Social kit for every app: captions, bios, hashtags, ready posts, logos, story scripts and a posting plan, all branded to <b data-site="phone">${esc(SiteCfg.phone())}</b>.</p></div>
+      <div class="flex flex-wrap gap-2">
+        <button class="btn btn-ghost" data-action="site-editor"><i class="ph ph-note-pencil"></i>Edit site content</button>
+        <button class="btn btn-primary" data-action="download-all-creatives"><i class="ph ph-download-simple"></i>Download all PNGs</button>
+      </div>
+    </div>
+    ${mktHubHTML()}
+    <section class="card overflow-hidden">
+      <div class="grid lg:grid-cols-[minmax(0,1.25fr)_minmax(280px,.75fr)]">
+        <div class="bg-[#052e2b] p-3 sm:p-5 flex items-center justify-center">
+          <canvas id="promo-video" class="block w-full max-w-[620px] h-auto rounded-xl shadow-2xl" style="aspect-ratio:1/1" aria-label="Animated CampusFlow promotional video preview"></canvas>
+        </div>
+        <div class="p-5 sm:p-7 flex flex-col justify-center">
+          <div class="badge bg-rose-100 text-rose-700 w-max mb-3"><i class="ph-fill ph-video-camera"></i>12-second promo video</div>
+          <h3 class="font-display font-bold text-xl tracking-tight">A real animated sales clip</h3>
+          <p class="text-sm text-zinc-500 leading-relaxed mt-2">Problem → product → benefits → call-to-action. Rendered from the actual CampusFlow interface, not an AI stock video.</p>
+          <div class="flex flex-wrap gap-2.5 mt-5">
+            <button class="btn btn-primary" data-action="download-promo-video"><i class="ph ph-download-simple"></i>Render &amp; download video</button>
+            <button class="btn btn-ghost" data-action="restart-promo"><i class="ph ph-arrow-clockwise"></i>Restart preview</button>
+          </div>
+          <p class="text-[11px] text-zinc-400 mt-3 leading-relaxed">Chrome/Edge export WebM; supported Safari versions may export MP4. Rendering takes the full 12 seconds to preserve smooth timing.</p>
+        </div>
+      </div>
+    </section>
+    <div class="grid xl:grid-cols-2 2xl:grid-cols-3 gap-5">
+      ${Object.entries(CREATIVE_SPECS).map(([id,s])=>`<section class="card overflow-hidden">
+        <div class="bg-zinc-100/80 p-3 sm:p-4"><canvas data-creative="${id}" class="block w-full h-auto rounded-xl shadow-sm bg-white" style="aspect-ratio:${s.w}/${s.h}" aria-label="${esc(s.title)} preview"></canvas></div>
+        <div class="p-4 flex items-center gap-3">
+          <div class="min-w-0 flex-1"><h3 class="font-display font-bold text-[15px]">${esc(s.title)}</h3>
+          <p class="text-[11px] text-zinc-500 mt-0.5">${s.size} px · PNG · ready to publish</p></div>
+          <button class="btn btn-ghost" data-action="download-creative" data-id="${id}"><i class="ph ph-download-simple"></i>PNG</button>
+        </div>
+      </section>`).join("")}
+    </div>
+    <div class="card p-4 sm:p-5">
+      <div class="flex items-center gap-2 mb-3">
+        <div class="tile w-9 h-9 rounded-lg bg-emerald-500/10 text-emerald-600"><i class="ph-fill ph-chats text-base"></i></div>
+        <h3 class="font-display font-bold text-[15px] tracking-tight">Ready-to-post captions</h3>
+        <span class="badge bg-zinc-100 text-zinc-500 ml-auto">tap to copy</span>
+      </div>
+      <div class="grid lg:grid-cols-2 gap-2.5">
+        ${[
+          ["Facebook — problem/solution",
+           ph=>"Timetable week used to mean three days of argument at our school. Now it is one afternoon. CampusFlow reads your staff and subjects, warns before a teacher is double-booked, and finds the relief teacher automatically. It even works when the internet does not. Built for English, Sinhala and Tamil schools. Call "+ph+" for a free trial."],
+          ["Facebook — free trial",
+           ph=>SiteCfg.val("trialDays")+" days free, for any school. CampusFlow builds your timetable, tracks teacher workload, plans daily relief and prints every wall chart. No card, no lock-in — your data exports any time. Call "+ph+" and mention this post."],
+          ["WhatsApp broadcast",
+           ph=>"CampusFlow — school timetable and relief software.\\n• Auto-generates the week, clash-free\\n• Assigns relief teachers instantly\\n• Works offline on any phone\\n• Prints class and teacher timetables\\nFree "+SiteCfg.val("trialDays")+"-day trial: "+ph],
+          ["Short / status",
+           ph=>"Timetables that build themselves. Relief teachers found in one tap. CampusFlow — "+ph+"."]
+        ].map(([label,make])=>{ const copy=make(SiteCfg.phone()); return `<button class="text-left card !rounded-xl p-3.5 hover:shadow-md transition-all" data-action="copy-text" data-text="${esc(copy)}">
+          <div class="text-[10px] font-extrabold uppercase tracking-wide text-emerald-600 mb-1.5">${esc(label)}</div>
+          <div class="text-[12px] text-zinc-600 leading-relaxed" style="display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden">${esc(copy)}</div>
+          <div class="text-[10px] font-bold text-zinc-400 mt-2 flex items-center gap-1"><i class="ph ph-copy"></i>Copy caption</div>
+        </button>`; }).join("")}
+      </div>
+    </div>
+    <div class="card p-4 flex items-start gap-3 bg-emerald-50/50 !border-emerald-200/70">
+      <i class="ph-fill ph-info text-emerald-600 text-lg mt-0.5"></i>
+      <p class="text-xs text-emerald-900/80 leading-relaxed">All 16 images and the promo video are generated on this device at full resolution only when you download them — previews stay light so the page stays fast on phones.</p>
+    </div>
+  </div>`;
+  renderMarketingCanvases();
+  mktBindInputs();
+}
+
+/* =================================================================================
+   SCANNER — photograph a timetable, teacher list or wall board and turn it into data.
+   Pipeline: capture → image repair → OCR (on-device or AI) → fuzzy match to your
+   existing records → human review → apply. The review step is deliberate: OCR on
+   handwriting is never trustworthy enough to write straight into a live timetable.
+   ================================================================================= */
+const Scan={
+  step:"capture", mode:"teachers", engine:"local",
+  busy:false, progress:0, status:"", error:"",
+  srcDataUrl:"", prepDataUrl:"", rawText:"",
+  rows:[], grid:null, classId:null, orientation:"days-cols",
+  stats:null, aiKey:localStorage.getItem("cf.aiKey")||"",
+  variants:[],
+  /* documents (PDF / Excel / CSV) and the on-device reader's language set */
+  doc:null, docName:"", page:1, sheetIndex:0, report:null,
+  langs:localStorage.getItem("cf.scanLangs")||"eng", usedEngine:""
+};
+const SCAN_MODES=[
+  ["teachers","ph-chalkboard-teacher","Teacher list","Names and the subjects each teacher takes"],
+  ["subjects","ph-books","Subject list","A plain list of subject names"],
+  ["timetable","ph-table","Class timetable","A grid of periods for one class"],
+  ["text","ph-file-text","Just read the text","Reports, notices, anything — no parsing"]
+];
+let tesseractPromise=null;
+function loadScriptOnce(src,test){
+  if(test?.()) return Promise.resolve();
+  return new Promise((resolve,reject)=>{
+    const existing=$(`script[data-lazy-src="${CSS.escape(src)}"]`);
+    if(existing){ existing.addEventListener("load",resolve,{once:true});existing.addEventListener("error",()=>reject(new Error("Resource blocked.")),{once:true});return; }
+    const s=document.createElement("script");s.src=src;s.async=true;s.dataset.lazySrc=src;
+    s.onload=resolve;s.onerror=()=>reject(new Error("The required reader was blocked or could not download."));document.head.appendChild(s);
+  });
+}
+/* The reader ships with the app in ./vendor and is cached by the service worker,
+   so this no longer needs a connection — the old build pulled the engine, its
+   core and every language pack from a CDN, which is why scanning failed offline. */
+function ensureTesseract(){
+  if(typeof Tesseract!=="undefined") return Promise.resolve();
+  if(!tesseractPromise) tesseractPromise=loadScriptOnce("vendor/tesseract.min.js",()=>typeof Tesseract!=="undefined")
+    .catch(error=>{tesseractPromise=null;throw new Error("The on-device reader could not start. "+(error?.message||"")+(navigator.onLine?"":" It has not been saved on this device yet — open the app once with a connection."));});
+  return tesseractPromise;
+}
+/* One worker is created per language set and then reused. The previous code called
+   Tesseract.recognize() for every image variant, which rebuilt the worker — and
+   re-downloaded the language data — for each attempt. */
+let ocrWorker=null, ocrWorkerLangs=null, ocrWorkerPromise=null;
+const absUrl = p => new URL(p,document.baseURI).href;
+async function ensureOcrWorker(langs){
+  const want=langs||"eng";
+  if(ocrWorker&&ocrWorkerLangs===want) return ocrWorker;
+  if(ocrWorkerPromise&&ocrWorkerLangs===want) return ocrWorkerPromise;
+  await ensureTesseract();
+  if(ocrWorker){ try{ await ocrWorker.terminate(); }catch(_){} ocrWorker=null; }
+  ocrWorkerLangs=want;
+  /* scanner.js knows its own folder, which is where these files live. */
+  await ensureScanner();
+  const vsrc=f=>typeof Scanner!=="undefined"&&Scanner.asset?Scanner.asset(f):absUrl("vendor/"+f);
+  ocrWorkerPromise=Tesseract.createWorker(want,1,{
+    workerPath:vsrc("tesseract-worker.min.js"),
+    corePath:vsrc("tesseract-core-simd-lstm.wasm.js"),
+    langPath:vsrc("tessdata"),
+    cacheMethod:"none",                  /* our own copy of the data is already local */
+    workerBlobURL:true,
+    logger:m=>{                            /* progress during the read itself */
+      const cb=ocrWorker&&ocrWorker._onProgress;
+      if(cb&&m.status==="recognizing text") cb(m.progress||0);
+    },
+    /* Tables lose their columns without this: the reader then keeps the gaps
+       between words instead of collapsing them into single spaces. */
+    params:{preserve_interword_spaces:"1", tessedit_pageseg_mode:"6"}
+  }).then(w=>{ ocrWorker=w; return w; })
+    .catch(error=>{ ocrWorkerPromise=null; ocrWorkerLangs=null; throw new Error("The on-device reader could not prepare "+(want==="eng"?"English":want)+". "+(error?.message||"")); });
+  return ocrWorkerPromise;
+}
+/* Words with positions, not just a wall of text: the grid engine needs to know
+   WHERE each word sits before it can rebuild rows and columns.
+   data.words IS the flattened tree, so walking the blocks as well would count
+   every word twice — which doubles the text and destroys the geometry. */
+function ocrWords(data){
+  const out=[];
+  const push=w=>{ if(!w) return; const t=String(w.text||"").trim(); if(!t) return;
+    const b=w.bbox||{}; if(b.x1==null) return;
+    out.push({text:t,x0:b.x0,y0:b.y0,x1:b.x1,y1:b.y1,conf:(w.confidence==null?80:w.confidence)/100}); };
+  if(Array.isArray(data?.words)&&data.words.length){ data.words.forEach(push); return out; }
+  (data?.blocks||[]).forEach(block=>(block.paragraphs||[]).forEach(par=>(par.lines||[]).forEach(line=>(line.words||[]).forEach(push))));
+  return out;
+}
+
+/* ---------- image repair: the part that actually rescues bad photos ---------- */
+function scanLoadImage(file){
+  return new Promise((res,rej)=>{
+    const rd=new FileReader();
+    rd.onerror=()=>rej(new Error("Could not read that file."));
+    rd.onload=()=>{ const im=new Image();
+      im.onload=()=>res(im); im.onerror=()=>rej(new Error("That file is not a readable image."));
+      im.src=rd.result; };
+    rd.readAsDataURL(file);
+  });
+}
+function scanToCanvas(img,maxDim=1900){
+  const scale=Math.min(1,maxDim/Math.max(img.width,img.height));
+  const cv=document.createElement("canvas");
+  cv.width=Math.max(1,Math.round(img.width*scale));
+  cv.height=Math.max(1,Math.round(img.height*scale));
+  const ctx=cv.getContext("2d",{willReadFrequently:true});
+  ctx.drawImage(img,0,0,cv.width,cv.height);
+  return cv;
+}
+function scanGray(cv){
+  const ctx=cv.getContext("2d",{willReadFrequently:true});
+  const d=ctx.getImageData(0,0,cv.width,cv.height), p=d.data;
+  const g=new Float32Array(cv.width*cv.height);
+  for(let i=0,j=0;i<p.length;i+=4,j++) g[j]=0.299*p[i]+0.587*p[i+1]+0.114*p[i+2];
+  return g;
+}
+/* integral image → O(1) box mean, so local work stays fast on cheap phones */
+function scanIntegral(g,w,h){
+  const I=new Float64Array((w+1)*(h+1));
+  for(let y=0;y<h;y++){ let run=0;
+    for(let x=0;x<w;x++){ run+=g[y*w+x]; I[(y+1)*(w+1)+(x+1)]=I[y*(w+1)+(x+1)]+run; } }
+  return I;
+}
+function scanBoxMean(I,w,h,x,y,r){
+  const x0=Math.max(0,x-r), y0=Math.max(0,y-r), x1=Math.min(w-1,x+r), y1=Math.min(h-1,y+r);
+  const area=(x1-x0+1)*(y1-y0+1);
+  const s=I[(y1+1)*(w+1)+(x1+1)]-I[y0*(w+1)+(x1+1)]-I[(y1+1)*(w+1)+x0]+I[y0*(w+1)+x0];
+  return s/area;
+}
+/* Removes uneven lighting (window glare, shadow across a folded page, dim classroom)
+   then thresholds locally. This is the single biggest win for wall-board photos. */
+function scanBinarize(g,w,h,{invert=false,strength=0.86,radius=0}={}){
+  const r=radius||Math.max(12,Math.round(Math.min(w,h)/28));
+  const I=scanIntegral(g,w,h);
+  const out=new Uint8ClampedArray(w*h);
+  for(let y=0;y<h;y++) for(let x=0;x<w;x++){
+    const i=y*w+x, m=scanBoxMean(I,w,h,x,y,r);
+    const v=g[i];
+    const on = invert ? (v>m*(2-strength)+6) : (v<m*strength+ (m*0.02));
+    out[i]=on?0:255;
+  }
+  return out;
+}
+function scanMeanBrightness(g){ let s=0; for(let i=0;i<g.length;i++) s+=g[i]; return s/g.length; }
+/* Deskew by maximising row-ink variance across candidate angles — reliable for text
+   photographed at an angle, which is how every wall board gets captured. */
+function scanDeskewAngle(bin,w,h){
+  let best=0,bestScore=-1;
+  const step=Math.max(1,Math.floor(h/360));
+  for(let deg=-7;deg<=7;deg+=0.5){
+    const rad=deg*Math.PI/180, tan=Math.tan(rad);
+    const rows=new Float64Array(h);
+    for(let y=0;y<h;y+=step) for(let x=0;x<w;x+=2){
+      const yy=y+Math.round((x-w/2)*tan);
+      if(yy<0||yy>=h) continue;
+      if(bin[yy*w+x]===0) rows[y]++;
+    }
+    let mean=0; for(let y=0;y<h;y+=step) mean+=rows[y];
+    mean/= (h/step);
+    let varc=0; for(let y=0;y<h;y+=step){ const d=rows[y]-mean; varc+=d*d; }
+    if(varc>bestScore){ bestScore=varc; best=deg; }
+  }
+  return best;
+}
+function scanRotate(cv,deg){
+  if(Math.abs(deg)<0.25) return cv;
+  const rad=deg*Math.PI/180;
+  const out=document.createElement("canvas");
+  out.width=cv.width; out.height=cv.height;
+  const ctx=out.getContext("2d",{willReadFrequently:true});
+  ctx.fillStyle="#fff"; ctx.fillRect(0,0,out.width,out.height);
+  ctx.translate(out.width/2,out.height/2); ctx.rotate(-rad);
+  ctx.drawImage(cv,-cv.width/2,-cv.height/2);
+  return out;
+}
+function scanBinToCanvas(bin,w,h){
+  const cv=document.createElement("canvas"); cv.width=w; cv.height=h;
+  const ctx=cv.getContext("2d",{willReadFrequently:true});
+  const d=ctx.createImageData(w,h);
+  for(let i=0,j=0;i<bin.length;i++,j+=4){ d.data[j]=d.data[j+1]=d.data[j+2]=bin[i]; d.data[j+3]=255; }
+  ctx.putImageData(d,0,0); return cv;
+}
+function scanUpscale(cv,factor){
+  if(factor<=1) return cv;
+  const out=document.createElement("canvas");
+  out.width=Math.round(cv.width*factor); out.height=Math.round(cv.height*factor);
+  const ctx=out.getContext("2d",{willReadFrequently:true});
+  ctx.imageSmoothingEnabled=true; ctx.imageSmoothingQuality="high";
+  ctx.drawImage(cv,0,0,out.width,out.height);
+  return out;
+}
+/* Build several repaired candidates; OCR each and keep whichever reads best.
+   Costs time, which is exactly the trade the user asked for. */
+function scanBuildVariants(img){
+  const base=scanToCanvas(img);
+  const w=base.width,h=base.height;
+  const g=scanGray(base);
+  const dark=scanMeanBrightness(g)<110;            /* chalkboard / dim photo */
+  const firstBin=scanBinarize(g,w,h,{invert:dark});
+  const angle=scanDeskewAngle(firstBin,w,h);
+  const straight=scanRotate(base,angle);
+  const g2=scanGray(straight);
+  const variants=[];
+  variants.push({label:"repaired",canvas:scanUpscale(scanBinToCanvas(scanBinarize(g2,w,h,{invert:dark}),w,h),1.5)});
+  variants.push({label:"soft",canvas:scanUpscale(scanBinToCanvas(scanBinarize(g2,w,h,{invert:dark,strength:0.95,radius:Math.round(Math.min(w,h)/14)}),w,h),1.5)});
+  variants.push({label:"grayscale",canvas:scanUpscale(straight,1.4)});
+  if(dark) variants.push({label:"inverted",canvas:scanUpscale(scanBinToCanvas(scanBinarize(g2,w,h,{invert:false}),w,h),1.5)});
+  return {variants,angle,dark,preview:variants[0].canvas};
+}
+
+/* ---------- fuzzy matching: turns garbled OCR into your real records ---------- */
+function scanNorm(s){ return String(s||"").toLowerCase().replace(/[^a-z0-9\u0D80-\u0DFF\u0B80-\u0BFF]+/g,""); }
+function scanLev(a,b){
+  if(a===b) return 0;
+  if(!a.length) return b.length; if(!b.length) return a.length;
+  let prev=Array.from({length:b.length+1},(_,i)=>i);
+  for(let i=1;i<=a.length;i++){
+    const cur=[i];
+    for(let j=1;j<=b.length;j++)
+      cur[j]=Math.min(prev[j]+1,cur[j-1]+1,prev[j-1]+(a[i-1]===b[j-1]?0:1));
+    prev=cur;
+  }
+  return prev[b.length];
+}
+function scanSimilar(a,b){
+  const x=scanNorm(a),y=scanNorm(b);
+  if(!x||!y) return 0;
+  if(x===y) return 1;
+  if(x.length>2&&y.startsWith(x)) return .93;
+  if(y.length>2&&x.startsWith(y)) return .9;
+  return 1-scanLev(x,y)/Math.max(x.length,y.length);
+}
+function scanBestMatch(text,list,getKeys,min=0.6){
+  let best=null,score=0;
+  list.forEach(item=>{
+    getKeys(item).filter(Boolean).forEach(k=>{
+      const s=scanSimilar(text,k);
+      if(s>score){ score=s; best=item; }
+    });
+  });
+  return score>=min?{item:best,score}:{item:null,score};
+}
+const scanMatchSubject = txt => scanBestMatch(txt,state.subjects,s=>[s.name,s.code]);
+const scanMatchTeacher = txt => scanBestMatch(txt,state.teachers,t=>[t.name,t.code,initials(t.name)]);
+
+/* ---------- OCR engines ---------- */
+async function scanOcrLocal(canvas,onProgress,langs){
+  const worker=await ensureOcrWorker(langs||Scan.langs||"eng");
+  if(onProgress) worker._onProgress=onProgress;
+  const res=await worker.recognize(canvas);
+  const data=res?.data||{};
+  return { text:data.text||"", conf:(data.confidence||0)/100, words:ocrWords(data), langs:langs||Scan.langs||"eng" };
+}
+const SCAN_LANG_LABEL={"eng":"English","eng+sin":"English + Sinhala","eng+tam":"English + Tamil","eng+sin+tam":"English + Sinhala + Tamil"};
+const scanLangLabel=id=>SCAN_LANG_LABEL[id]||id;
+/* A Sinhala scan handed to the English engine reads as an empty page — and the
+   person watching has no way to know why. So: try what they chose, and if that
+   produces nothing useful, try every pack once before admitting defeat. The
+   retry is skipped on a device that is already slow — there, one honest pass
+   and a clear message beat two slow ones. */
+/* Which of two readings of the same page is the better one? More lessons is
+   usually more, but a reading that leaves a whole DAY empty is worse for a
+   school than one that fills every day and misses a few cells — those are the
+   days someone would have to type in from scratch. So a clear margin in lessons
+   wins, otherwise the reading that covers more days does. */
+function scanReadingScore(res){
+  if(!res) return {lessons:0,days:0,conf:0,chars:0};
+  /* Candidates arrive in two shapes: OCR passes decorated by scanLessonsIn
+     (_lessons/_grid) and PDF page candidates that carry matched/grid. Both must
+     be scored the same way, or every candidate looks like zero lessons and the
+     best-reading comparison silently degrades into "highest confidence". */
+  const lessons=res._lessons!=null?res._lessons:(res.matched||0);
+  let days=0;
+  const grid=res._grid||res.grid;
+  if(grid&&grid.length){
+    const cols=grid[0]?grid[0].length:0;
+    for(let d=0;d<cols;d++) if(grid.some(row=>row[d]&&row[d].subjectId)) days++;
+  }
+  return {lessons,days,conf:res.conf||0,chars:res.chars||0};
+}
+function scanBetterReading(a,b){
+  const A=scanReadingScore(a), B=scanReadingScore(b);
+  if(!a) return b;
+  if(!b) return a;
+  if(A.lessons>B.lessons*1.25) return a;
+  if(B.lessons>A.lessons*1.25) return b;
+  if(A.days!==B.days) return A.days>B.days?a:b;
+  if(A.lessons!==B.lessons) return A.lessons>B.lessons?a:b;
+  return A.conf>=B.conf?a:b;
+}
+async function scanOcrSmart(canvas,onProgress){
+  const chosen=Scan.langs||"eng";
+  const passes=[chosen];
+  /* The retry is decided by the RESULT, not by how fast the device is: a page
+     that produced nothing at all is worth one more pass even on a slow phone —
+     that is the difference between "it worked" and "it read nothing". A page
+     that already yielded lessons never pays for a second pass. */
+  if(chosen!=="eng+sin+tam"&&Scan.engine!=="ai") passes.push("eng+sin+tam");
+  let best=null;
+  for(let i=0;i<passes.length;i++){
+    const langs=passes[i];
+    if(i) { Scan.status="Nothing matched with "+scanLangLabel(passes[0])+" — trying every language pack…"; Scan.progress=Math.min(88,Scan.progress||30); Store.requestRender(); }
+    let res;
+    try{ res=await scanOcrLocal(canvas,onProgress,langs); }
+    catch(err){ if(i) continue; throw err; }
+    res._lessons=res._lessons||0;
+    if(Scan.mode==="timetable") scanLessonsIn(res);
+    best=scanBetterReading(res,best);
+    if((best._lessons||0)>=4) break;      /* it is reading real lessons: enough */
+  }
+  if(best&&best.langs&&best.langs!==chosen){ Scan.langsUsed=best.langs; Scan.langsAuto=true; }
+  else if(best) { Scan.langsUsed=best.langs||chosen; Scan.langsAuto=false; }
+  return best;
+}
+/* CamScanner, Adobe Scan, Genius Scan and friends leave a grey frame, a spine
+   shadow and a watermark on the page. Cropping to the ink before any repair
+   gives the geometry real edges to work with — the border otherwise votes
+   itself in as a row and a column. */
+/* Gemini model identifier lives in configuration, not buried in request code. Google
+   retires model versions on a schedule (2.0 Flash shut down June 2026), so the app asks
+   the key holder to confirm the model name instead of promising one forever. */
+const defaultGeminiModel = () => localStorage.getItem("cf.geminiModel") || "gemini-2.0-flash";
+/* Free-model fallback list, in quality order. If the preferred model returns a
+   404/400 (Google retires versions or your key is on the free tier of a different
+   one), we quietly try the next one before surfacing an error. All four are
+   currently free-tier on Google AI Studio. */
+const FREE_GEMINI_MODELS = ["gemini-2.0-flash","gemini-2.5-flash","gemini-2.0-flash-lite","gemini-2.5-flash-lite"];
+async function scanOcrAI(canvas,mode){
+  const key=Scan.aiKey.trim();
+  if(!key) throw new Error("Add your free Google AI Studio key below or in Scanner → Settings first.");
+  const b64=canvas.toDataURL("image/jpeg",0.9).split(",")[1];
+  const ask = mode==="timetable"
+    ? "This is a school class timetable. Return ONLY rows of plain text, one line per period, cells separated by | . Preserve empty cells as a single - . No commentary."
+    : mode==="subjects"
+    ? "List every subject name you can read, one per line. No numbering, no commentary."
+    : mode==="teachers"
+    ? "This is a school teacher list, possibly handwritten. Return one line per teacher as: Name - Subject, Subject. If subjects are not shown, return just the name. No commentary."
+    : "Transcribe all readable text exactly, preserving line breaks. No commentary.";
+  // Scanner's optional AI OCR engine (user-supplied key). Iterates the free model list.
+  const order = [defaultGeminiModel(), ...FREE_GEMINI_MODELS.filter(m=>m!==defaultGeminiModel())];
+  let lastErr=null;
+  for(const model of order){
+    try{
+      const r=await fetch("https://generativelanguage.googleapis.com/v1beta/models/"+model+":generateContent",{
+        method:"POST", headers:{"Content-Type":"application/json","x-goog-api-key":key},
+        body:JSON.stringify({ contents:[{ parts:[{text:ask},{inline_data:{mime_type:"image/jpeg",data:b64}}] }],
+          generationConfig:{temperature:0.1} })
+      });
+      if(r.ok){
+        const j=await r.json();
+        const text=j?.candidates?.[0]?.content?.parts?.map(p=>p.text||"").join("\n")||"";
+        if(text.trim()) return { text, conf:0.9, model };
+        continue;
+      }
+      const detail=await r.text().catch(()=>"");
+      if(r.status===400&&/API key/i.test(detail)) throw new Error("That AI key was rejected. Check it at aistudio.google.com.");
+      if(r.status===429){ lastErr=new Error("The AI service is rate-limiting. Wait a minute and retry."); continue; }
+      if(r.status===404) continue;
+      lastErr=new Error("AI engine error ("+r.status+").");
+    }catch(e){ lastErr=e; if(String(e.message||"").includes("API key")) throw e; }
+  }
+  throw lastErr || new Error("AI engine returned nothing readable.");
+}
+
+/* ---------- parsing ---------- */
+function scanCleanLines(text){
+  return String(text||"").split(/\r?\n/)
+    .map(l=>l.replace(/[|•·]+$/,"").replace(/\s{2,}/g," ").trim())
+    .filter(l=>l.length>1 && /[a-z\u0D80-\u0DFF\u0B80-\u0BFF]/i.test(l));
+}
+function scanStripIndex(line){ return line.replace(/^\s*\(?\d{1,3}\s*[).:\-]\s*/,"").trim(); }
+function scanTitle(s){
+  return s.replace(/\s+/g," ").trim()
+    .split(" ").map(w=>w.length>2&&w===w.toUpperCase()?w.charAt(0)+w.slice(1).toLowerCase():w).join(" ");
+}
+function scanParseTeachers(text){
+  const rows=[];
+  scanCleanLines(text).forEach(raw=>{
+    let line=scanStripIndex(raw);
+    if(/^(name|teacher|staff|no\.?|subject)s?\b/i.test(line)&&line.length<24) return;  /* header row */
+    let name=line, subsPart="";
+    const sep=line.match(/\s[-–—:|]\s|\t/);
+    if(sep){ const i=line.indexOf(sep[0]); name=line.slice(0,i); subsPart=line.slice(i+sep[0].length); }
+    else { const m=line.match(/^(.*?)\s*\((.+)\)\s*$/); if(m){ name=m[1]; subsPart=m[2]; } }
+    name=scanTitle(name.replace(/[^\w.'\-\s\u0D80-\u0DFF\u0B80-\u0BFF]/g," ").trim());
+    if(name.length<2) return;
+    const subs=subsPart.split(/[,/&;]+/).map(s=>s.trim()).filter(s=>s.length>1).map(s=>{
+      const m=scanMatchSubject(s);
+      return m.item?{name:m.item.name,id:m.item.id,matched:true,score:m.score}:{name:scanTitle(s),id:null,matched:false,score:0};
+    });
+    const tm=scanMatchTeacher(name);
+    rows.push({ type:"teacher", include:true, name, subjects:subs,
+      existingId:tm.item?.id||null, existingName:tm.item?.name||"", score:tm.score, raw });
+  });
+  return rows;
+}
+function scanParseSubjects(text){
+  const seen=new Set(), rows=[];
+  scanCleanLines(text).forEach(raw=>{
+    scanStripIndex(raw).split(/[,;|]/).map(s=>s.trim()).filter(s=>s.length>1).forEach(s=>{
+      const name=scanTitle(s.replace(/[^\w'\-\s\u0D80-\u0DFF\u0B80-\u0BFF]/g," ").trim());
+      if(name.length<2||seen.has(scanNorm(name))) return;
+      seen.add(scanNorm(name));
+      const m=scanMatchSubject(name);
+      rows.push({ type:"subject", include:!m.item, name, existingId:m.item?.id||null,
+        existingName:m.item?.name||"", score:m.score, raw });
+    });
+  });
+  return rows;
+}
+function scanParseTimetable(text){
+  const periods=state.settings.periodsPerDay, days=state.settings.daysPerWeek;
+  const src=scanCleanLines(text).filter(l=>!/^(period|time|day|mon|tue|wed|thu|fri|sat)\b.{0,40}$/i.test(l)||l.split(/[|\t]|\s{2,}/).length>2);
+  const grid=Array.from({length:periods},()=>Array.from({length:days},()=>null));
+  let used=0;
+  src.slice(0,periods).forEach((line,p)=>{
+    const cells=line.split(/\s*[|]\s*|\t+|\s{2,}/).map(c=>c.trim()).filter((c,i)=>!(i===0&&/^p?\d{1,2}$/i.test(c)));
+    cells.slice(0,days).forEach((cell,d)=>{
+      if(!cell||/^[-–—.]+$/.test(cell)) return;
+      const parts=cell.split(/[\/,(]/).map(s=>s.replace(/\)/g,"").trim()).filter(Boolean);
+      const sm=scanMatchSubject(parts[0]||cell);
+      const tm=parts[1]?scanMatchTeacher(parts[1]):{item:null,score:0};
+      if(!sm.item&&!tm.item) { grid[p][d]={raw:cell,subjectId:null,teacherId:null,score:0}; return; }
+      grid[p][d]={ raw:cell, subjectId:sm.item?.id||null, teacherId:tm.item?.id||null,
+        score:Math.max(sm.score,tm.score) };
+      used++;
+    });
+  });
+  return { grid, used };
+}
+
+/* =================================================================================
+   Offline document reader — vendor/scanner.js
+   Spreadsheets are read as real cells (no OCR at all), PDFs with a text layer are
+   read from their own text with positions, and rows/columns are recovered from
+   WHERE words sit rather than from line breaks. Everything runs from files saved
+   in ./vendor, so a school with no internet can still import its timetable.
+   ================================================================================= */
+/* ---------------------------------------------------------------------------
+   Can THIS device read pictures at all?
+   A low-end phone (little memory, one or two slow cores, an old browser without
+   WebAssembly) cannot run the on-device reader: it will either crawl or fail
+   halfway. Saying so up front is far kinder than a spinner that never ends — and
+   the file paths that need no reader at all (Excel, CSV, a PDF with text) keep
+   working on those devices.
+   --------------------------------------------------------------------------- */
+let scanPower=null;
+function scanCapability(){
+  if(scanPower) return scanPower;
+  const blockers=[], notes=[];
+  let wasm=false, canvas=false, blob=false;
+  try{ wasm=typeof WebAssembly==="object"&&typeof WebAssembly.instantiate==="function"; }catch(_){}
+  try{ canvas=!!document.createElement("canvas").getContext; }catch(_){}
+  try{ blob=typeof Blob!=="undefined"&&typeof URL!=="undefined"&&!!URL.createObjectURL; }catch(_){}
+  if(!wasm) blockers.push("this browser is too old to run the on-device reader (it has no WebAssembly)");
+  if(!canvas||!blob) blockers.push("this browser cannot prepare pictures for reading");
+  const mem=(typeof navigator!=="undefined"&&navigator.deviceMemory)?+navigator.deviceMemory:null;
+  const cores=(typeof navigator!=="undefined"&&navigator.hardwareConcurrency)?+navigator.hardwareConcurrency:null;
+  const conn=(typeof navigator!=="undefined"&&navigator.connection)||{};
+  if(mem!=null&&mem<=2) notes.push("only about "+mem+" GB of memory");
+  if(cores!=null&&cores<=2) notes.push(cores+" processor core"+(cores===1?"":"s"));
+  if(conn.saveData) notes.push("data saving is switched on");
+  scanPower={ ocr:blockers.length===0, slow:notes.length>0, blockers, notes, mem, cores };
+  return scanPower;
+}
+/* Pictures can still be sent to the AI reader when the device can't read them
+   itself — that path only needs a canvas, not the local engine. */
+function scanCanImage(){
+  const cap=scanCapability();
+  return cap.ocr || (Scan.engine==="ai" && !!(Scan.aiKey||"").trim());
+}
+let scannerPromise=null;
+function ensureScanner(){
+  if(typeof Scanner!=="undefined") return Promise.resolve();
+  if(!scannerPromise) scannerPromise=loadScriptOnce("vendor/scanner.js",()=>typeof Scanner!=="undefined")
+    .catch(err=>{ scannerPromise=null; throw new Error("The file reader could not start on this device. "+(err?.message||"")); });
+  return scannerPromise;
+}
+function scanCtx(){
+  return {
+    periodsPerDay:state.settings.periodsPerDay,
+    daysPerWeek:state.settings.daysPerWeek,
+    matchSubject:t=>{ const m=scanMatchSubject(t); return {item:m.item,score:m.score}; },
+    matchTeacher:t=>{ const m=scanMatchTeacher(t); return {item:m.item,score:m.score}; }
+  };
+}
+function scanKindOf(file){
+  if(typeof Scanner==="undefined"){           /* engine not loaded yet: classify by name */
+    const n=(file?.name||"").toLowerCase();
+    if(/\.pdf$/.test(n)) return "pdf";
+    if(/\.(xlsx|xlsm|xls|csv|tsv|ods)$/.test(n)) return "sheet";
+    if((file?.type||"").startsWith("image/")) return "image";
+    return "unknown";
+  }
+  return Scanner.classifyFile(file);
+}
+/* One page of a PDF, drawn to a canvas — only needed when the PDF is a scan. */
+async function scanRenderPdfPage(pdfDoc,num){
+  const page=await pdfDoc.getPage(num);
+  const base=page.getViewport({scale:1});
+  const scale=Math.min(3,Math.max(2,1650/(base.width||700)));
+  const viewport=page.getViewport({scale});
+  const canvas=document.createElement("canvas");
+  canvas.width=Math.ceil(viewport.width); canvas.height=Math.ceil(viewport.height);
+  const g=canvas.getContext("2d",{willReadFrequently:true});
+  await page.render({canvasContext:g,viewport}).promise;
+  return canvas;
+}
+async function scanLoadDoc(file,kind){
+  await ensureScanner();
+  if(kind==="sheet"){
+    const book=await Scanner.readSheetFile(file);
+    if(!book.sheets.length) throw new Error("That spreadsheet looks empty — no readable cells were found in any sheet.");
+    return { kind:"sheet", name:file.name, sheets:book.sheets, sheetIndex:0 };
+  }
+  Scan.status="Opening the PDF…"; Store.requestRender();
+  const pdf=await Scanner.readPdfFile(file,(p,total)=>{
+    Scan.status=`Reading page ${p} of ${total}…`;
+    Scan.progress=Math.min(72,8+(p/(total||1))*64); Store.requestRender();
+  });
+  return { kind:"pdf", name:file.name, pdfDoc:pdf.document, pages:pdf.pages,
+    numPages:pdf.numPages, needsOcr:pdf.needsOcr,
+    page:pdf.best?pdf.best.page:(pdf.pages[0]?.page||1) };
+}
+/* A scanned PDF has no text layer at all, so draw its pages and read the pixels. */
+async function scanPdfOcr(){
+  const d=Scan.doc;
+  if(!d||!d.pdfDoc) return null;
+  if(!scanCapability().ocr)
+    throw new Error("That PDF is a scan — it is a picture, and this device can't read pictures. Upload the timetable as Excel or CSV instead, or use a PDF where the text can be selected.");
+  const total=Math.min(6,d.numPages);
+  let best=null;
+  /* Which repairs worked on the first page — reused on the rest, and which
+     language pack actually read the page (so the others are not tried again). */
+  const pageWinners=[];
+  const perPage=[];
+  /* A CamScanner file, or an export from an old program, says nothing in its
+     text layer except its own watermark — the pages are then read as pictures,
+     with the layout recovered from positions exactly like a photo. Six pages
+     covers a stack of class sheets without turning a huge file into a wait. */
+  for(let n=1;n<=total;n++){
+    Scan.status=`That PDF is a scan — reading page ${n} of ${total} as a picture…`;
+    Scan.progress=Math.min(78,40+n*(36/total)); Store.requestRender();
+    let here=null;
+    try{
+      const page=await scanRenderPdfPage(d.pdfDoc,n);
+      /* A scanned page is just a photo of paper, so it gets the same repair
+         (deskew, contrast, upscale) as a camera photo — and, exactly like the
+         camera path, several versions are read and the one that produces the
+         most REAL lessons wins. Characters alone are a poor judge: binarising a
+         faint scan often yields more text and less truth. */
+      const built=scanBuildVariants(page);
+      Scan.prepDataUrl=built.preview.toDataURL("image/jpeg",0.7);
+      /* Page one is searched properly. Later pages reuse what won on page one —
+         the same scanner, the same light, the same sheet — so a stack of class
+         timetables costs seconds per page instead of minutes. */
+      const all=[{label:"original",canvas:page},built.variants[2],built.variants[1],built.variants[0]];
+      const tries=pageWinners.length
+        ? all.filter(v=>v&&pageWinners.includes(v.label)).concat(all.filter(v=>v&&!pageWinners.includes(v.label)).slice(0,1))
+        : all;
+      if(pageWinners.length&&!tries.length) { /* nothing left to try */ }
+      for(const v of tries){
+        if(!v||!v.canvas) continue;
+        Scan.status=total>1?`Reading page ${n} of ${total} as a picture (${v.label})…`:`Reading the scan as a picture (${v.label})…`;
+        Store.requestRender();
+        const res=await scanOcrSmart(v.canvas,()=>{});
+        const w=Scanner.cleanOcrWords(res.words||[]).filter(x=>x.text);
+        if(w.length<6) continue;
+        const grid=Scanner.buildGridFromBoxes(w,{});
+        const model=grid?Scanner.interpretGrid(grid,{daysPerWeek:state.settings.daysPerWeek}):null;
+        const out=model&&model.recognised?Scanner.gridToTimetable(model,scanCtx()):null;
+        const cand={ kind:"ocr", via:v.label, page:n, words:w, text:res.text||"", grid, conf:res.conf,
+          langs:res.langs||Scan.langs, script:Scanner.scriptOf(res.text||""),
+          matched:out?out.report.matched:0, chars:w.reduce((a,x)=>a+x.text.length,0) };
+        here=Scan.mode==="timetable"?scanBetterReading(cand,here)
+          :(!here||cand.matched>here.matched||(cand.matched===here.matched&&cand.chars>here.chars)?cand:here);
+        if(here.matched>=15) { if(!pageWinners.includes(v.label)) pageWinners.push(v.label); break; }
+      }
+      if(here&&!pageWinners.length) pageWinners.push(here.via||"original");
+    }catch(err){ if(n===1) throw err; continue; }
+    if(!here) continue;
+    perPage.push(here);
+    if(!best||here.matched>best.matched||(here.matched===best.matched&&here.chars>best.chars)) best=here;
+  }
+  if(best&&best.langs){ Scan.langsUsed=best.langs; Scan.langsAuto=best.langs!==(Scan.langs||"eng"); }
+  if(best) best.pages=perPage;
+  return best;
+}
+/* The grid currently selected in the review step (a sheet or a PDF page). */
+function scanPickedGrid(){
+  const d=Scan.doc; if(!d) return null;
+  if(d.kind==="sheet") return (d.sheets[d.sheetIndex||0]||d.sheets[0]||{}).grid||null;
+  if(d.kind==="pdf"){ const p=d.pages.find(x=>x.page===d.page)||d.pages[0]; return p?(p.grid||null):null; }
+  if(d.kind==="ocr") return d.grid||null;
+  return null;
+}
+function scanDocLines(){
+  const d=Scan.doc; if(!d) return Scan.rawText||"";
+  if(d.kind==="sheet"){
+    const g=scanPickedGrid();
+    return g?Scanner.linesFromGrid(g).join("\n"):"";
+  }
+  if(d.kind==="pdf"||d.kind==="ocr"){
+    if(d.words||d.kind==="ocr") return d.text||"";
+    return d.pages.map(p=>Scanner.linesFromGrid(p.grid||{cells:[]}).join("\n")).filter(Boolean).join("\n");
+  }
+  return Scan.rawText||"";
+}
+/* How many distinct day names appear in a grid? A sheet that never mentions a
+   day is not a timetable, and guessing one would be worse than saying so. */
+function scanDayHits(grid,text){
+  const seen=new Set();
+  const scan=t=>{ const d=Scanner.dayIndexFromText(t); if(d!==-1) seen.add(d); };
+  if(grid&&grid.cells) grid.cells.forEach(row=>row.forEach(scan));
+  else String(text||"").split(/[\n|,;\t]/).forEach(scan);
+  return seen.size;
+}
+/* Lessons currently sitting in the review grid (edited by hand or read). */
+function scanFilled(){
+  let n=0; (Scan.grid||[]).forEach(row=>row.forEach(c=>{ if(c&&c.subjectId) n++; })); return n;
+}
+/* A blank timetable grid sized to the school's own settings. */
+function scanBlankGrid(){
+  return Array.from({length:state.settings.periodsPerDay},()=>Array.from({length:state.settings.daysPerWeek},()=>null));
+}
+/* Re-read the loaded document through the chosen mode. Used on import and also
+   when the user switches sheet or page in the review step. */
+/* The OCR result becomes the same shape as a text-layer PDF: one entry per page,
+   each with the page's own grid, words and text. That way the page picker, the
+   per-page class detection and the "import all" button all work on a stack of
+   scans exactly as they do on a stack of sheets. */
+function scanDocFromOcr(ocr, base){
+  const pages=(ocr.pages&&ocr.pages.length?ocr.pages:[ocr]).map(p=>({
+    page:p.page, words:p.words, text:p.text, grid:p.grid,
+    matched:p.matched||0, conf:p.conf, langs:p.langs, script:p.script, via:p.via,
+    chars:(p.words||[]).reduce((a,w)=>a+w.text.length,0)
+  }));
+  return {
+    kind:"pdf", scanned:true, name:base&&base.name, numPages:base&&base.numPages,
+    pages, page:(ocr.page||pages[0]&&pages[0].page||1),
+    grid:ocr.grid, words:ocr.words, text:ocr.text
+  };
+}
+/* A page usually says which class it belongs to: "Grade 6A", "Class: 9C",
+   "ශ්‍රේණිය 8", "தரம் 7 · பிரிவு B". Reading that off saves the person from
+   importing a stack of scans one page at a time. */
+const SCAN_CLASS_RE=[
+  /* A number is required. "Class Timetable" is the NAME of a document, not a
+     class, and the first version of this happily read a whole file as "Class T". */
+  /grade\s*([0-9]{1,2})\s*[-–]?\s*([A-Za-z])?/i,
+  /(?:class|form|std|standard|section)\s*[:.\-]?\s*([0-9]{1,2})\s*[-–]?\s*([A-Za-z])?/i,
+  /([0-9]{1,2})\s*[-–]\s*([A-Z])\b/,                                 /* "10 - B" */
+  /ශ්‍රේණිය\s*([0-9]{1,2})/u,
+  /පන්තිය\s*([0-9]{1,2})/u,
+  /(?:தரம்|வகுப்பு)\s*([0-9]{1,2})/u
+];
+function scanClassLabel(text){
+  const t=Scanner.squash(text||"");
+  if(!t) return "";
+  for(const re of SCAN_CLASS_RE){
+    const m=t.match(re);
+    if(m) return Scanner.squash(m[0]).replace(/^class\s*[:.\-]?/i,"Class ").slice(0,40);
+  }
+  return "";
+}
+/* Which existing class does this label mean? "Grade 10B", "10B" and "10 B" are
+   the same class; if none matches, the page gets a new class named by its label. */
+function scanClassFor(label){
+  const want=scanNorm(label); if(!want) return null;
+  /* "Grade 6A" and "Grade 8A" are one character apart, so a plain similarity
+     check happily merges two different grades. Whatever else differs, the number
+     must be the same number. */
+  const numOf=t=>((String(t||"").match(/[0-9]{1,2}/)||[""])[0]);
+  const wantNum=numOf(label);
+  let best=null,score=0;
+  state.classes.forEach(c=>{
+    if(wantNum&&numOf(c.name)&&numOf(c.name)!==wantNum) return;
+    const keys=[c.name,scanNorm(c.name).replace(/^grade/,""),(c.name.match(/[0-9]+\s*[A-Za-z]?/)||[""])[0]];
+    keys.filter(Boolean).forEach(k=>{ const sc=scanSimilar(label,k); if(sc>score){score=sc;best=c;} });
+  });
+  return score>=.72?best:null;
+}
+function scanPageText(page){
+  if(!page) return "";
+  if(page.boxes&&page.boxes.length) return page.boxes.map(b=>b.text).join(" ");
+  if(page.words&&page.words.length) return page.words.map(w=>w.text).join(" ");
+  return page.text||"";
+}
+/* Read every page that holds a timetable and work out its class, so a file of
+   class sheets can be imported in one go. */
+function scanAnalysePages(){
+  const d=Scan.doc; if(!d) return;
+  const pages=d.kind==="pdf"?d.pages:(d.kind==="ocr"?[d]:[]);
+  d.analysis=(pages||[]).map((p,i)=>{
+    const text=scanPageText(p).slice(0,600);
+    const grid=p.grid||null;
+    const model=grid?Scanner.interpretGrid(grid,{daysPerWeek:state.settings.daysPerWeek}):null;
+    const out=model&&model.recognised?Scanner.gridToTimetable(model,scanCtx()):null;
+    if(out){ p.out=out; p.grid=grid; }
+    const label=scanClassLabel(text)||scanClassLabel(d.name||"")||"";
+    const cls=label?scanClassFor(label):null;
+    return { page:p.page||i+1, label, classId:cls?cls.id:null, className:cls?cls.name:(label||""),
+      matched:out?out.report.matched:0, filled:p.grid?(p.grid.cells||[]).reduce((a,r)=>a+r.filter(c=>c&&c.trim()).length,0):0,
+      needsOcr:!!p.needsOcr };
+  });
+  d.classPages=d.analysis.filter(a=>a.matched>0||a.filled>=4);
+  d.multi=d.classPages.length>1;
+}
+function scanConvert(){
+  Scan.rows=[]; Scan.grid=null; Scan.report=null;
+  if(Scan.mode==="teachers"){ Scan.rawText=scanDocLines()||""; Scan.rows=scanParseTeachers(Scan.rawText); return; }
+  if(Scan.mode==="subjects"){ Scan.rawText=scanDocLines()||""; Scan.rows=scanParseSubjects(Scan.rawText); return; }
+  if(Scan.mode!=="timetable"){ Scan.rawText=scanDocLines()||""; return; }
+
+  if(!Scan.classId||!C(Scan.classId)) Scan.classId=state.ui.activeClassId||state.classes[0]?.id||null;
+  const grid=scanPickedGrid();
+  const model=grid?Scanner.interpretGrid(grid,{daysPerWeek:state.settings.daysPerWeek}):null;
+  const out=model&&model.recognised?Scanner.gridToTimetable(model,scanCtx()):null;
+  if(out&&out.report.matched>0){
+    Scan.grid=out.grid; Scan.report=out.report; Scan.orientation=model.orientation;
+    Scan.rawText=Scanner.linesFromGrid(grid).join("\n"); return;
+  }
+  const text=scanDocLines()||"";
+  Scan.rawText=text;
+  /* Days but no usable geometry: the old line-by-line reading still helps. */
+  if(scanDayHits(grid,text)>=3){
+    const r=scanParseTimetable(text);
+    if(r.used>0){
+      Scan.grid=r.grid; Scan.orientation="days-cols";
+      Scan.report={placed:r.used,matched:r.used,unmatched:[],fallback:true}; return;
+    }
+  }
+  /* Nothing that looks like a week: show the text and say so, do not invent a grid. */
+  Scan.grid=out?out.grid:scanBlankGrid();
+  Scan.report={placed:0,matched:0,unmatched:[],noTimetable:true};
+}
+/* ---------- orchestration ---------- */
+async function scanRun(file){
+  if(!file) return;
+  const kind=scanKindOf(file);
+  if(kind==="unknown"){
+    Scan.error="I can't read that kind of file. Use a photo, a PDF, or an Excel / CSV / ODS sheet.";
+    Store.requestRender(); return;
+  }
+  if(kind==="image") return scanRunPhoto(file);
+  return scanRunDoc(file,kind);
+}
+async function scanRunDoc(file,kind){
+  Scan.busy=true; Scan.error=""; Scan.progress=3; Scan.step="processing";
+  Scan.langsUsed=""; Scan.langsAuto=false; Scan.docNote="";
+  Scan.doc=null; Scan.docName=file.name||"file"; Scan.page=1; Scan.sheetIndex=0;
+  Scan.rows=[]; Scan.grid=null; Scan.report=null; Scan.rawText=""; Scan.prepDataUrl="";
+  Scan.status=kind==="sheet"?"Reading the spreadsheet…":"Reading the PDF…";
+  Store.requestRender();
+  try{
+    Scan.doc=await scanLoadDoc(file,kind);
+    const cap=scanCapability();
+    if(kind!=="pdf") Scan.usedEngine=kind==="sheet"?"sheet":"text";
+    else if(!Scan.doc.needsOcr){
+      /* A PDF with a real text layer: read it exactly, then lay it out like any
+         other sheet. (This branch used to only name the engine, so nothing was
+         analysed and the review screen came up empty.) */
+      Scan.usedEngine="text";
+      Scan.status="Working out the layout…"; Scan.progress=82; Store.requestRender();
+      scanAnalysePages(); scanConvert();
+    }
+    else {
+      /* ---------------------------------------------------------------
+         Reading a PDF is a decision, not a single path. Its own text is exact
+         when the file is well made, but plenty of school PDFs come from programs
+         that cannot store Sinhala or Tamil properly: the letters are missing and
+         the layer looks readable while producing nonsense. So the text read is
+         tried, checked against what it actually achieved, and only then — if it
+         fell short and this device can read pictures — are the pages read as
+         images. Whichever understanding is better is the one kept.
+         --------------------------------------------------------------- */
+      const textDoc=Scan.doc;
+      const noLayer=(textDoc.pages||[]).every(p=>p.chars<24);
+      if(!textDoc.needsOcr){
+        Scan.status="Working out the layout…"; Scan.progress=82; Store.requestRender();
+        scanAnalysePages(); scanConvert();
+      }
+      const textMatched=(Scan.report&&Scan.report.matched)||0;
+      const textCells=(Scan.report&&Scan.report.cells||[]).length||0;
+      const poorRead=textDoc.needsOcr||(textCells>=6&&textMatched<textCells*0.65);
+      if(textDoc.needsOcr||poorRead){
+        if(!cap.ocr){
+          if(textDoc.needsOcr) throw new Error("That PDF is a picture (it has no text layer) and this device can't read pictures. Upload the timetable as Excel or CSV instead, or use a PDF whose text can be selected.");
+          Scan.docNote="This PDF's text is damaged — the program that made it left letters out — and this device cannot read pictures to make up for it. Upload the timetable as Excel or CSV for a full import.";
+        } else {
+          Scan.status=textDoc.damaged
+            ? "This PDF's letters are damaged — reading the pages as pictures instead…"
+            : (textDoc.needsOcr?"That PDF is a scan — reading its pages as pictures…":"Reading the pages as pictures to check the text…");
+          Scan.progress=40; Store.requestRender();
+          let ocr=null, ocrErr=null;
+          try{ ocr=await scanPdfOcr(); }catch(e){ ocrErr=e; }
+          if(ocr){
+            Scan.doc=scanDocFromOcr(ocr,textDoc);
+            Scan.doc.fromText=textDoc;
+            Scan.confidence=ocr.conf; Scan.usedEngine="ocr";
+            scanAnalysePages(); scanConvert();
+            const ocrMatched=(Scan.report&&Scan.report.matched)||0;
+            if(ocrMatched>textMatched||textDoc.needsOcr){
+              const readPages=(ocr.pages||[]).length;
+              Scan.docNote = noLayer
+                ? "This PDF has no text layer — it is a scan — so "+(readPages>1?readPages+" pages were read":"its page was read")+" as pictures ("+ocrMatched+" lesson(s) recognised)."
+                : "This PDF's own text is damaged: the program that made the file could not store all its letters"+(textCells?(", and only "+textMatched+" of "+textCells+" readable cells matched your subjects"):"")+". Its pages were read as pictures instead and gave "+ocrMatched+" lesson(s).";
+            } else {
+              Scan.doc=textDoc; scanAnalysePages(); scanConvert();
+              Scan.docNote="This PDF's text is damaged (the file itself is missing letters). Reading the pages as pictures did not do better, so the text version is shown — check the grid below, or upload the timetable as Excel or CSV.";
+              Scan.usedEngine="text";
+            }
+          } else {
+            if(textDoc.needsOcr) throw new Error("That PDF has no text in it and nothing readable could be found on its pages. "+(ocrErr&&ocrErr.message?ocrErr.message+" ":"" )+"Try a clearer scan, or upload the timetable as Excel or CSV.");
+            Scan.docNote="This PDF's text is damaged and its pages could not be read as pictures either ("+(ocrErr&&ocrErr.message||"no text found")+"). Upload the timetable as Excel or CSV for a full import.";
+            Scan.usedEngine="text";
+          }
+        }
+        Scan.status="Working out the layout…"; Scan.progress=88; Store.requestRender();
+        await new Promise(r=>setTimeout(r,16));
+        scanAnalysePages(); scanConvert();
+      }
+    }
+    Scan.progress=100; Scan.step=(Scan.mode==="text"&&!Scan.rawText.trim())?"capture":"review";
+    Scan.status=""; Scan.stats=null;
+  }catch(err){
+    Scan.error=err?.message||"That file could not be read."; Scan.step="capture";
+  }finally{
+    Scan.busy=false; Store.requestRender();
+  }
+}
+/* How many real lessons a reader result would place in the timetable. Used to
+   choose between repaired versions of the same photo. */
+function scanLessonsIn(res){
+  try{
+    const words=Scanner.cleanOcrWords(res.words||[]).filter(w=>w.text);
+    if(!res._lessons) res._lessons=0;
+    if(words.length<8) return res._lessons;
+    const g=Scanner.buildGridFromBoxes(words,{});
+    const model=g?Scanner.interpretGrid(g,{daysPerWeek:state.settings.daysPerWeek}):null;
+    if(!model||!model.recognised) return res._lessons;
+    const out=Scanner.gridToTimetable(model,scanCtx());
+    res._lessons=out.report.matched; res._grid=g;
+    return res._lessons;
+  }catch(_){ return 0; }
+}
+/* The camera path: repair the photo, run the on-device reader, then use word
+   positions to rebuild the timetable grid where possible. */
+async function scanRunPhoto(file){
+  Scan.busy=true; Scan.error=""; Scan.progress=2; Scan.step="processing";
+  Scan.doc=null; Scan.docName=file.name||"photo"; Scan.report=null;
+  Scan.langsUsed=""; Scan.langsAuto=false; Scan.docNote="";
+  Scan.status="Reading the photo…"; Store.requestRender();
+  try{
+    const cap=scanCapability();
+    if(!cap.ocr&&!(Scan.engine==="ai"&&(Scan.aiKey||"").trim())){
+      Scan.busy=false; Scan.step="capture";
+      Scan.error="This device can't read photos or scanned paper — "+(cap.blockers[0]||cap.notes[0]||"it is too limited for the reader")+
+        ". You can still upload an Excel, CSV or PDF file: those are read without any picture reading.";
+      Store.requestRender(); return;
+    }
+    await ensureScanner();                 /* the geometry reader; cached after the first use */
+    const img=await scanLoadImage(file);
+    Scan.srcDataUrl="";
+    Scan.status="Repairing lighting, angle and contrast…"; Scan.progress=12; Store.requestRender();
+    await new Promise(r=>setTimeout(r,16));
+    const built=scanBuildVariants(img);
+    Scan.prepDataUrl=built.preview.toDataURL("image/jpeg",0.75);
+    Scan.stats={angle:built.angle.toFixed(1),dark:built.dark,tries:0};
+    Scan.progress=22; Store.requestRender();
+
+    let best={text:"",conf:0}, tries=0;
+    if(Scan.engine==="ai"){
+      Scan.status="Sending to the AI reader…"; Store.requestRender();
+      best=await scanOcrAI(built.variants[0].canvas,Scan.mode);
+      tries=1; Scan.progress=85;
+    } else {
+      for(let i=0;i<built.variants.length;i++){
+        const v=built.variants[i];
+        Scan.status=`Reading attempt ${i+1} of ${built.variants.length} (${v.label})…`;
+        Store.requestRender();
+        let res;
+        try{ res=await scanOcrSmart(v.canvas,p=>{
+          Scan.progress=Math.min(84,22+ (i/built.variants.length)*62 + p*(62/built.variants.length));
+          Store.requestRender();
+        }); }catch(err){ if(i===0&&built.variants.length===1) throw err; continue; }
+        tries++;
+        /* Judged by what it actually achieves: for a timetable that means real
+           lessons, not characters or raw confidence. A brighter repair can read
+           more text and place fewer lessons, and the previous scoring picked it
+           every time. */
+        let score=res.conf*0.6 + Math.min(1,scanCleanLines(res.text).length/14)*0.4;
+        let bestScore=best.conf*0.6 + Math.min(1,scanCleanLines(best.text).length/14)*0.4;
+        if(Scan.mode==="timetable"&&typeof Scanner!=="undefined"){
+          score=scanLessonsIn(res)*10 + score;
+          bestScore=(best._lessons||0)*10 + bestScore;
+        }
+        if(Scan.mode==="timetable"&&typeof Scanner!=="undefined") best=scanBetterReading(res,best);
+        else if(score>bestScore) best=res;
+        if(res.conf>0.86 || (best._lessons||0)>=15) break;   /* already clean / complete */
+        /* If the first repair needed another language pack to read anything at
+           all, the other repairs will not change that. */
+        if(Scan.langsAuto&&i>=1) break;
+      }
+    }
+    if(!best.text.trim()) throw new Error("Nothing readable was found. Try better light, hold straighter, or switch to the AI engine.");
+
+    Scan.stats.tries=tries; Scan.rawText=best.text; Scan.progress=92;
+    Scan.status="Matching against your records…"; Store.requestRender();
+    await new Promise(r=>setTimeout(r,16));
+
+    Scan.grid=null; Scan.rows=[];
+    if(Scan.mode==="teachers") Scan.rows=scanParseTeachers(best.text);
+    else if(Scan.mode==="subjects") Scan.rows=scanParseSubjects(best.text);
+    else if(Scan.mode==="timetable"){
+      if(!Scan.classId||!C(Scan.classId)) Scan.classId=state.ui.activeClassId||state.classes[0]?.id||null;
+      /* Words with positions rebuild the grid properly; without them the old
+         line-by-line reading is still used. */
+      const words=Scanner.cleanOcrWords(best.words||[]).filter(w=>w.text);
+      let done=false;
+      if(words.length>=8&&typeof Scanner!=="undefined"){
+        try{
+          const g=Scanner.buildGridFromBoxes(words,{});
+          const model=g?Scanner.interpretGrid(g,{daysPerWeek:state.settings.daysPerWeek}):null;
+          if(model&&model.recognised){
+            const out=Scanner.gridToTimetable(model,scanCtx());
+            if(out.report.matched>0){
+              Scan.grid=out.grid; Scan.report=out.report; Scan.orientation=model.orientation;
+              Scan.doc={kind:"ocr",words,text:best.text,grid:g,conf:best.conf};
+              done=true;
+            }
+          }
+        }catch(err){ done=false; }
+      }
+      if(!done){
+        const r=scanParseTimetable(best.text); Scan.grid=r.grid;
+        Scan.report={placed:r.used,matched:r.used,unmatched:[],fallback:true};
+      }
+    }
+    Scan.confidence=best.conf;
+    Scan.progress=100; Scan.step="review"; Scan.status="";
+  }catch(err){
+    Scan.error=err.message||"The scan failed."; Scan.step="capture";
+  }finally{
+    Scan.busy=false; Store.requestRender();
+  }
+}
+function scanApply(){
+  if(!needEdit()) return;
+  let added=0, updated=0, cells=0;
+  if(Scan.mode==="subjects"){
+    Scan.rows.filter(r=>r.include&&r.name).forEach(r=>{
+      if(r.existingId) return;
+      const code=(r.name.split(/\s+/).map(w=>w[0]).join("")||r.name.slice(0,3)).toUpperCase().slice(0,5);
+      state.subjects=[...state.subjects,{id:uid("s"),name:r.name,code,color:SUBJ_COLORS[state.subjects.length%SUBJ_COLORS.length]}];
+      added++;
+    });
+  }
+  if(Scan.mode==="teachers"){
+    Scan.rows.filter(r=>r.include&&r.name).forEach(r=>{
+      const subjectIds=[];
+      r.subjects.forEach(s=>{
+        let id=s.id;
+        if(!id&&s.name){
+          const code=(s.name.split(/\s+/).map(w=>w[0]).join("")||s.name.slice(0,3)).toUpperCase().slice(0,5);
+          const fresh={id:uid("s"),name:s.name,code,color:SUBJ_COLORS[state.subjects.length%SUBJ_COLORS.length]};
+          state.subjects=[...state.subjects,fresh]; id=fresh.id;
+        }
+        if(id&&!subjectIds.includes(id)) subjectIds.push(id);
+      });
+      if(r.existingId){
+        const t=T(r.existingId); if(!t) return;
+        const merged=[...new Set([...(t.subjectIds||[]),...subjectIds])];
+        t.subjectIds=merged; updated++;
+      } else {
+        state.teachers=[...state.teachers,{id:uid("t"),name:r.name,
+          code:initials(r.name),color:PALETTE[state.teachers.length%PALETTE.length],subjectIds}];
+        added++;
+      }
+    });
+  }
+  if(Scan.mode==="timetable"&&Scan.grid&&Scan.classId){
+    if(!needUnlocked(Scan.classId)) return;
+    const g=blankGrid();
+    Scan.grid.forEach((row,p)=>row.forEach((cell,d)=>{
+      if(!cell||!cell.subjectId) return;
+      if(d<state.settings.daysPerWeek&&p<state.settings.periodsPerDay){
+        g[d][p]=[{subjectId:cell.subjectId,teacherId:cell.teacherId||null}]; cells++;
+      }
+    }));
+    state.timetable[Scan.classId]=g;
+  }
+  const parts=[];
+  if(added) parts.push(added+" added");
+  if(updated) parts.push(updated+" updated");
+  if(cells) parts.push(cells+" lessons placed");
+  toast(parts.length?"success":"info","Scan applied",parts.join(" · ")||"Nothing was selected to import.");
+  Scan.step="capture"; Scan.rows=[]; Scan.grid=null; Scan.rawText=""; Scan.prepDataUrl="";
+  Scan.doc=null; Scan.docName=""; Scan.report=null; Scan.page=1; Scan.sheetIndex=0; Scan.stats=null;
+}
+
+/* ---------- scanner UI ---------- */
+function scanConfBadge(score){
+  if(score>=.85) return `<span class="badge bg-emerald-100 text-emerald-700">sure</span>`;
+  if(score>=.6)  return `<span class="badge bg-amber-100 text-amber-800">check</span>`;
+  return `<span class="badge bg-rose-100 text-rose-700">guess</span>`;
+}
+function renderScanner(){
+  const edit=canEdit();
+  if(!edit){
+    $("#view").innerHTML=`<div class="max-w-xl mx-auto pt-6">${emptyState("ph-lock","Scanner is read-only for your role",
+      "Ask your principal for “Can edit workspace” to import scanned records.","")}</div>`;
+    return;
+  }
+  let body="";
+  if(Scan.step==="processing"){
+    body=`<div class="card p-6 sm:p-8 text-center rise">
+      <div class="tile w-16 h-16 rounded-2xl bg-emerald-500/10 text-emerald-600 mx-auto mb-4"><i class="ph ph-scan text-3xl"></i></div>
+      <h3 class="font-display font-bold text-lg">Working on it</h3>
+      <p class="text-xs text-zinc-500 mt-1.5">${esc(Scan.status||"Processing…")}</p>
+      <div class="h-2.5 rounded-full bg-zinc-100 overflow-hidden mt-5 max-w-sm mx-auto">
+        <div class="h-full rounded-full bg-gradient-to-r from-emerald-500 to-teal-400 transition-all duration-300" style="width:${Math.round(Scan.progress)}%"></div></div>
+      <p class="text-[11px] text-zinc-400 mt-3">${Scan.docName&&/\\.(xlsx|xlsm|xls|csv|tsv|ods|pdf)$/i.test(Scan.docName)?"Large files can take a moment. Leave this screen open.":"A careful scan can take 20–60 seconds on a phone. Leave this screen open."}</p>
+      ${Scan.prepDataUrl?`<img src="${Scan.prepDataUrl}" alt="Repaired scan preview" class="mt-5 rounded-xl border border-zinc-200 max-h-64 mx-auto">`:""}
+    </div>`;
+  } else if(Scan.step==="review"){
+    /* Where the data came from, and — for a workbook or a long PDF — which sheet
+       or page is being read. One tab per grade plus a staff list at the end is
+       the normal shape of a school's spreadsheet. */
+    const src=Scan.doc;
+    const picker=src&&((src.kind==="sheet"&&src.sheets.length>1)||((src.kind==="pdf"||src.kind==="ocr")&&src.numPages>1))?`
+      <div class="card p-4 mt-4 rise">
+        <label class="label">${src.kind==="sheet"?"Which sheet should I use?":"Which page should I use?"}</label>
+        <div class="flex flex-wrap gap-2">
+          ${src.kind==="sheet"
+            ? src.sheets.map((sh,i)=>`<button class="btn ${(src.sheetIndex||0)===i?"btn-soft":"btn-ghost"} !min-h-[38px] !h-9 !px-3 !text-[12px]" data-action="scan-sheet" data-i="${i}">${esc(sh.name)}<span class="opacity-55 ml-1">${sh.filled}</span></button>`).join("")
+            : Array.from({length:src.numPages},(_,i)=>i+1).map(n=>`<button class="btn ${(src.page||1)===n?"btn-soft":"btn-ghost"} !min-h-[38px] !h-9 !px-3 !text-[12px]" data-action="scan-page" data-n="${n}">Page ${n}</button>`).join("")}
+        </div>
+        <p class="text-[11px] text-zinc-400 mt-2 leading-relaxed">${src.kind==="sheet"
+          ? "The number is how many filled cells that sheet has. The busiest sheet is chosen for you."
+          : "Pick the page that holds the timetable."}</p>
+      </div>`:"";
+    const multi=(src&&src.multi&&src.classPages&&src.classPages.length>1)?`
+      <div class="card p-4 mt-4 rise !border-emerald-200/70 bg-emerald-50/40">
+        <div class="flex items-start gap-3">
+          <i class="ph-fill ph-stack text-emerald-600 text-lg mt-0.5"></i>
+          <div class="flex-1 min-w-0">
+            <div class="text-[13px] font-extrabold text-emerald-900">This file holds ${src.classPages.length} timetables</div>
+            <p class="text-[11px] text-emerald-900/70 leading-relaxed mt-1">Each page was read on its own and the class name printed on the page was picked up. Untick anything you do not want, then import them all in one go — nothing is overwritten without being listed here.</p>
+            <div class="space-y-1.5 mt-2.5">
+              ${src.classPages.map(a=>`<label class="flex items-center gap-2.5 bg-white/70 border border-emerald-200/60 rounded-xl px-2.5 py-2 cursor-pointer">
+                <input type="checkbox" class="sr-only" data-change="scan-class-page" data-page="${a.page}" ${a.include===false?"":"checked"}>
+                <span class="switch !w-9 !h-5"></span>
+                <span class="text-[12px] font-bold text-zinc-700 flex-none">Page ${a.page}</span>
+                <span class="text-[12px] flex-1 min-w-0 truncate">${a.classId||a.label?`<span class="text-emerald-700 font-semibold">${esc(a.className||a.label)}</span>${a.classId?" <span class=\"text-[10px] text-zinc-400\">existing class</span>":` <span class="text-[10px] text-zinc-400">will be created</span>`}`:`<span class="text-zinc-400">no class name on the page</span>`}</span>
+                <span class="chip !text-[10px] flex-none">${a.matched||a.filled} lesson(s)</span>
+              </label>`).join("")}
+            </div>
+            <button class="btn btn-primary mt-3" data-action="scan-apply-all"><i class="ph ph-check"></i>Import all checked</button>
+          </div>
+        </div>
+      </div>`:"";
+
+    const docNote=Scan.docNote?`<div class="text-[11px] text-sky-900/80 bg-sky-50 border border-sky-200/70 rounded-xl p-3 mt-3 leading-relaxed flex items-start gap-2">
+      <i class="ph-fill ph-info text-sky-500 mt-0.5 flex-none"></i><span>${esc(Scan.docNote)}${Scan.langsUsed&&Scan.langsAuto?` <b>Read with the ${esc(scanLangLabel(Scan.langsUsed))} pack</b> — that is what the page turned out to be written in.`:""}</span></div>`:"";
+
+    const found=Scan.report&&Scan.mode==="timetable"?(Scan.report.noTimetable
+      ? `<div class="text-[11px] text-amber-800 bg-amber-50 border border-amber-200/70 rounded-xl p-3 mt-3 leading-relaxed flex items-start gap-2">
+          <i class="ph-fill ph-warning text-amber-500 mt-0.5 flex-none"></i>
+          <span><b>No day names were found here</b>, so this does not look like a timetable. Pick another sheet above, or choose “Teacher list” / “Just read the text” instead. Nothing will be written to the timetable from this screen.</span></div>`
+      : `<p class="text-[11px] mt-2.5 leading-relaxed ${Scan.report.matched?"text-zinc-500":"text-rose-600 font-semibold"}">
+        ${Scan.report.matched} lesson(s) matched your subjects${Scan.report.unmatched&&Scan.report.unmatched.length?` · ${Scan.report.unmatched.length} cell(s) need a decision — they are marked “?” in the grid`:""}${Scan.report.fallback?" · read line by line, so check the days line up":""}.</p>`):"";
+    const head=`<div class="card p-4 flex items-center gap-3 flex-wrap rise">
+      <div class="tile bg-emerald-500/10 text-emerald-600"><i class="ph-fill ph-check-circle text-xl"></i></div>
+      <div class="flex-1 min-w-[180px]">
+        <div class="font-bold text-sm">${Scan.doc?"Read successfully — check before importing":"Read complete — check before importing"}</div>
+        <div class="text-[11px] text-zinc-500 mt-0.5">${Scan.doc
+          ? `${esc(Scan.docName)} · ${Scan.usedEngine==="sheet"?"read as a spreadsheet, no guessing":Scan.usedEngine==="ocr"?"scanned PDF, read from the picture":Scan.usedEngine==="text"?"read from the file's own text":"cleaned up and read on this device"}`
+          : Scan.stats?`straightened ${esc(Scan.stats.angle)}° · ${Scan.stats.tries} read attempt(s)${Scan.stats.dark?" · dark board mode":""}`:""} · nothing is saved until you press Import</div>
+      </div>
+      <button class="btn btn-ghost" data-action="scan-restart"><i class="ph ph-arrow-counter-clockwise"></i>Start over</button>
+    </div>${picker}`;
+
+    if(Scan.mode==="text"){
+      body=head+`<div class="card p-4 mt-4">
+        <label class="label">Text found</label>
+        <textarea class="field !h-auto min-h-[320px] py-3 font-mono text-[12px] leading-relaxed" data-fid="scan-text" data-input="scan-text">${esc(Scan.rawText)}</textarea>
+        <div class="flex flex-wrap gap-2.5 mt-3">
+          <button class="btn btn-primary" data-action="scan-copy"><i class="ph ph-copy"></i>Copy text</button>
+          <button class="btn btn-ghost" data-action="scan-restart"><i class="ph ph-camera"></i>Scan another</button>
+        </div></div>`;
+    } else if(Scan.mode==="timetable"){
+      const days=state.settings.daysPerWeek, periods=state.settings.periodsPerDay;
+      body=head+multi+`
+      <div class="card p-4 mt-4">
+        <label class="label">Import into which class?</label>
+        <select class="field w-full sm:!w-auto sm:!min-w-[220px]" data-change="scan-class">
+          ${state.classes.map(c=>`<option value="${c.id}" ${Scan.classId===c.id?"selected":""}>${esc(c.name)}${c.locked?" · LOCKED":""}</option>`).join("")||`<option value="">No classes yet</option>`}
+        </select>
+        <p class="text-[11px] text-amber-700 bg-amber-50 border border-amber-200/70 rounded-xl p-2.5 mt-3 leading-relaxed">
+          Importing <b>replaces that class's whole week</b>. Undo (Ctrl+Z) restores it.</p>
+        ${docNote}
+        ${found}
+      </div>
+      <div class="card overflow-hidden mt-4">
+        <div class="overflow-auto" style="max-height:60vh"><table class="ttable">
+          <thead><tr><th class="rowhead">Period</th>${Array.from({length:days},(_,d)=>`<th>${DAYS_SHORT[d]}</th>`).join("")}</tr></thead>
+          <tbody>${Array.from({length:periods},(_,p)=>`<tr><td class="rowhead">P${p+1}</td>
+            ${Array.from({length:days},(_,d)=>{ const cell=Scan.grid?.[p]?.[d];
+              const s=cell?.subjectId?S(cell.subjectId):null;
+              return `<td class="cell readonly !min-w-[150px]">
+                <select class="field !h-9 !text-[11px] !px-2" data-change="scan-cell" data-p="${p}" data-d="${d}">
+                  <option value="">—</option>
+                  ${state.subjects.map(su=>`<option value="${su.id}" ${s?.id===su.id?"selected":""}>${esc(su.code)}</option>`).join("")}
+                </select>
+                ${cell&&!s&&cell.raw?`<div class="text-[9px] text-rose-500 font-bold truncate mt-0.5" title="${esc(cell.raw)}">?${esc(cell.raw.slice(0,10))}</div>`:""}
+              </td>`; }).join("")}
+          </tr>`).join("")}</tbody></table></div>
+      </div>
+      <div class="flex flex-wrap gap-2.5 mt-4">
+        <button class="btn btn-primary" data-action="scan-apply" ${Scan.classId&&scanFilled()?"":"disabled"}><i class="ph ph-check"></i>Import ${scanFilled()?scanFilled()+" lesson(s)":""} into timetable</button>
+        <button class="btn btn-ghost" data-action="scan-restart">Cancel</button>
+      </div>`;
+    } else {
+      const rows=Scan.rows;
+      const chosen=rows.filter(r=>r.include).length;
+      body=head+`
+      <div class="flex items-center justify-between gap-2 flex-wrap mt-4">
+        <p class="text-xs text-zinc-500 font-semibold">${rows.length} row(s) found · ${chosen} selected</p>
+        <div class="flex gap-2">
+          <button class="btn btn-ghost !min-h-[38px]" data-action="scan-all" data-on="1">Select all</button>
+          <button class="btn btn-ghost !min-h-[38px]" data-action="scan-all" data-on="0">None</button>
+        </div>
+      </div>
+      ${rows.length?`<div class="space-y-2 mt-3">
+        ${rows.map((r,i)=>`<div class="card p-3 flex items-start gap-3 ${r.include?"":"opacity-55"}">
+          <label class="flex items-center pt-1.5 cursor-pointer flex-none">
+            <input type="checkbox" class="sr-only" data-change="scan-row" data-i="${i}" ${r.include?"checked":""}>
+            <span class="switch !w-11 !h-6"></span></label>
+          <div class="flex-1 min-w-0">
+            <input class="field !h-10 !text-[13px] font-semibold" data-fid="scan-name-${i}" data-input="scan-name" data-i="${i}" value="${esc(r.name)}">
+            <div class="flex items-center gap-1.5 flex-wrap mt-1.5">
+              ${scanConfBadge(r.score)}
+              ${r.existingId?`<span class="chip !text-[10px]"><i class="ph-fill ph-link text-sky-500"></i>updates ${esc(r.existingName)}</span>`
+                            :`<span class="chip !text-[10px]"><i class="ph-fill ph-plus-circle text-emerald-500"></i>new</span>`}
+              ${(r.subjects||[]).map(s=>`<span class="chip !text-[10px] ${s.matched?"":"!bg-amber-50 !text-amber-700 !border-amber-200"}">${esc(s.name)}${s.matched?"":" · new"}</span>`).join("")}
+            </div>
+            <div class="text-[10px] text-zinc-400 font-mono truncate mt-1" title="${esc(r.raw)}">read: ${esc(r.raw)}</div>
+          </div>
+        </div>`).join("")}
+      </div>`:`<div class="mt-3">${emptyState("ph-eye-slash","Nothing could be parsed","The text was read but no names were recognisable. Try the AI engine, or scan a smaller section at a time.","")}</div>`}
+      <div class="flex flex-wrap gap-2.5 mt-4">
+        <button class="btn btn-primary" data-action="scan-apply" ${chosen?"":"disabled"}><i class="ph ph-check"></i>Import ${chosen} row(s)</button>
+        <button class="btn btn-ghost" data-action="scan-restart">Cancel</button>
+      </div>`;
+    }
+  } else {
+    body=`
+    ${Scan.error?`<div class="card p-4 flex items-start gap-3 !border-rose-200 bg-rose-50/70 rise">
+      <i class="ph-fill ph-warning-circle text-rose-500 text-lg mt-0.5"></i>
+      <div class="text-xs text-rose-800 leading-relaxed flex-1">${esc(Scan.error)}</div></div>`:""}
+    <div class="card p-4 sm:p-5">
+      <label class="label">What are you scanning?</label>
+      <div class="grid sm:grid-cols-2 gap-2">
+        ${SCAN_MODES.map(([m,ic,title,sub])=>`<button class="text-left rounded-xl border p-3 transition-all ${Scan.mode===m?"border-emerald-400 bg-emerald-50/60":"border-zinc-200 hover:border-zinc-300"}"
+          data-action="scan-mode" data-mode="${m}">
+          <div class="flex items-center gap-1.5 text-[13px] font-extrabold ${Scan.mode===m?"text-emerald-700":"text-zinc-700"}"><i class="ph-fill ${ic}"></i>${title}</div>
+          <div class="text-[11px] text-zinc-500 leading-snug mt-1">${sub}</div></button>`).join("")}
+      </div>
+    </div>
+
+    <div class="card p-4 sm:p-5 mt-4">
+      <label class="label">Reading engine</label>
+      <div class="grid sm:grid-cols-2 gap-2">
+        <button class="text-left rounded-xl border p-3 transition-all ${Scan.engine==="local"?"border-emerald-400 bg-emerald-50/60":"border-zinc-200"} ${scanCapability().ocr?"":"opacity-60"}" data-action="scan-engine" data-engine="local">
+          <div class="text-[13px] font-extrabold ${Scan.engine==="local"?"text-emerald-700":"text-zinc-700"}"><i class="ph-fill ph-device-mobile"></i> On this device</div>
+          <div class="text-[11px] text-zinc-500 leading-snug mt-1">${scanCapability().ocr
+            ? "Free, private, works offline. Strong on printed and neat writing; struggles with messy handwriting."
+            : "<b class=\"text-amber-700\">Not available on this device</b> — it needs WebAssembly and more memory than this phone has."}</div></button>
+        <button class="text-left rounded-xl border p-3 transition-all ${Scan.engine==="ai"?"border-emerald-400 bg-emerald-50/60":"border-zinc-200"}" data-action="scan-engine" data-engine="ai">
+          <div class="text-[13px] font-extrabold ${Scan.engine==="ai"?"text-emerald-700":"text-zinc-700"}"><i class="ph-fill ph-sparkle"></i> AI reader</div>
+          <div class="text-[11px] text-zinc-500 leading-snug mt-1">Far better on bad handwriting and wall boards. Needs internet and your own free Google AI Studio key.</div></button>
+      </div>
+      ${Scan.engine==="ai"?`<div class="mt-3 space-y-2.5">
+        <div class="flex items-center justify-between gap-2">
+          <div>
+            <label class="label">Google AI Studio key</label>
+            <input class="field font-mono !text-xs" type="password" data-fid="scan-key" data-input="scan-key" value="${esc(Scan.aiKey)}" placeholder="AIza…" autocomplete="off">
+          </div>
+          <button type="button" class="btn btn-ghost !min-h-[42px] !px-3 flex-none self-end" data-action="scan-key-clear" aria-label="Remove key from this device"><i class="ph ph-trash"></i></button>
+        </div>
+        <label class="flex items-center gap-2 text-[11px] text-zinc-500 min-h-[32px] cursor-pointer">
+          <input type="checkbox" id="scan-remember-key" class="sr-only" data-change="scan-key-remember" ${localStorage.getItem("cf.aiKey")?"checked":""}>
+          <span class="switch !w-9 !h-5"></span>Remember the key on this device
+        </label>
+        <div class="flex items-center gap-2.5">
+          <div class="flex-1"><label class="label !mb-1">Gemini model</label>
+            <input class="field font-mono !text-xs !h-11" data-fid="scan-model" data-input="scan-model" value="${esc(defaultGeminiModel())}" placeholder="e.g. gemini-2.5-flash"></div>
+        </div>
+        <div class="text-[11px] text-amber-800 bg-amber-50 border border-amber-200/70 rounded-xl p-3 leading-relaxed flex items-start gap-2">
+          <i class="ph-fill ph-warning text-amber-500 mt-0.5 flex-none"></i>
+          <span>Your personal API key travels only from this device to Google, but it <b>can be exposed by browser extensions or someone using this device</b>. For confidential staff papers use the on-device engine or the on-premise pipeline instead.</span>
+        </div>
+      </div>`:""}
+    </div>
+
+    <div class="card p-5 mt-4">
+      <div class="text-center">
+        <div class="tile w-16 h-16 rounded-2xl bg-gradient-to-br from-emerald-500/12 to-teal-500/8 text-emerald-600 mx-auto mb-3"><i class="ph ph-upload-simple text-3xl"></i></div>
+        <h3 class="font-display font-bold text-[15px]">Upload the file or take the photo</h3>
+        <p class="text-xs text-zinc-500 mt-1 max-w-md mx-auto leading-relaxed">
+          Excel, CSV, PDF, or a picture of the printed chart. The file is read on this device — nothing is uploaded,
+          and it works with no internet after the first visit.</p>
+      </div>
+      <div class="grid sm:grid-cols-2 gap-2.5 mt-4">
+        <button class="btn btn-primary" data-action="scan-pick"><i class="ph ph-file-arrow-up"></i>Upload a file</button>
+        ${scanCanImage()
+          ? `<button class="btn btn-ghost" data-action="scan-camera"><i class="ph ph-camera"></i>Use camera</button>`
+          : `<button class="btn btn-ghost" disabled title="Not possible on this device"><i class="ph ph-camera-slash"></i>Camera not available</button>`}
+      </div>
+      ${(!scanCapability().ocr)?`<div class="text-[11px] mt-3 rounded-xl p-3 leading-relaxed flex items-start gap-2 ${scanCanImage()
+          ?"text-sky-800 bg-sky-50 border border-sky-200/70"
+          :"text-amber-800 bg-amber-50 border border-amber-200/70"}">
+        <i class="ph-fill ${scanCanImage()?"ph-info":"ph-warning-circle"} ${scanCanImage()?"text-sky-500":"text-amber-500"} mt-0.5 flex-none"></i>
+        <span>${scanCanImage()
+          ? "<b>Photos can't be read on this device yourself</b> — the on-device reader needs more than it has ("+esc(scanCapability().blockers[0]||scanCapability().notes[0]||"it is too limited")+"). You can still <b>upload an Excel, CSV or PDF file</b>, or use the <b>AI reader</b> with your key."
+          : "<b>This device can't take or read photos</b> — "+esc(scanCapability().blockers[0]||scanCapability().notes[0]||"it is too limited for the reader")+". Timetables uploaded as <b>Excel, CSV or a text PDF</b> are read without any picture reading, so those still work here."}</span></div>`:""}
+      ${(scanCapability().ocr&&scanCapability().slow)?`<div class="text-[11px] mt-3 rounded-xl p-3 leading-relaxed flex items-start gap-2 text-amber-800 bg-amber-50 border border-amber-200/70">
+        <i class="ph-fill ph-warning text-amber-500 mt-0.5 flex-none"></i>
+        <span><b>This device is on the slow side</b> (${esc(scanCapability().notes.join(", "))}). Reading a photo can take a minute or more, and a very large one may fail. Excel, CSV and PDF files are quick here.</span></div>`:""}
+      <p class="text-[11px] text-zinc-400 text-center mt-3">.xlsx · .xls · .csv · .ods · .pdf · .jpg · .png</p>
+      <div class="grid sm:grid-cols-3 gap-2 mt-4 pt-4 border-t border-zinc-100 text-[11px] text-zinc-500">
+        <div class="flex items-start gap-2"><i class="ph-fill ph-file-xls text-emerald-500 text-base mt-0.5"></i>
+          <span><b class="text-zinc-700">Spreadsheets are read exactly</b> — every sheet, merged cells, messy rows and all.</span></div>
+        <div class="flex items-start gap-2"><i class="ph-fill ph-file-pdf text-rose-500 text-base mt-0.5"></i>
+          <span><b class="text-zinc-700">PDFs</b> are read from their own text; a scanned PDF is recognised as a picture.</span></div>
+        <div class="flex items-start gap-2"><i class="ph-fill ph-image text-sky-500 text-base mt-0.5"></i>
+          <span><b class="text-zinc-700">Photos</b> are cleaned up first, then read on this device.</span></div>
+      </div>
+      ${Scan.mode==="timetable"?`<div class="mt-4 pt-4 border-t border-zinc-100">
+        <label class="label !mb-1.5">Languages on the timetable</label>
+        <div class="flex flex-wrap gap-2">
+          ${[["eng","English"],["eng+sin","English + සිංහල"],["eng+tam","English + தமிழ்"],["eng+sin+tam","All three"]]
+            .map(([id,lbl])=>`<button class="btn ${Scan.langs===id?"btn-soft":"btn-ghost"} !min-h-[38px] !h-9 !px-3 !text-[12px]" data-action="scan-lang" data-lang="${id}">${lbl}</button>`).join("")}
+        </div>
+        <p class="text-[11px] text-zinc-400 mt-2 leading-relaxed">Extra languages make reading slower. Leave this on English and the app will quietly try the other packs itself if a page turns out to be Sinhala or Tamil — the packs are stored on this device, so even that works offline.</p>
+      </div>`:""}
+    </div>
+
+    <div class="card p-4 mt-4 flex items-start gap-3 bg-sky-50/60 !border-sky-200/70">
+      <i class="ph-fill ph-info text-sky-500 text-lg mt-0.5"></i>
+      <p class="text-xs text-sky-900/80 leading-relaxed"><b>How to get a good read:</b> scan one section at a time rather than a whole wall; a folded page reads better photographed in two halves; for a blackboard the app automatically switches to light-on-dark mode. Whatever it reads, you review and correct it before anything is saved.</p>
+    </div>`;
+  }
+
+  $("#view").innerHTML=`
+  <div class="space-y-4">
+    <div class="flex items-end justify-between gap-3 flex-wrap">
+      <div><div class="text-[11px] font-bold uppercase tracking-[.1em] text-emerald-600">Paperwork shortcut</div>
+      <h2 class="font-display font-bold text-2xl sm:text-[28px] tracking-tight mt-0.5">Scanner</h2>
+      <p class="text-xs text-zinc-500 font-medium mt-1">Photograph a timetable, staff list or wall board and turn it into records.</p></div>
+    </div>
+    ${body}
+  </div>`;
+}
+
+/* =================================================================================
+   ATTENDANCE — fingerprint clock-in and live principal dashboard
+   ================================================================================= */
+let attendancePromise=null;
+function ensureAttendance(){
+  if(window.ATT) return Promise.resolve(ATT);
+  if(attendancePromise) return attendancePromise;
+  attendancePromise=loadScriptOnce("vendor/attendance.js",()=>typeof window.ATT!=="undefined").then(()=>ATT);
+  return attendancePromise;
+}
+
+function attMethodChip(method){
+  const map={fingerprint:["ph-fingerprint","att.method.fingerprint","bg-violet-50 text-violet-700 border-violet-200"],
+             manual:["ph-hand-pointing","att.method.manual","bg-amber-50 text-amber-700 border-amber-200"],
+             device:["ph-plugs-connected","att.method.device","bg-sky-50 text-sky-700 border-sky-200"]};
+  const [ic,k,cls] = map[method]||["ph-dot","?","bg-zinc-100 text-zinc-600 border-zinc-200"];
+  return `<span class="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-bold ${cls}"><i class="ph-fill ${ic}"></i>${esc(t(k))}</span>`;
+}
+function attStatusPill(s){
+  if(s==="in") return `<span class="chip !text-[10px] bg-emerald-50 text-emerald-700 border border-emerald-200"><i class="ph-fill ph-check-circle"></i>${esc(t("att.statusin"))}</span>`;
+  if(s==="out") return `<span class="chip !text-[10px] bg-zinc-100 text-zinc-600 border border-zinc-200"><i class="ph-fill ph-arrow-right"></i>${esc(t("att.statusout"))}</span>`;
+  return `<span class="chip !text-[10px] bg-rose-50 text-rose-600 border border-rose-200"><i class="ph-fill ph-clock"></i>${esc(t("att.statusaway"))}</span>`;
+}
+
+/* Attendance actions. They live in the global click dispatcher (the `actions` map), not in a
+   listener re-added on every render: those listeners stacked up, so one tap could run a
+   clock-in several times. attHooks is set by renderAttendance for the open screen. */
+let attHooks = null;
+function attErrText(e){
+  const m = String((e && (e.message || e.code)) || "");
+  if (/permission/i.test(m)) return "Your account is not allowed to read today's attendance. The principal can check this account's role in Team.";
+  return backendMessage(e) || m || "unknown error";
+}
+async function attSafe(fn){
+  try { await fn(); }
+  catch(e){ toast("error","Attendance",backendMessage(e)); }
+}
+const ATT_ACTIONS = {
+  "att-clock": el => attSafe(async()=>{
+    const kind = el.dataset.kind;
+    el.disabled = true; const old = el.innerHTML; el.innerHTML = `<span class="spinner"></span>${esc(t("att.attaching"))}`;
+    try{
+      if(ATT.hasBiometric()){ await ATT.clockWithFinger(kind); toast("success", kind==="in"?"Signed in with your fingerprint.":"Signed out.",""); }
+      else { await ATT.clockManual(kind); toast("success", kind==="in"?"Signed in.":"Signed out.",""); }
+    } finally { el.disabled = false; el.innerHTML = old; }
+    await attHooks?.repaint();
+  }),
+  "att-manual": el => attSafe(async()=>{
+    await ATT.clockManual(el.dataset.kind); toast("info","Manual sign-in recorded.",""); await attHooks?.repaint();
+  }),
+  "att-add-bio": el => attSafe(async()=>{
+    const label = prompt("Label for this device (e.g. My phone, Office laptop)","My phone");
+    if(!label) return;
+    el.disabled = true; const old = el.innerHTML; el.innerHTML = `<span class="spinner"></span>${esc(t("att.attaching"))}`;
+    try{ await ATT.registerFinger({label}); toast("success","Fingerprint saved. Future clock-ins are one tap.",""); }
+    finally { el.disabled = false; el.innerHTML = old; }
+    await attHooks?.repaint();
+  }),
+  "att-remove-bio": el => attSafe(async()=>{
+    if(!confirm(t("att.confirmremove"))) return;
+    await ATT.removeCredential(el.dataset.cid); await attHooks?.repaint();
+  }),
+  "att-add-device": () => attHooks?.addDevice(),
+  "att-revoke-device": el => attSafe(async()=>{
+    if(!confirm("Revoke this attendance device? It can no longer send clock-ins.")) return;
+    await callBackend("deviceKeyRevoke",{schoolId:Session.schoolId,deviceId:el.dataset.id});
+    toast("info","Device revoked.",""); await attHooks?.repaint();
+  }),
+  "att-print-today": () => attHooks?.print("today"),
+  "att-print-recent": () => attSafe(()=>attHooks?.print("recent")),
+  /* Principal fixes today's record for one person: sign in, sign out, or undo the last entry. */
+  "att-manage": el => attSafe(async()=>{
+    const op = el.dataset.op, uid = el.dataset.uid;
+    let note = "";
+    if(op === "undo"){
+      if(!confirm("Undo the most recent attendance record for this person today?")) return;
+    } else {
+      const n = prompt(op==="in" ? "Reason for signing them in manually (optional)" : "Reason for signing them out manually (optional)", "");
+      if(n === null) return;
+      note = n.trim();
+    }
+    el.disabled = true;
+    try{
+      await callBackend("attendanceManual",{schoolId:Session.schoolId,uid,op,note},30000);
+      toast("success", op==="undo" ? "Record undone." : "Saved.", op==="undo" ? "" : "Recorded as a manual entry.");
+    } finally { el.disabled = false; }
+    await attHooks?.repaint();
+  })
+};
+let attRenderSeq = 0;
+async function renderAttendance(){
+  const view=$("#view");
+  const myRender = ++attRenderSeq;   /* a slow older render must never paint over a newer one */
+  view.innerHTML=`<div class="space-y-4 view-in">
+    <div class="flex items-end justify-between gap-3 flex-wrap">
+      <div><div class="text-[11px] font-bold uppercase tracking-[.1em] text-violet-600">Biometric attendance</div>
+      <h2 class="font-display font-bold text-2xl sm:text-[28px] tracking-tight mt-0.5">${esc(t("route.attendance"))}</h2>
+      <p class="text-xs text-zinc-500 font-medium mt-1">${esc(t("att.wholetime"))}</p></div>
+      ${(isPrincipal()||isSuper())?`<div class="flex gap-2"><button class="btn btn-ghost" data-action="att-print-today"><i class="ph ph-printer"></i>${esc(t("att.printsheet"))}</button>
+        <button class="btn btn-ghost" data-action="att-print-recent"><i class="ph ph-calendar-check"></i>${esc(t("att.printrecent"))}</button>
+        <button class="btn btn-primary" data-action="att-add-device"><i class="ph ph-plugs-connected"></i>${esc(t("att.adddevice"))}</button></div>`:""}
+    </div>
+    <div id="att-body" class="grid lg:grid-cols-3 gap-4"><div class="lg:col-span-3 text-center text-zinc-400 text-sm py-10"><span class="spinner"></span></div></div>
+  </div>`;
+  try{ await ensureAttendance(); }catch(e){ view.querySelector("#att-body").innerHTML=`<div class="card p-6 text-rose-700">${esc(e.message||String(e))}</div>`; return; }
+
+  const canManage = isPrincipal() || isSuper();   /* same rule as the server (assertSchoolManager) */
+    const mayReadDay = canReadDayAttendance();
+  async function paint(){
+    const mine = await ATT.todayForMe().catch(()=>null);   /* offline: show "not in yet" rather than failing the screen */
+    const mineStatus = ATT.latestStatus(mine);
+    // Registering a fingerprint only makes sense on a device that can actually prompt for one.
+    const bio = ATT.hasBiometric();
+    const creds = bio ? await ATT.listCredentials() : {};
+    const mineHtml = `
+      <div class="card p-5">
+        <div class="flex items-center justify-between gap-3">
+          <div>
+            <div class="text-[11px] font-bold uppercase tracking-[.1em] text-violet-500">${esc(state.settings.schoolName||"School")}</div>
+            <h3 class="font-display font-bold text-lg mt-0.5">${esc(Session.email||"You")}</h3>
+            <p class="text-[11px] text-zinc-500">${fmtRole(Session.schoolRole)} · ${esc(t("att.today"))}</p>
+          </div>
+          ${attStatusPill(mineStatus.status)}
+        </div>
+        <div class="grid grid-cols-2 gap-2 mt-5">
+          <button class="btn btn-primary !h-12 text-[14px]" data-action="att-clock" data-kind="in" ${mineStatus.status==="in"?"disabled":""}><i class="ph-fill ph-fingerprint text-lg"></i>${esc(t("att.clockin"))}</button>
+          <button class="btn btn-ghost !h-12 text-[14px]" data-action="att-clock" data-kind="out" ${mineStatus.status!=="in"?"disabled":""}><i class="ph ph-door-open"></i>${esc(t("att.clockout"))}</button>
+        </div>
+        ${bio?`<button class="btn btn-ghost w-full mt-2 !text-[12px]" data-action="att-manual" data-kind="${mineStatus.status==="in"?"out":"in"}"><i class="ph ph-hand-pointing"></i>${esc(t("att.manualnote"))}</button>`
+            :`<div class="mt-3 rounded-xl p-3 text-[11px] leading-relaxed text-amber-800 bg-amber-50 border border-amber-200 flex items-start gap-2"><i class="ph-fill ph-warning text-amber-500 mt-0.5 flex-none"></i><span>${esc(t("att.nobio"))}</span></div>`}
+        <div class="mt-5 pt-4 border-t border-zinc-100">
+          <div class="flex items-center justify-between mb-2"><b class="text-[13px]">${esc(t("att.registered"))}</b>
+            ${bio?`<button class="btn btn-ghost !h-8 !px-3 !text-[11px]" data-action="att-add-bio"><i class="ph ph-plus"></i>${esc(t("att.addbio"))}</button>`:""}</div>
+          ${bio?(Object.keys(creds).length?`<div class="space-y-2">${Object.entries(creds).map(([cid,c])=>`
+            <div class="flex items-center justify-between gap-2 rounded-xl border border-zinc-200 p-2.5">
+              <div class="min-w-0">
+                <div class="font-semibold text-[13px] truncate"><i class="ph-fill ph-fingerprint text-violet-500 mr-1"></i>${esc(c.label||"Phone")}</div>
+                <div class="text-[10px] text-zinc-500">${esc(t("att.registeredon"))} ${ATT.fmtWhen(c.createdAt)} · ${esc(t("att.lastused"))} ${c.lastUsedAt?ATT.fmtWhen(c.lastUsedAt):"—"}</div>
+              </div>
+              <button class="btn btn-ghost !h-8 !w-8 !px-0" data-action="att-remove-bio" data-cid="${esc(cid)}" title="${esc(t("att.removebio"))}"><i class="ph ph-trash"></i></button>
+            </div>`).join("")}</div>`
+            :`<p class="text-[11px] text-zinc-500 leading-relaxed rounded-xl bg-zinc-50 border border-zinc-200 p-3">${esc(t("att.noregistered"))}</p>`):""}
+        </div>
+        <p class="text-[10px] text-zinc-400 mt-3 leading-relaxed">${esc(t("att.fingerdesc"))}</p>
+      </div>`;
+
+    let schoolHtml="";
+    if(mayReadDay){
+      /* A failed read (offline, or rules changed) must not blank the whole screen: the
+         device card below still has to render so the principal can fix the setup. */
+      const data = await ATT.todayForSchool().catch(e=>({ day:null, members:{}, loadErr: attErrText(e) }));
+      const day = data.day;
+      const members = data.members;
+      const rows = Object.entries(members).filter(([uid,m])=>m && m.active && (m.role==="teacher"||m.role==="staff"||m.role==="admin"||m.role==="principal"))
+        .map(([uid,m])=>{
+          const me = day?.byMember?.[uid];
+          const s = ATT.latestStatus(me);
+          return { uid, m, s, me };
+        }).sort((a,b)=>{
+          const o={in:0,out:1,away:2};
+          if(o[a.s.status]!==o[b.s.status]) return o[a.s.status]-o[b.s.status];
+          return (a.m.name||"").localeCompare(b.m.name||"");
+        });
+      const counts = rows.reduce((o,r)=>{o[r.s.status]=(o[r.s.status]||0)+1;return o;},{in:0,out:0,away:0});
+      schoolHtml = `<div class="lg:col-span-2 space-y-4">
+        <div class="grid sm:grid-cols-3 gap-3">
+          <div class="card p-4"><div class="text-[10px] font-bold uppercase text-emerald-600 tracking-wider">${esc(t("att.in"))}</div><div class="text-2xl font-extrabold mt-1">${counts.in}</div><div class="text-[11px] text-zinc-500">${esc(t("att.live"))}</div></div>
+          <div class="card p-4"><div class="text-[10px] font-bold uppercase text-zinc-500 tracking-wider">${esc(t("att.out"))}</div><div class="text-2xl font-extrabold mt-1">${counts.out}</div><div class="text-[11px] text-zinc-500">${esc(t("att.statusout"))}</div></div>
+          <div class="card p-4"><div class="text-[10px] font-bold uppercase text-rose-500 tracking-wider">${esc(t("att.away"))}</div><div class="text-2xl font-extrabold mt-1">${counts.away}</div><div class="text-[11px] text-zinc-500">${esc(t("att.statusaway"))}</div></div>
+        </div>
+        <div class="card p-0 overflow-hidden" id="att-print-today">
+          <div class="p-4 border-b border-zinc-100 flex items-center justify-between">
+            <div><h3 class="font-bold text-[15px]">${esc(state.settings.schoolName||"School")} · ${esc(t("att.today"))} ${ATT.todayKey()}</h3>
+              <p class="text-[11px] text-zinc-500">${esc(t("att.wholetime"))}</p></div>
+            <span class="text-[10px] text-zinc-400">${rows.length} staff</span>
+          </div>
+          <div class="overflow-x-auto">
+          <table class="w-full text-[13px]">
+            <thead class="bg-zinc-50 text-[11px] uppercase tracking-wider text-zinc-500"><tr>
+              <th class="text-left p-3">Name</th><th class="text-left p-3">Role</th><th class="text-left p-3">Status</th>
+              <th class="text-left p-3">In</th><th class="text-left p-3">Out</th><th class="text-left p-3">Device</th>${canManage?'<th class="text-left p-3">Manage</th>':""}
+            </tr></thead>
+            <tbody>
+              ${rows.map(r=>`<tr class="border-t border-zinc-100 hover:bg-zinc-50/60">
+                <td class="p-3 font-medium">${esc(r.m.name||r.m.email||r.uid)}</td>
+                <td class="p-3 text-zinc-500">${esc(fmtRole(r.m.role))}</td>
+                <td class="p-3">${attStatusPill(r.s.status)}</td>
+                <td class="p-3 tabular-nums">${r.s.inAt?ATT.fmtClock(r.s.inAt):"—"}</td>
+                <td class="p-3 tabular-nums">${r.s.outAt?ATT.fmtClock(r.s.outAt):"—"}</td>
+                <td class="p-3">${r.s.method?attMethodChip(r.s.method):'<span class="text-zinc-300 text-[10px]">—</span>'}${r.s.note?`<div class="text-[10px] text-zinc-500 mt-0.5">${esc(r.s.note)}</div>`:""}</td>
+                ${canManage?`<td class="p-3"><div class="flex gap-1 whitespace-nowrap">
+                  <button class="btn btn-ghost !h-7 !px-2 !text-[11px]" data-action="att-manage" data-op="in" data-uid="${esc(r.uid)}" ${r.s.status==="in"?"disabled":""}>In</button>
+                  <button class="btn btn-ghost !h-7 !px-2 !text-[11px]" data-action="att-manage" data-op="out" data-uid="${esc(r.uid)}" ${r.s.status!=="in"?"disabled":""}>Out</button>
+                  <button class="btn btn-ghost !h-7 !px-2 !text-[11px] text-rose-600" data-action="att-manage" data-op="undo" data-uid="${esc(r.uid)}" ${r.me?.events?"":"disabled"} title="Undo the last record"><i class="ph ph-arrow-counter-clockwise"></i></button>
+                </div></td>`:""}
+              </tr>`).join("")}
+            </tbody>
+          </table>
+          </div>
+        </div>
+        ${await renderAttendanceDevices()}
+      </div>`;
+      if(data.loadErr) schoolHtml = `<div class="lg:col-span-2 rounded-xl border border-rose-200 bg-rose-50 p-3 text-[12px] text-rose-800">Today's attendance could not load: ${esc(data.loadErr)}</div>` + schoolHtml;
+    } else schoolHtml=`<div class="lg:col-span-2"></div>`;
+
+    if(myRender !== attRenderSeq) return;
+    view.querySelector("#att-body").innerHTML = mineHtml + schoolHtml;
+  }
+
+  attHooks = { repaint: paint, addDevice: openAddDevice, print: printSheet };
+
+  async function renderAttendanceDevices(){
+    if(!canManage) return "";
+    let devs=[], loadErr="";
+    try{ const r = await callBackend("deviceKeyList",{schoolId:Session.schoolId}); devs=r.devices||[]; }
+    catch(e){ loadErr=backendMessage(e)||"unknown error"; }
+    if(loadErr) return `<div class="card p-5">
+      <h3 class="font-bold text-[15px]"><i class="ph-fill ph-plugs-connected text-sky-500 mr-1"></i>${esc(t("att.devices"))}</h3>
+      <div class="mt-3 rounded-xl border border-rose-200 bg-rose-50 p-3 text-[12px] text-rose-800 leading-relaxed">
+        <b>Attendance devices could not load.</b> ${esc(loadErr)}
+        <div class="mt-1 text-[11px] text-rose-700/80">If this is a new setup, the server functions must be deployed once: <code class="font-mono">firebase deploy --only functions</code>.</div>
+      </div>
+    </div>`;
+    return `<div class="card p-5">
+      <div class="flex items-center justify-between"><h3 class="font-bold text-[15px]"><i class="ph-fill ph-plugs-connected text-sky-500 mr-1"></i>${esc(t("att.devices"))}</h3>
+        <button class="btn btn-ghost !h-8 !px-3 !text-[11px]" data-action="att-add-device"><i class="ph ph-plus"></i>${esc(t("att.adddevice"))}</button></div>
+      <p class="text-[11px] text-zinc-500 mt-1 leading-relaxed">${esc(t("att.adddevicedesc"))}</p>
+      ${devs.length?`<div class="mt-3 space-y-2">${devs.map(d=>`
+        <div class="rounded-xl border border-zinc-200 p-2.5 flex items-center justify-between gap-2">
+          <div class="min-w-0"><div class="font-semibold text-[13px] truncate">${esc(d.label)}</div>
+            <div class="text-[10px] text-zinc-500">${d.active?'<span class="text-emerald-600 font-bold">Active</span>':'<span class="text-rose-500 font-bold">Revoked</span>'} · created ${ATT.fmtWhen(d.createdAt)} · last seen ${d.lastSeenAt?ATT.fmtWhen(d.lastSeenAt):"—"}</div></div>
+          ${d.active?`<button class="btn btn-ghost !h-8 !px-2 text-rose-600" data-action="att-revoke-device" data-id="${esc(d.deviceId)}"><i class="ph ph-prohibit"></i>${esc(t("att.revoke"))}</button>`:""}
+        </div>`).join("")}</div>`
+        :`<p class="text-[11px] text-zinc-500 mt-3 rounded-xl bg-zinc-50 border border-dashed border-zinc-200 p-3 text-center">${esc(t("att.nokeys"))}</p>`}
+      <div class="mt-4 rounded-xl bg-sky-50 border border-sky-200 p-3 text-[11px] text-sky-900/80 leading-relaxed">
+        <b><i class="ph-fill ph-info text-sky-500 mr-1"></i>For a USB fingerprint reader or wall scanner:</b> create a device key above, then set the machine (or its companion app on a PC at reception) to send each clock-in to this address. Clock-ins appear in this live list.
+        <div class="mt-2">${deviceSetupHtml()}</div>
+      </div>
+    </div>`;
+  }
+
+  function openAddDevice(){
+    Modal.open({
+      title:t("att.adddevice"),
+      body:`<div class="space-y-3">
+        <label class="label">Label</label>
+        <input class="field" id="att-dev-label" placeholder="Reception scanner" value="Reception scanner">
+        <p class="text-[11px] text-zinc-500 leading-relaxed">${esc(t("att.adddevicedesc"))}</p>
+      </div>`,
+      actions:[
+        {label:"Cancel",kind:"ghost",action:()=>Modal.close()},
+        {label:"Create key",kind:"primary",action:async()=>{
+          const label=$("#att-dev-label").value||"Reception scanner";
+          const r = await callBackend("deviceKeyCreate",{schoolId:Session.schoolId,label});
+          Modal.close();
+          Modal.open({
+            title:"Device key created",
+            body:`<div class="space-y-3">
+              <p class="text-xs text-zinc-600 leading-relaxed">Copy this key now — it is shown exactly once and cannot be recovered.</p>
+              <textarea class="field font-mono !text-[11px] h-28" readonly id="att-dev-key">${esc(r.key)}</textarea>
+              <p class="text-[11px] text-zinc-500">Device id: <code class="font-mono">${esc(r.deviceId)}</code></p>
+              <div class="rounded-xl bg-sky-50 border border-sky-200 p-3">${deviceSetupHtml()}</div>
+            </div>`,
+            actions:[
+              {label:"Copy",kind:"primary",action:()=>{
+                navigator.clipboard?.writeText(r.key).catch(()=>{});
+                toast("success",t("att.keycopied"),"");
+                Modal.close();
+                paint();
+              }}
+            ]
+          });
+        }}
+      ]
+    });
+  }
+
+  function printSheet(which){
+    const node=view.querySelector("#att-print-today");
+    if(!node) return;
+    const win=window.open("","_blank","width=900,height=700");
+    const title = state.settings.schoolName+" · Attendance · "+ATT.todayKey();
+    win.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>${esc(title)}</title>
+      <style>
+        body{font:12px/1.45 Inter,system-ui,sans-serif;color:#18181b;padding:24px}
+        h1{font-size:18px;margin:0 0 4px} .muted{color:#71717a;font-size:11px;margin-bottom:16px}
+        table{width:100%;border-collapse:collapse} th,td{border-bottom:1px solid #e4e4e7;padding:8px 10px;text-align:left;font-size:12px}
+        th{background:#fafafa;font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:#71717a}
+        .pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:10px;font-weight:700}
+        .in{background:#dcfce7;color:#15803d} .out{background:#f4f4f5;color:#52525b} .away{background:#ffe4e6;color:#be123c}
+        @media print{body{padding:8mm} .noprint{display:none}}
+      </style></head><body>
+      <h1>${esc(state.settings.schoolName||"School")}</h1>
+      <div class="muted">${which==="recent"?"Last 14 days":"Today"} · ${ATT.todayKey()}</div>
+      ${node.querySelector("table").outerHTML}
+      <${"script"}>window.onload=()=>setTimeout(()=>window.print(),300);</${"script"}>
+      </body></html>`);
+    win.document.close();
+  }
+
+  paint().catch(e=>{ view.querySelector("#att-body").innerHTML=`<div class="card p-6 text-rose-700">${esc(e.message||String(e))}</div>`; });
+}
+
+/* =================================================================================
+   FIND — universal search + AI answers
+   ================================================================================= */
+let findPromise=null;
+let assistantPromise=null;
+function ensureAssistant(){
+  if(window.Assistant) return Promise.resolve(Assistant);
+  if(assistantPromise) return assistantPromise;
+  assistantPromise=loadScriptOnce("vendor/assistant.js",()=>typeof window.Assistant!=="undefined").then(()=>Assistant);
+  return assistantPromise;
+}
+function ensureFind(){
+  if(window.Find) return Promise.resolve(Find);
+  if(findPromise) return findPromise;
+  findPromise=loadScriptOnce("vendor/find.js",()=>typeof window.Find!=="undefined").then(()=>Find);
+  return findPromise;
+}
+let _findAttUnsub=null;
+function findStopAttendance(){ if(_findAttUnsub){ _findAttUnsub(); _findAttUnsub=null; } }
+function findListenAttendance(){
+  if(!Session.schoolId||!FB.ready||!canReadDayAttendance()){ findStopAttendance(); return; }
+  if(_findAttUnsub) return;
+  state._attendance = state._attendance || {};
+  const today = new Date(); today.setHours(0,0,0,0);
+  const keys=[]; for(let i=0;i<14;i++){ keys.push(schoolDayKey(new Date(Date.now()-i*86400000))); }
+  const refs = keys.map(k=>FB.db.ref(`schools/${Session.schoolId}/attendance/${k}`));
+  const onVal = snap=>{ if(window.Find){ Find.refresh(); if(Store.raw.ui.route==="find" && !document.getElementById("find-q")?.matches(":focus")) renderFindResults(); } };
+  refs.forEach(r=>r.on("value", snap=>{ state._attendance[snap.key]=snap.val()||null; onVal(); }));
+  _findAttUnsub = ()=>refs.forEach(r=>r.off("value"));
+}
+function kindChip(kind){
+  const map={teacher:["ph-user","find.teacher","bg-emerald-50 text-emerald-700 border-emerald-200"],
+             subject:["ph-book-open","find.subject","bg-indigo-50 text-indigo-700 border-indigo-200"],
+             class:["ph-chalkboard-teacher","find.class","bg-sky-50 text-sky-700 border-sky-200"],
+             slot:["ph-clock","find.slot","bg-zinc-50 text-zinc-700 border-zinc-200"],
+             attendance:["ph-fingerprint","find.attendance","bg-violet-50 text-violet-700 border-violet-200"],
+             member:["ph-user-circle","find.member","bg-amber-50 text-amber-700 border-amber-200"],
+             sheet:["ph-file-spreadsheet","find.sheet","bg-rose-50 text-rose-700 border-rose-200"],
+             database:["ph-database","route.database","bg-zinc-50 text-zinc-700 border-zinc-200"]};
+  const [ic,key,cls] = map[kind]||["ph-dot","?","bg-zinc-100 text-zinc-600"];
+  return `<span class="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-bold ${cls}"><i class="ph-fill ${ic}"></i>${esc(t(key))}</span>`;
+}
+function renderFindResults(){
+  const box=$("#find-results"); if(!box) return;
+  if(!window.Find){ box.innerHTML=`<div class="text-center py-6 text-zinc-400 text-sm"><span class="spinner"></span></div>`; return; }
+  const q=$("#find-q")?.value||"";
+  if(!q.trim()){ box.innerHTML = `<div class="text-center text-zinc-400 text-sm py-10"><i class="ph ph-magnifying-glass text-3xl block mb-2 text-zinc-300"></i>${esc(t("find.placeholder"))}</div>`; return; }
+  const hits = Find.search(q, 80);
+  if(!hits.length){ box.innerHTML = `<div class="card p-6 text-center text-zinc-500 text-sm"><i class="ph ph-warning-circle text-rose-400 text-2xl block mb-2"></i>${esc(t("find.nohits"))}</div>`; return; }
+  box.innerHTML = `<div class="text-[11px] font-bold uppercase tracking-wider text-zinc-400 mb-2">${esc(t("find.results"))} · ${hits.length}</div>
+    <div class="space-y-2">${hits.slice(0,40).map(h=>`
+      <button class="w-full text-left card p-3 hover:border-emerald-300 hover:bg-emerald-50/30 transition-colors" data-action="find-jump" data-kind="${esc(h.kind)}" data-id="${esc(h.id||"")}" data-source="${esc(h.sourceId||"")}">
+        <div class="flex items-center gap-2 mb-1">${kindChip(h.kind)}<span class="text-[10px] text-zinc-400 font-semibold">${esc(h.sourceLabel||"")}</span></div>
+        <div class="font-bold text-[14px] truncate">${esc(h.title||"")}</div>
+        <div class="text-[12px] text-zinc-500 line-clamp-2">${esc(h.body||"")}</div>
+      </button>`).join("")}</div>`;
+}
+let findSyncing = false;
+async function renderFind(){
+  await Promise.allSettled([ensureFind(), ensureAssistant()]);   /* offline first-load must not blank the screen */
+  configureFindCloud();
+  const view=$("#view");
+  const online=navigator.onLine;
+  view.innerHTML=`<div class="space-y-5 view-in">
+    <div class="relative overflow-hidden rounded-3xl p-5 sm:p-7 text-white shadow-xl" style="background:linear-gradient(135deg,var(--brand,#4f46e5),#7c3aed 60%,#db2777)">
+      <div class="absolute -right-10 -top-10 w-44 h-44 rounded-full bg-white/10 blur-2xl"></div>
+      <div class="relative">
+        <div class="text-[11px] font-bold uppercase tracking-[.14em] opacity-80">CampusFlow Find</div>
+        <h2 class="font-display font-bold text-2xl sm:text-[30px] tracking-tight mt-1">Ask anything about your school</h2>
+        <p class="text-[13px] opacity-90 mt-1 max-w-xl">Teachers, classes, lessons, attendance and linked sheets, in one place. Works offline with your saved data.</p>
+        <div class="mt-4 flex items-center gap-2 bg-white rounded-2xl p-2 shadow-lg text-zinc-800">
+          <i class="ph ph-magnifying-glass text-zinc-400 text-xl pl-2"></i>
+          <input id="find-q" class="flex-1 !border-0 !ring-0 !bg-transparent !shadow-none !pl-0 text-[15px] font-medium" placeholder="${esc(t("find.placeholder"))}" autocomplete="off" autofocus>
+          <button class="btn btn-primary !h-10 !px-4 !rounded-xl" data-action="find-go"><i class="ph-bold ph-arrow-right"></i></button>
+        </div>
+        <div class="mt-3 flex flex-wrap gap-1.5 text-[11px]">
+          ${["Who is free period 3 Wednesday?","Who teaches Maths?","Where is Grade 10A on Monday?","Who is in today?"].map(s=>`<button class="px-2.5 py-1 rounded-full bg-white/15 hover:bg-white/25 font-semibold" data-action="find-example" data-q="${esc(s)}">${esc(s)}</button>`).join("")}
+        </div>
+        ${online?"":`<div class="mt-3 inline-flex items-center gap-1.5 text-[11px] font-bold bg-amber-300/90 text-amber-950 px-2.5 py-1 rounded-full"><i class="ph-fill ph-wifi-slash"></i>Offline: searching saved data. Sheet refresh needs internet.</div>`}
+      </div>
+    </div>
+    <div id="find-ai"></div>
+    <div class="grid lg:grid-cols-3 gap-4">
+      <div id="find-results" class="lg:col-span-2 space-y-2"></div>
+      <div class="space-y-4">
+        <div class="card p-4">
+          <h3 class="font-bold text-[14px] mb-1 flex items-center gap-2"><i class="ph-fill ph-database text-indigo-500"></i>${esc(t("find.datasources"))}</h3>
+          <p class="text-[11px] text-zinc-500 leading-relaxed">${esc(t("find.addsheetdesc"))}</p>
+          <button class="btn btn-ghost w-full mt-3 !text-[12px]" data-action="find-add-source"><i class="ph ph-plus"></i>${esc(t("find.addsheet"))}</button>
+          <div id="find-sources" class="mt-3 space-y-2"></div>
+        </div>
+        <div class="card p-4 text-[11px] text-zinc-500 leading-relaxed flex items-start gap-2">
+          <i class="ph-fill ph-shield-check text-emerald-500 mt-0.5 flex-none"></i>
+          <span>Answers come only from your school's own data on this device. Nothing is sent to any AI service, and there are no keys to set up.</span>
+        </div>
+      </div>
+    </div>
+  </div>`;
+  renderFindResults();
+  renderFindSources();
+  findListenAttendance();
+
+  const q=$("#find-q");
+  let tmr=null;
+  q.addEventListener("input",()=>{ clearTimeout(tmr); tmr=setTimeout(()=>{ renderFindResults(); renderAnswer(q.value); },150); });
+  q.addEventListener("keydown",e=>{ if(e.key==="Enter"){ e.preventDefault(); renderAnswer(q.value,true); } });
+  q.focus();
+
+  if(view._findClick) view.removeEventListener("click",view._findClick);
+  view._findClick=findHandler;
+  view.addEventListener("click",findHandler);
+  function findHandler(ev){
+    if(!document.getElementById("find-q")) return;      /* not on the Find screen */
+    const b=ev.target.closest("[data-action]");
+    if(!b) return;
+    const a=b.dataset.action;
+    if(a==="find-go"){ renderAnswer(q.value,true); }
+    else if(a==="find-example"){ q.value=b.dataset.q; renderAnswer(q.value,true); renderFindResults(); }
+    else if(a==="find-add-source"){ openAddSource(); }
+    else if(a==="find-refresh"){ refreshSource(b.dataset.id); }
+    else if(a==="find-remove"){ removeSourceUi(b.dataset.id); }
+    else if(a==="find-jump"){ jumpTo(b.dataset); }
+    else if(a==="find-ask-chip"){ renderAnswer(b.dataset.q,true); }
+  }
+
+  function renderAnswer(text,force){
+    const out=$("#find-ai");
+    const qq=(text||"").trim();
+    if(!out) return;
+    if(!qq){ out.innerHTML=""; return; }
+    // Live card only for real questions; Enter / arrow always answers.
+    const looksLikeQuestion = /\?\s*$|^(who|what|where|when|which|how|is|are|does|do|list|show|count|ගුරු|කවුද|எங்கே|யார்)\b/i.test(qq);
+    if(!force && !looksLikeQuestion){ out.innerHTML=""; return; }
+    let r;
+    try{ r = Assistant.answer(qq); }catch(e){ r={text:"Something went wrong reading your data. Try a simpler question.",sources:[]}; }
+    const lines=(r.text||"").split("\n").map(l=>`<div class="leading-relaxed">${esc(l)}</div>`).join("");
+    out.innerHTML=`<div class="card p-5 !border-indigo-200 bg-gradient-to-br from-white to-indigo-50/60 view-in">
+      <div class="flex items-center gap-2 mb-2"><span class="w-7 h-7 rounded-xl grid place-items-center text-white" style="background:linear-gradient(135deg,#4f46e5,#db2777)"><i class="ph-fill ph-sparkle text-[14px]"></i></span>
+        <span class="text-[12px] font-bold text-indigo-700">CampusFlow answer</span><span class="ml-auto text-[10px] text-zinc-400 font-semibold">${online?"":"offline · "}from your data</span></div>
+      <div class="text-[14px] text-zinc-800 space-y-1">${lines}</div>
+      ${r.sources&&r.sources.length?`<div class="mt-3 pt-3 border-t border-indigo-100 flex flex-wrap gap-1.5">${r.sources.slice(0,8).map(s=>`<button class="chip !text-[11px] hover:bg-white" data-action="find-jump" data-kind="${esc(s.kind||"")}" data-id="${esc(String(s.id||""))}" data-title="${esc(s.title||"")}">${kindChip(s.kind)} ${esc(s.title||"")}</button>`).join("")}</div>`:""}
+    </div>`;
+  }
+  // Server-backed sheets: the first import saves the CSV to Firebase; every device then
+  // caches it locally, so searches are instant and work offline.
+  function configureFindCloud(){
+    if(!window.Find || !Session.schoolId) return;
+    const sid = Session.schoolId;
+    Find.configure({
+      importSheet:(label,url)=>callBackend("findSheetImport",{schoolId:sid,label,url},60000),
+      removeSheet:id=>callBackend("findSheetRemove",{schoolId:sid,id},20000),
+      readCloud:async()=>{ const s=await FB.db.ref(`schools/${sid}/findSources`).once("value"); return s.val()||{}; }
+    });
+    if(!FB.ready || findSyncing) return;
+    findSyncing = true;
+    Find.syncFromCloud().then(n=>{
+      if(n){ Find.refresh(); if(Store.raw.ui.route==="find"){ renderFindSources(); renderFindResults(); } }
+    }).catch(e=>console.warn("[Find] sheet sync skipped", e && e.message)).finally(()=>{ findSyncing=false; });
+  }
+  function openAddSource(){
+    Modal.open({
+      title:t("find.addsheet"),
+      body:`<div class="space-y-3">
+        <div><label class="label">${esc(t("find.label"))}</label><input class="field" id="find-src-label" placeholder="Grade 10 term marks"></div>
+        <div><label class="label">${esc(t("find.url"))}</label><input class="field font-mono !text-xs" id="find-src-url" placeholder="https://docs.google.com/spreadsheets/d/..."></div>
+        <p class="text-[11px] text-zinc-500 leading-relaxed">${esc(t("find.addsheetdesc"))}</p>
+      </div>`,
+      actions:[
+        {label:"Cancel",kind:"ghost",action:()=>Modal.close()},
+        {label:"Add & fetch",kind:"primary",action:async()=>{
+          const label=$("#find-src-label").value.trim(); const url=$("#find-src-url").value.trim();
+          if(!url || !Find.sheetExportUrl(url)){ toast("error","Missing link","Paste a Google Sheets link (sharing set to 'Anyone with the link can view')."); throw 0; }
+          Modal.close();
+          await sheetImportUi(label||"Sheet", url);
+        }}
+      ]
+    });
+  }
+  async function sheetImportUi(label,url){
+    toast("info","Loading sheet…","Saving it once for everyone in your school. Searches will be instant after this.");
+    try{
+      const src = await Find.importSheet(label,url);
+      Find.refresh();
+      renderFindSources();
+      renderFindResults();
+      toast("success","Sheet saved",(Math.max(0,(src.rows||[]).length-1))+" "+t("find.fetched"));
+    }catch(e){
+      toast("error","Could not load sheet",(e&&e.message)||"Try again in a minute.");
+    }
+  }
+  async function refreshSource(id){ const s=Find.sources().find(x=>x.id===id); if(s) await sheetImportUi(s.label,s.url); }
+  async function removeSourceUi(id){ if(!confirm("Remove this sheet from Find?")) return; Find.removeSource(id); Find.refresh(); renderFindSources(); renderFindResults(); }
+
+  function renderFindSources(){
+    const wrap=$("#find-sources"); if(!wrap) return;
+    const list=Find.sources();
+    if(!list.length){ wrap.innerHTML=`<p class="text-[11px] text-zinc-500 rounded-xl bg-zinc-50 border border-dashed border-zinc-200 p-3 text-center">${esc(t("find.nosources"))}</p>`; return; }
+    wrap.innerHTML=list.map(s=>{
+      const n = s.rows?Math.max(0,s.rows.length-1):0;
+      return `<div class="rounded-xl border border-zinc-200 p-2.5 text-[12px]" data-source-card="${s.id}">
+        <div class="flex items-center gap-2"><i class="ph-fill ph-file-spreadsheet text-rose-500 text-base"></i>
+          <div class="flex-1 min-w-0"><div class="font-bold truncate">${esc(s.label)}</div>
+            <div class="text-[10px] text-zinc-500 font-mono truncate">${esc(s.url)}</div></div>
+          <button class="icon-btn !w-8 !h-8" data-action="find-refresh" data-id="${s.id}" title="${esc(t("find.refresh"))}"><i class="ph ph-arrows-clockwise"></i></button>
+          <button class="icon-btn !w-8 !h-8 text-rose-500" data-action="find-remove" data-id="${s.id}" title="${esc(t("find.remove"))}"><i class="ph ph-trash"></i></button>
+        </div>
+        <div class="src-status text-[10px] mt-1 ${s.error?"text-rose-500":"text-zinc-500"}">${s.error?esc(t("find.fetcherr"))+" — "+esc(s.error):(n?n+" "+t("find.fetched")+(s.fetchedAt?" · "+new Date(s.fetchedAt).toLocaleString():""):"—")}</div>
+      </div>`;
+    }).join("");
+  }
+}
+
+function jumpTo(info){
+  const k=info.kind, id=info.id, src=info.source||info.title;
+  if(k==="teacher"||k==="member"){ Store.raw.ui.dbTab="teachers"; Store.raw.ui.route="database"; }
+  else if(k==="subject"){ Store.raw.ui.dbTab="subjects"; Store.raw.ui.route="database"; }
+  else if(k==="class"){ Store.raw.ui.route="timetable"; Store.raw.ui.activeClassId=id; }
+  else if(k==="slot"){ const [cid,ds,ps,lis]=id.split("|"); Store.raw.ui.route="timetable"; Store.raw.ui.activeClassId=cid; setTimeout(()=>openCellViewer(cid,+ds,+ps),150); return; }
+  else if(k==="attendance"){ Store.raw.ui.route="attendance"; }
+  else if(k==="database"){ Store.raw.ui.route="database"; if(id==="teachers"||id==="subjects") Store.raw.ui.dbTab=id; }
+  else if(k==="sheet"){ toast("info","From sheet: "+(src||info.title||""),"Open your linked sheet in the right panel."); return; }
+  else Store.raw.ui.route="dashboard";
+  Store.flush(); Store.requestRender(); Modal.close();
+}
+
+/* =================================================================================
+   CHROME / NAV / REFRESH
+   ================================================================================= */
+const ROUTES={
+  admin:    { title:"Schools",       icon:"ph-buildings",      tab:"Schools"  },
+  dashboard:{ title:"Dashboard",     icon:"ph-squares-four",   tab:"Home"     },
+  timetable:{ title:"Timetable",     icon:"ph-calendar-dots",  tab:"Timings"  },
+  relief:   { title:"Relief Center", icon:"ph-user-switch",    tab:"Relief"   },
+  team:     { title:"Team",          icon:"ph-users-three",    tab:"Team"     },
+  database: { title:"Database",      icon:"ph-database",       tab:"Data"     },
+  print:    { title:"Print Center",  icon:"ph-printer",        tab:"Print"    },
+  scanner:  { title:"Scanner",       icon:"ph-scan",           tab:"Scan"     },
+  attendance:{ title:"Attendance",   icon:"ph-fingerprint",    tab:"Attendance" },
+  find:     { title:"Find",          icon:"ph-magnifying-glass", tab:"Find"   },
+  marketing:{ title:"Marketing Studio", icon:"ph-megaphone",  tab:"Promote"  }
+};
+function allowedRoutes(){
+  if (isSuper()) return Session.schoolId ? Object.keys(ROUTES) : ["admin","marketing"];
+  const r=["dashboard","timetable","relief","database","print","attendance","find"];
+  if (canViewUsers()) r.splice(3,0,"team");
+  if (canEdit()) r.splice(r.indexOf("database")+1,0,"scanner");
+  return r;
+}
+function navModel(){
+  const r=allowedRoutes();
+  if (isSuper() && Session.schoolId) return { side:["admin",...r.filter(x=>x!=="admin")], tabs:["admin","dashboard","timetable","attendance","find","marketing","database"] };
+  if (isSuper()) return { side:["admin","marketing"], tabs:["admin","marketing"] };
+  const tabs=(()=>{
+    const base=["dashboard","timetable","relief"];
+    if(r.includes("scanner")&&r.includes("team")) base.push("scanner");
+    else if(r.includes("scanner")) base.push("scanner");
+    base.push("attendance","find");
+    if(r.includes("team")) base.push("team");
+    base.push("database");
+    if(base.length>6) return base.slice(0,5).concat(["database"]); // tab bar real estate
+    return base;
+  })();
+  return { side:r, tabs };
+}
+function renderNav(){
+  const {side,tabs}=navModel();
+  const r=Store.raw.ui.route;
+  $("#side-nav").innerHTML=
+    (isSuper()&&Session.schoolId?`<div class="px-3 pt-1 pb-2 text-[10px] font-extrabold uppercase tracking-[.12em] text-zinc-400">Platform</div>`:"")+
+    side.map(id=>{
+      const R=ROUTES[id];
+      const label=id==="admin"&&Session.schoolId?"‹ "+t("route.admin"):(t("route."+id)||R.title);
+      return `${isSuper()&&Session.schoolId&&id==="dashboard"?`<div class="px-3 pt-3 pb-2 text-[10px] font-extrabold uppercase tracking-[.12em] text-zinc-400">${esc(state.settings.schoolName||"School")}</div>`:""}
+      <button class="nav-item ${r===id?"active":""}" data-action="nav" data-route="${id}"><i class="ph ${R.icon} text-lg"></i>${label}</button>`;
+    }).join("");
+  const grid=$("#tabbar-grid");
+  grid.className="grid mx-auto";
+  /* Each tab keeps at least 72px; with many tabs the bar scrolls sideways (see shell.css). */
+  grid.style.gridTemplateColumns=`repeat(${tabs.length},minmax(72px,1fr))`;
+  grid.style.minWidth=`${tabs.length*72}px`;
+  grid.innerHTML=tabs.map(id=>{ const R=ROUTES[id];
+    return `<button class="tab-item ${r===id?"active":""}" data-action="nav" data-route="${id}"><i class="ph ${R.icon}"></i><span class="truncate max-w-full px-0.5">${id==="admin"&&Session.schoolId?t("tab.admin"):(t("tab."+id)||R.tab)}</span></button>`; }).join("");
+  /* On a scrolling phone tab bar, keep the current tab visible. */
+  grid.querySelector(".tab-item.active")?.scrollIntoView?.({inline:"nearest",block:"nearest"});
+  $("#sidebar-footnote").innerHTML=
+    langSwitcher("w-full !flex mb-2")+
+    (isSuper() && !Session.schoolId
+    ? `<button class="btn btn-ghost w-full" data-action="sign-out"><i class="ph ph-sign-out"></i>${t("act.signout")}</button>`
+    : `<div class="card !rounded-xl p-3.5 bg-gradient-to-br from-emerald-50/80 to-teal-50/60 !border-emerald-100">
+        <div class="flex items-center gap-2 text-emerald-700 text-xs font-bold"><i class="ph-fill ph-lightning"></i>Local-first · cloud-synced</div>
+        <p class="text-[11px] leading-relaxed text-emerald-900/60 mt-1">Every change saves offline instantly and syncs when connected.</p>
+      </div>
+      ${deferredInstall?`<button class="btn btn-ghost w-full mt-2" data-action="install-app"><i class="ph ph-download-simple"></i>Install app</button>`:""}`);
+}
+function updateChrome(conf){
+  const r=Store.raw.ui.route;
+  const titleEl=$("#hdr-title"), subEl=$("#hdr-sub");
+  titleEl.textContent=t("route."+r)||(ROUTES[r]?.title)||"CampusFlow";
+  subEl.textContent=Session.schoolId
+    ? `${state.settings.schoolName} · ${fmtRole(Session.schoolRole)}${isSuper()?" (platform)":""} · ${fmtDateLong(localISO())}`
+    : "Platform administration";
+  /* Adaptive header sizing: long names shrink the type instead of being cut to dots. */
+  if(typeof updateHeaderName==="function") updateHeaderName();
+  $("#sidebar-school").textContent=Session.schoolId ? state.settings.schoolName : "Platform admin";
+  const logo=state.settings.logo;
+  ["brand-tile","brand-tile-m"].forEach(id=>{ const el=document.getElementById(id); if(!el) return;
+    el.innerHTML=logo?`<img class="logo-img" src="${logo}" alt="">`:`<i class="ph-fill ph-graduation-cap ${id==="brand-tile"?"text-2xl":"text-xl"}"></i>`; });
+  $("#hdr-conflict").innerHTML=(Session.schoolId && conf.count)
+    ? `<button class="flex items-center gap-1.5 h-8 px-3 rounded-full bg-rose-50 border border-rose-200 text-rose-600 text-[11px] font-bold hover:bg-rose-100 transition-colors" data-action="nav" data-route="timetable">
+        <i class="ph-fill ph-warning-octagon"></i><span class="tabular-nums">${conf.count}</span></button>` : "";
+  renderNav();
+  renderSyncPill();
+  if (typeof updateUndoBtn==="function") updateUndoBtn();
+}
+function refresh(){
+  const ae=document.activeElement;
+  const fid=ae?.dataset?.fid||null;
+  const sel=(ae && fid && ae.selectionStart!==undefined)?{s:ae.selectionStart,e:ae.selectionEnd}:null;
+  App.cache.conflicts=computeConflicts();
+  const allowed=allowedRoutes();
+  if (!allowed.includes(Store.raw.ui.route)) Store.raw.ui.route=isSuper()?"admin":"dashboard";
+  updateChrome(App.cache.conflicts);
+  const view=$("#view");
+  const routeChanged=App.lastRoute!==Store.raw.ui.route;
+    if(Store.raw.ui.route!=="marketing"&&typeof stopPromoPreview==="function") stopPromoPreview();
+  /* While a dialog is open the page behind it is hidden by the backdrop — rebuilding it
+     on every keystroke made big schools unusable. Defer it until the dialog closes. */
+  if (Modal.current && !routeChanged){
+    viewDirty=true;
+  } else {
+    viewDirty=false;
+    applyBrand();
+    const renderer=({admin:renderAdmin, marketing:renderMarketing, dashboard:renderDashboard, timetable:renderTimetable, database:renderDatabase, relief:renderRelief, team:renderTeam, print:renderPrintCenter, scanner:renderScanner, attendance:renderAttendance, find:renderFind})[Store.raw.ui.route];
+    try{
+      if(renderer) renderer();
+      else throw new Error("No renderer for route "+Store.raw.ui.route);
+    }catch(error){
+      console.warn("route render failed:",Store.raw.ui.route,error);
+      view.innerHTML=`<div class="max-w-lg mx-auto pt-8">
+        <div class="card p-7 text-center !border-rose-200 bg-rose-50/40">
+          <div class="tile w-14 h-14 rounded-2xl bg-rose-500/10 text-rose-500 mx-auto mb-3"><i class="ph-fill ph-warning-circle text-2xl"></i></div>
+          <h2 class="font-display font-bold text-lg tracking-tight">This screen could not open</h2>
+          <p class="text-sm text-zinc-500 mt-2 leading-relaxed">Your data is safe. Reload this screen or return to Schools. Error: ${esc(error?.message||"unknown render error")}</p>
+          <div class="flex flex-wrap justify-center gap-2 mt-5">
+            <button class="btn btn-primary" data-action="nav" data-route="${isSuper()?"admin":"dashboard"}">Go back</button>
+            <button class="btn btn-ghost" data-action="nav" data-route="${Store.raw.ui.route}"><i class="ph ph-arrow-clockwise"></i>Retry</button>
+          </div>
+        </div></div>`;
+    }
+    if (routeChanged){ view.classList.remove("view-in"); void view.offsetWidth; view.classList.add("view-in"); window.scrollTo({top:0}); App.lastRoute=Store.raw.ui.route; }
+  }
+  if (Modal.current&&Modal.current.reactive!==false) Modal.rerender();
+  if (fid){
+    const el=$(`[data-fid="${CSS.escape(fid)}"]`);
+    if (el){ el.focus({preventScroll:true}); if(sel&&el.setSelectionRange){ try{ el.setSelectionRange(sel.s,sel.e); }catch(e){ /* input type has no selection support */ } } }
+  }
+}
+
+/* =================================================================================
+   AUTH & SESSION
+   ================================================================================= */
+/* The splash is choreographed, not just hidden: it always plays for a beat so a fast
+   load looks deliberate, and it reports the real boot stage on a slow one. */
+const Splash={
+  shownAt:0, minMs:900, timer:null, stepIdx:0,
+  steps:["Opening your workspace…","Checking your school records…","Preparing the timetable…","Almost ready…"],
+  shown(){ return !$("#splash").classList.contains("gone"); },
+  begin(){
+    Splash.shownAt=performance.now(); Splash.stepIdx=0;
+    Splash.setStep(Splash.steps[0]);
+    clearInterval(Splash.timer);
+    Splash.timer=setInterval(()=>{
+      if(!Splash.shown()) return clearInterval(Splash.timer);
+      if(Splash.stepIdx<Splash.steps.length-1) Splash.setStep(Splash.steps[++Splash.stepIdx]);
+      else clearInterval(Splash.timer);
+    },1100);
+  },
+  setStep(txt){ const el=$("#splash-step"); if(el) el.textContent=txt; },
+  done(){
+    if(!Splash.shown()) return;
+    Splash.setStep("Ready");
+    const remaining=Math.max(0,Splash.minMs-(performance.now()-Splash.shownAt));
+    clearInterval(Splash.timer);
+    setTimeout(()=>$("#splash").classList.add("gone"), remaining);
+  }
+};
+function showSplash(gone){
+  if(gone){ Splash.done(); return; }
+  $("#splash").classList.remove("gone"); Splash.begin();
+}
+function showLogin(errBanner=""){
+  if(typeof Modal!=="undefined"){
+    clearTimeout(Modal._closeTimer); Modal._closeTimer=null; Modal.current=null; Modal.skipNext=false;
+    $("#modal-root").innerHTML="";
+  }
+  if(typeof Splash!=="undefined") Splash.done();
+  document.body.classList.remove("modal-open");
+  const appEl=$("#app"), loginEl=$("#login-root");
+  if(appEl) appEl.inert=false;
+  if(loginEl) loginEl.inert=false;
+  $("#app").hidden=true;
+  const root=$("#login-root"); root.hidden=false;
+  if(!PUBLIC_SITE_ENABLED()){
+    root.innerHTML=`<div class="min-h-dvh flex items-center justify-center p-4 bg-zinc-50">
+      <div class="w-full max-w-sm">
+        <div class="flex flex-col items-center mb-5">
+          <div class="tile w-16 h-16 rounded-3xl bg-gradient-to-br from-emerald-500 to-teal-600 text-white shadow-xl mb-4"><i class="ph-fill ph-graduation-cap text-3xl"></i></div>
+          <div class="font-display font-bold text-2xl">CampusFlow</div>
+        </div>
+        <form class="card p-6 space-y-4" data-form="login" autocomplete="on">
+          ${errBanner?`<div class="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-xl p-3">${esc(errBanner)}</div>`:""}
+          <div><label class="label" for="login-email">${esc(t("login.user"))}</label><input class="field" id="login-email" name="username" value="${esc(safeStore.get("cf.lastUsername",""))}" required autocomplete="username"></div>
+          <div><label class="label" for="login-pass">${esc(t("login.pass"))}</label><input type="password" class="field" id="login-pass" name="password" required autocomplete="current-password"></div>
+          <div id="login-err" hidden class="text-xs text-rose-600 bg-rose-50 border border-rose-200 rounded-xl p-3" role="alert"></div>
+          <button type="submit" class="btn btn-primary w-full" id="login-btn"><i class="ph ph-sign-in"></i>${esc(t("login.signin"))}</button>
+          ${cachedSessionAvailable()?`<button type="button" class="btn btn-ghost w-full" data-action="continue-offline"><i class="ph ph-cloud-slash"></i>Continue offline</button>`:""}
+          <div class="text-[11px] text-zinc-400 text-center"><span id="login-net">Checking connection…</span></div>
+        </form>
+      </div></div>`;
+    updateLoginNet();
+    return;
+  }
+  root.innerHTML=`
+  <div class="min-h-dvh bg-white">
+    <style id="lp-css">
+      .lp{--deep:#03241f;--deep2:#063b33;--g1:#059669;--g2:#10b981;--g3:#34d399;--mint:#d1fae5;--ink:#0b1f1c;--mute:#5b6f6a;--line:#dcefe7;color:var(--ink);font-family:"Inter",system-ui,sans-serif;overflow-x:hidden}
+      .lp *{box-sizing:border-box}
+      .lp h1,.lp h2,.lp h3{font-family:"Space Grotesk","Inter",sans-serif;letter-spacing:-.02em}
+      .lp-nav{position:fixed;min-width:0;top:max(12px,env(safe-area-inset-top));left:50%;transform:translateX(-50%);width:min(1120px,calc(100% - 20px));z-index:60;display:flex;align-items:center;gap:10px;padding:8px 8px 8px 14px;border-radius:999px;background:rgba(255,255,255,.78);backdrop-filter:blur(16px) saturate(1.4);-webkit-backdrop-filter:blur(16px) saturate(1.4);box-shadow:0 10px 40px -12px rgba(3,36,31,.35),0 0 0 1px rgba(5,150,105,.14);transition:box-shadow .3s}
+      .lp-brand{display:flex;align-items:center;gap:9px;font-family:"Space Grotesk",sans-serif;font-weight:700;font-size:17px;color:var(--ink);text-decoration:none}
+      .lp-mark{width:34px;height:34px;border-radius:11px;display:grid;place-items:center;background:linear-gradient(140deg,var(--g2),#0d9488);color:#fff;box-shadow:0 6px 16px -4px rgba(5,150,105,.6)}
+      .lp-links{display:none;gap:4px;margin-left:auto;margin-right:auto}
+      @media(min-width:900px){.lp-links{display:flex}}
+      .lp-nav .lp-brand{white-space:nowrap;flex:none}
+      @media(max-width:479px){.lp-nav{gap:6px;padding-left:8px}.lp-nav .lp-bt{display:none}.lp-nav .seg-btn{padding:0 8px!important;font-size:11px!important}.lp-nav .lp-pill{padding:0 12px}}
+      .lp-nav > :last-child{flex:none}
+      .lp-links a{white-space:nowrap;font-size:13px;font-weight:600;color:var(--mute);text-decoration:none;padding:8px 12px;border-radius:999px}
+      .lp-links a:hover{color:var(--ink);background:rgba(5,150,105,.08)}
+      .lp-pill{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:46px;padding:0 20px;border-radius:999px;font-weight:700;font-size:15px;text-decoration:none;border:0;cursor:pointer;transition:transform .15s,box-shadow .2s,background .2s;white-space:nowrap}
+      .lp-pill:active{transform:scale(.97)}
+      .lp-pill-main{background:linear-gradient(180deg,#10b981,#059669);color:#fff;box-shadow:0 10px 24px -8px rgba(5,150,105,.7),inset 0 1px 0 rgba(255,255,255,.25)}
+      .lp-pill-main:hover{box-shadow:0 14px 30px -8px rgba(5,150,105,.85),inset 0 1px 0 rgba(255,255,255,.25)}
+      .lp-pill-ghost{background:rgba(255,255,255,.1);color:#fff;box-shadow:inset 0 0 0 1.5px rgba(255,255,255,.28)}
+      .lp-pill-ghost:hover{background:rgba(255,255,255,.18)}
+      .lp-pill-soft{background:#fff;color:var(--ink);box-shadow:inset 0 0 0 1.5px var(--line)}
+      .lp-pill-soft:hover{box-shadow:inset 0 0 0 1.5px var(--g1);color:var(--g1)}
+      .lp-nav .lp-pill{min-height:40px;padding:0 16px;font-size:13px}
+      .lp-hero{position:relative;background:radial-gradient(900px 560px at 85% -5%,rgba(16,185,129,.35),transparent 60%),radial-gradient(700px 500px at -10% 110%,rgba(13,148,136,.4),transparent 60%),var(--deep);color:#ecfdf5;padding:124px 0 0;border-radius:0 0 36px 36px;overflow:hidden}
+      .lp-hero::before{content:"";position:absolute;inset:0;background-image:radial-gradient(rgba(52,211,153,.16) 1px,transparent 1px);background-size:22px 22px;mask-image:linear-gradient(180deg,#000 20%,transparent 85%);-webkit-mask-image:linear-gradient(180deg,#000 20%,transparent 85%);pointer-events:none}
+      .lp-wrap{max-width:1160px;margin:0 auto;padding:0 20px;position:relative}
+      .lp-hero-grid{display:grid;gap:44px;align-items:center;grid-template-columns:1fr}
+      @media(min-width:960px){.lp-hero-grid{grid-template-columns:1.02fr .98fr;gap:60px}}
+      .lp-eyebrow{display:inline-flex;align-items:center;gap:9px;padding:7px 14px 7px 8px;border-radius:999px;background:rgba(52,211,153,.12);box-shadow:inset 0 0 0 1px rgba(52,211,153,.3);font-size:12px;font-weight:700;color:#a7f3d0}
+      .lp-eyebrow b{background:var(--g2);color:var(--deep);border-radius:999px;padding:2px 8px;font-size:11px;letter-spacing:.04em}
+      .lp-h1{font-size:clamp(38px,6.2vw,72px);line-height:1.02;font-weight:700;margin:22px 0 0;color:#fff}
+      .lp-h1 em{font-style:normal;background:linear-gradient(95deg,#6ee7b7,#2dd4bf 60%,#a7f3d0);-webkit-background-clip:text;background-clip:text;color:transparent}
+      .lp-sub{font-size:17px;line-height:1.6;color:#b7e4d3;margin:20px 0 0;max-width:50ch}
+      .lp-ctas{display:flex;flex-wrap:wrap;gap:12px;margin-top:30px}
+      .lp-ctas .lp-pill{flex:1 1 auto}
+      @media(min-width:520px){.lp-ctas .lp-pill{flex:0 0 auto}}
+      .lp-tiny{font-size:13px;color:#86c7b2;margin-top:16px}
+      .lp-tiny a{color:#a7f3d0;font-weight:700}
+      .lp-stats{display:grid;grid-template-columns:repeat(2,1fr);gap:1px;margin-top:40px;background:rgba(255,255,255,.1);border-radius:20px;overflow:hidden;box-shadow:0 0 0 1px rgba(255,255,255,.08)}
+      @media(min-width:640px){.lp-stats{grid-template-columns:repeat(4,1fr)}}
+      .lp-stat{background:rgba(3,36,31,.85);padding:16px 18px}
+      .lp-stat strong{display:block;font-family:"Space Grotesk",sans-serif;font-size:22px;color:#fff}
+      .lp-stat span{font-size:12px;color:#86c7b2;font-weight:600}
+      /* phone mock */
+      .lp-phone-wrap{position:relative;display:flex;justify-content:center;padding:10px 0 0}
+      .lp-phone{position:relative;width:min(320px,86vw);height:560px;border-radius:46px;padding:11px;background:linear-gradient(160deg,#2b4b45,#07110f);box-shadow:0 60px 90px -30px rgba(0,0,0,.6),inset 0 0 0 1.5px rgba(255,255,255,.12)}
+      .lp-screen{width:100%;height:100%;border-radius:36px;background:#f7fbf9;color:var(--ink);overflow:hidden;position:relative;padding:44px 16px 16px}
+      .lp-island{position:absolute;top:11px;left:50%;transform:translateX(-50%);width:96px;height:28px;border-radius:20px;background:#000}
+      .lp-scr-h{display:flex;justify-content:space-between;align-items:center}
+      .lp-scr-h b{font-family:"Space Grotesk",sans-serif;font-size:17px}
+      .lp-chip{font-size:10px;font-weight:800;padding:4px 9px;border-radius:999px;background:#d1fae5;color:#047857;letter-spacing:.03em}
+      .lp-row{display:grid;grid-template-columns:44px 1fr;gap:10px;margin-top:12px;align-items:stretch}
+      .lp-time{font-size:11px;font-weight:700;color:var(--mute);padding-top:12px}
+      .lp-card{border-radius:16px;padding:11px 12px;color:#fff;font-size:12px;line-height:1.3}
+      .lp-card b{display:block;font-size:13px;font-family:"Space Grotesk",sans-serif}
+      .lp-card small{opacity:.85;font-size:11px}
+      .lp-relief{margin-top:14px;border-radius:18px;background:#fff;box-shadow:0 0 0 1.5px #a7f3d0;padding:12px}
+      .lp-relief .lp-cta{margin-top:10px;background:var(--g1);color:#fff;border-radius:12px;padding:10px;text-align:center;font-size:12px;font-weight:700}
+      .lp-float{position:absolute;z-index:3;background:#fff;color:var(--ink);border-radius:16px;padding:10px 12px;box-shadow:0 20px 40px -14px rgba(0,0,0,.45);display:flex;align-items:center;gap:9px;font-size:12px;font-weight:700;animation:lp-bob 5s ease-in-out infinite}
+      .lp-float i{width:30px;height:30px;border-radius:10px;display:grid;place-items:center;background:#d1fae5;color:#059669;font-size:16px}
+      @keyframes lp-bob{0%,100%{transform:translateY(0)}50%{transform:translateY(-7px)}}
+      /* sections */
+      .lp-sec{padding:96px 0}
+      @media(max-width:640px){.lp-sec{padding:64px 0}}
+      .lp-kicker{font-size:12px;font-weight:800;letter-spacing:.14em;text-transform:uppercase;color:var(--g1)}
+      .lp-h2{font-size:clamp(30px,4.2vw,50px);line-height:1.06;font-weight:700;margin:12px 0 0;max-width:20ch}
+      .lp-lead{font-size:17px;line-height:1.6;color:var(--mute);margin:16px 0 0;max-width:56ch}
+      .lp-feat{display:grid;gap:18px;grid-template-columns:1fr;margin-top:48px}
+      @media(min-width:900px){.lp-feat{grid-template-columns:repeat(3,1fr)}}
+      .lp-tile{position:relative;border-radius:28px;background:#fff;padding:28px;box-shadow:0 0 0 1px var(--line),0 1px 0 rgba(0,0,0,.02);overflow:hidden;transition:transform .25s,box-shadow .25s}
+      .lp-tile:hover{transform:translateY(-4px);box-shadow:0 0 0 1px #a7f3d0,0 24px 40px -22px rgba(5,150,105,.45)}
+      .lp-tile.big{grid-column:span 1}
+      @media(min-width:900px){.lp-tile.big{grid-column:span 2}}
+      .lp-ico{width:50px;height:50px;border-radius:16px;display:grid;place-items:center;font-size:24px;background:linear-gradient(145deg,#d1fae5,#a7f3d0);color:#047857}
+      .lp-tile h3{font-size:22px;margin:18px 0 0;font-weight:700}
+      .lp-tile p{font-size:15px;line-height:1.6;color:var(--mute);margin:8px 0 0}
+      .lp-viz{margin-top:22px;border-radius:18px;background:#f3faf7;padding:14px;box-shadow:inset 0 0 0 1px var(--line)}
+      .lp-grid7{display:grid;grid-template-columns:repeat(6,1fr);gap:4px;font-size:10px;font-weight:700;color:var(--mute);text-align:center}
+      .lp-grid7 div.c{height:26px;border-radius:7px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:10px;margin-top:4px}
+      .lp-bars{display:flex;align-items:flex-end;gap:8px;height:110px}
+      .lp-bars span{flex:1;border-radius:10px 10px 4px 4px;background:linear-gradient(180deg,#34d399,#059669)}
+      .lp-chips{display:flex;flex-wrap:wrap;gap:8px}
+      .lp-chips span{font-size:12px;font-weight:700;padding:7px 12px;border-radius:999px;background:#fff;box-shadow:inset 0 0 0 1px var(--line);color:var(--ink)}
+      .lp-dark{background:var(--deep);color:#ecfdf5;border-radius:28px;padding:28px;position:relative;overflow:hidden}
+      .lp-dark p{color:#a7d9c7}
+      .lp-dark .lp-ico{background:rgba(52,211,153,.16);color:#6ee7b7}
+      .lp-dark h3{color:#fff}
+      .lp-toggle{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-radius:12px;background:rgba(255,255,255,.06);margin-top:8px;font-size:13px;font-weight:600;color:#d1fae5}
+      .lp-toggle i{width:36px;height:20px;border-radius:999px;background:var(--g2);position:relative}
+      .lp-toggle i::after{content:"";position:absolute;right:2px;top:2px;width:16px;height:16px;border-radius:50%;background:#fff}
+      .lp-toggle i.off{background:rgba(255,255,255,.2)}
+      .lp-toggle i.off::after{right:auto;left:2px}
+      .lp-steps{display:grid;gap:14px;margin-top:48px;grid-template-columns:1fr}
+      @media(min-width:900px){.lp-steps{grid-template-columns:repeat(3,1fr)}}
+      .lp-step{position:relative;border-radius:24px;padding:26px;background:#fff;box-shadow:0 0 0 1px var(--line)}
+      .lp-step .n{font-family:"Space Grotesk",sans-serif;font-size:56px;font-weight:700;line-height:1;background:linear-gradient(180deg,#34d399,#059669);-webkit-background-clip:text;background-clip:text;color:transparent}
+      .lp-step h3{font-size:20px;margin:14px 0 0;font-weight:700}
+      .lp-step p{font-size:15px;line-height:1.6;color:var(--mute);margin:8px 0 0}
+      .lp-who{display:grid;gap:12px;grid-template-columns:1fr 1fr;margin-top:40px}
+      @media(min-width:900px){.lp-who{grid-template-columns:repeat(4,1fr)}}
+      .lp-who div{border-radius:20px;padding:20px;background:#fff;box-shadow:0 0 0 1px var(--line)}
+      .lp-who i{font-size:24px;color:var(--g1)}
+      .lp-who b{display:block;margin-top:12px;font-size:15px}
+      .lp-who span{display:block;font-size:13px;color:var(--mute);margin-top:4px;line-height:1.5}
+      .lp-band{background:linear-gradient(135deg,#059669,#0f766e);border-radius:32px;color:#fff;padding:34px 26px;position:relative;overflow:hidden;box-shadow:0 40px 80px -40px rgba(5,150,105,.7)}
+      @media(min-width:768px){.lp-band{padding:52px}}
+      .lp-band::after{content:"";position:absolute;right:-80px;top:-80px;width:280px;height:280px;border-radius:50%;background:rgba(255,255,255,.08)}
+      .lp-band h2{font-size:clamp(28px,4vw,44px);line-height:1.08;font-weight:700;margin:12px 0 0;max-width:22ch;color:#fff}
+      .lp-band p{color:#d1fae5;font-size:16px;line-height:1.6;margin:14px 0 0;max-width:54ch}
+      .lp-band .lp-ctas{position:relative;z-index:1}
+      .lp-call{display:grid;gap:14px;margin-top:40px;grid-template-columns:1fr}
+      @media(min-width:768px){.lp-call{grid-template-columns:1.2fr 1fr}}
+      .lp-callbox{border-radius:28px;background:#fff;padding:28px;box-shadow:0 0 0 1px var(--line)}
+      .lp-callbox .num{font-family:"Space Grotesk",sans-serif;font-size:clamp(30px,4.6vw,44px);font-weight:700;color:var(--ink);margin-top:10px;letter-spacing:-.01em}
+      .lp-callbox p{color:var(--mute);font-size:15px;line-height:1.6;margin:8px 0 0}
+      .lp-callbox .lp-ctas{margin-top:20px}
+      .lp-callbox .lp-ctas .lp-pill{flex:1 1 auto}
+      .lp-faq{max-width:820px;margin:44px auto 0}
+      .lp-cta-end{text-align:center;padding:90px 0 40px}
+      .lp-foot{background:var(--deep);color:#86c7b2;padding:34px 0 calc(34px + env(safe-area-inset-bottom));font-size:14px}
+      .lp-foot a{color:#d1fae5;font-weight:700;text-decoration:none}
+      /* The reveal animation is opt-in: .js-reveal is added by JS only once the observer
+         is actually watching. Previously .lp-reveal was opacity:0 unconditionally and no
+         script ever added .in, so every section below the hero (Features, How it works,
+         Pricing, FAQ) stayed invisible and the page was ~3,500px of blank white. Content
+         must never depend on JS to be visible. */
+      .lp.js-reveal .lp-reveal{opacity:0;transform:translateY(18px);transition:opacity .7s ease,transform .7s cubic-bezier(.16,1,.3,1)}
+      .lp.js-reveal .lp-reveal.in{opacity:1;transform:none}
+      @media(prefers-reduced-motion:reduce){.lp *{animation:none!important;transition:none!important}.lp.js-reveal .lp-reveal{opacity:1;transform:none}}
+      .lp-faq details{padding:20px 24px;border-top:1px solid var(--line)}.lp-faq details:first-child{border-top:0}
+      @media(max-width:520px){.lp-hero{padding-top:104px}.lp-float{display:none}.lp-phone{height:520px}}
+    </style>
+    <div class="lp">
+      <!-- Floating pill navigation -->
+      <nav class="lp-nav" aria-label="Main">
+        <a class="lp-brand" href="#top"><span class="lp-mark"><i class="ph-fill ph-graduation-cap text-lg"></i></span><span class="lp-bt">CampusFlow</span></a>
+        <div class="lp-links">
+          <a href="#features">Features</a>
+          <a href="#how">How it works</a>
+          <a href="#buy">Buy</a>
+          <a href="#faq">FAQ</a>
+        </div>
+        ${langSwitcher()}
+        <a class="lp-pill lp-pill-main" href="#signin">${esc(t("login.signin"))}</a>
+      </nav>
+
+      <!-- Hero: Sri Lankan schools first -->
+      <header class="lp-hero" id="top">
+        <div class="lp-wrap" style="padding-bottom:0">
+          <div class="lp-hero-grid">
+            <div>
+              <div class="lp-eyebrow"><b>SRI LANKA</b>For schools · සිංහල · தமிழ் · English</div>
+              <h1 class="lp-h1" data-site="heroTitle">${esc(SiteCfg.val("heroTitle"))}</h1>
+              <p class="lp-sub" data-site="heroSub">${esc(SiteCfg.val("heroSubtitle"))}</p>
+              <div class="lp-ctas">
+                <a class="lp-pill lp-pill-main" data-site-href="wa" href="${SiteCfg.waLink()}" target="_blank" rel="noopener"><i class="ph-fill ph-whatsapp-logo text-xl"></i>Get an account for your school</a>
+                <a class="lp-pill lp-pill-ghost" data-site-href="tel" href="${SiteCfg.tel()}"><i class="ph ph-phone text-lg"></i><span data-site="phone">${esc(SiteCfg.phone())}</span></a>
+              </div>
+              <p class="lp-tiny">Already have an account? <a href="#signin">Sign in here</a></p>
+            </div>
+            <div class="lp-phone-wrap" aria-hidden="true">
+              <div class="lp-float" style="left:-4px;top:70px"><i class="ph-fill ph-user-switch"></i><span>Relief covered<br><small style="font-weight:600;color:#5b6f6a">Period 2 · Science</small></span></div>
+              <div class="lp-float" style="right:-6px;bottom:110px;animation-delay:-2s"><i class="ph-fill ph-wifi-slash"></i><span>Saved offline<br><small style="font-weight:600;color:#5b6f6a">Syncs when online</small></span></div>
+              <div class="lp-phone">
+                <div class="lp-island"></div>
+                <div class="lp-screen">
+                  <div class="lp-scr-h"><b>Today</b><span class="lp-chip">Clash-free</span></div>
+                  <div class="lp-row"><div class="lp-time">07:40</div><div class="lp-card" style="background:#059669"><b>Mathematics · 9B</b><small>Room 12 · Teacher A</small></div></div>
+                  <div class="lp-row"><div class="lp-time">08:20</div><div class="lp-card" style="background:#0f766e"><b>Science · 9B</b><small>Lab 2 · Teacher B</small></div></div>
+                  <div class="lp-row"><div class="lp-time">09:10</div><div class="lp-card" style="background:#10b981"><b>Sinhala · 9B</b><small>Room 4 · Teacher C</small></div></div>
+                  <div class="lp-relief"><div style="font-size:11px;font-weight:800;color:#047857;letter-spacing:.06em">ABSENT TEACHER</div><div style="font-weight:700;font-size:14px;margin-top:4px">Relief teacher found in 1 tap</div><div class="lp-cta">Assign relief</div></div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="lp-stats">
+            <div class="lp-stat"><strong><span data-site="trialDays">${esc(String(SiteCfg.val("trialDays")))}</span> days</strong><span>Free trial</span></div>
+            <div class="lp-stat"><strong>3</strong><span>Languages</span></div>
+            <div class="lp-stat"><strong>Offline</strong><span>Works without internet</span></div>
+            <div class="lp-stat"><strong>A4 / A3</strong><span>Official print</span></div>
+          </div>
+        </div>
+      </header>
+
+      <!-- Features: the school day, one card per job -->
+      <section class="lp-sec" id="features">
+        <div class="lp-wrap">
+          <div class="lp-reveal"><div class="lp-kicker">Features</div>
+          <h2 class="lp-h2">Everything a school day needs, in one place.</h2>
+          <p class="lp-lead">Fingerprint attendance, one search box for the whole school, your own colours and logo, relief for absent teachers and printed class plans, in one app that works offline.</p></div>
+          <div class="lp-feat">
+            <article class="lp-tile big lp-reveal">
+              <div class="lp-ico"><i class="ph-fill ph-calendar-check"></i></div>
+              <h3>Auto-generated timetables</h3>
+              <p>Clash-free schedules built from your teachers and subjects. Conflicts are flagged before they happen, not on the morning of.</p>
+              <div class="lp-viz"><div class="lp-grid7" style="grid-template-columns:44px repeat(5,1fr)">
+                <div></div><div>Mon</div><div>Tue</div><div>Wed</div><div>Thu</div><div>Fri</div>
+                <div style="align-self:center">P1</div><div class="c" style="background:#059669">Maths</div><div class="c" style="background:#0f766e">Sci</div><div class="c" style="background:#059669">Maths</div><div class="c" style="background:#0f766e">Sci</div><div class="c" style="background:#10b981">Sinh</div>
+                <div style="align-self:center">P2</div><div class="c" style="background:#10b981">Sinh</div><div class="c" style="background:#059669">Maths</div><div class="c" style="background:#0f766e">Sci</div><div class="c" style="background:#059669">Maths</div><div class="c" style="background:#10b981">Sinh</div>
+              </div></div>
+            </article>
+            <article class="lp-tile lp-reveal">
+              <div class="lp-ico"><i class="ph-fill ph-fingerprint"></i></div>
+              <h3>Fingerprint attendance</h3>
+              <p>Teachers clock in with their phone's fingerprint or face. The browser never sees the fingerprint. Missing teachers show up on the dashboard live.</p>
+              <div class="lp-viz"><div class="lp-chips"><span>Nimal · in 07:42</span><span>Kamala · not yet</span></div></div>
+            </article>
+            <article class="lp-tile lp-reveal">
+              <div class="lp-ico"><i class="ph-fill ph-magnifying-glass"></i></div>
+              <h3>Find anything, instantly</h3>
+              <p>One search box for teachers, classes, lessons, attendance and your linked Google Sheets. Ask a question and get an answer that cites its source.</p>
+              <div class="lp-viz"><div class="lp-chips"><span>Who is free period 3?</span><span>Kamala Silva, Science</span></div></div>
+            </article>
+            <article class="lp-tile lp-reveal">
+              <div class="lp-ico"><i class="ph-fill ph-user-switch"></i></div>
+              <h3>Relief in one tap</h3>
+              <p>A teacher is absent. CampusFlow finds the best-matched free teacher for that subject and grade, and fills in absences from fingerprint data.</p>
+              <div class="lp-viz"><div class="lp-chips"><span>Free this period ✓</span><span>Teaches this subject ✓</span></div></div>
+            </article>
+            <article class="lp-tile lp-reveal">
+              <div class="lp-ico"><i class="ph-fill ph-palette"></i></div>
+              <h3>Your school's look</h3>
+              <p>Your logo and colours appear for every teacher and staff member the moment they sign in. The principal can let admins change them.</p>
+              <div class="lp-viz"><div class="lp-chips"><span style="background:#059669;color:#fff">Green</span><span style="background:#4f46e5;color:#fff">Indigo</span><span style="background:#e11d48;color:#fff">Rose</span></div></div>
+            </article>
+            <article class="lp-tile lp-reveal">
+              <div class="lp-ico"><i class="ph-fill ph-cloud-slash"></i></div>
+              <h3>Works without internet</h3>
+              <p>Every change saves on the device and syncs later. Schools with unstable connections keep working.</p>
+              <div class="lp-viz"><div class="lp-bars"><span style="height:45%"></span><span style="height:70%"></span><span style="height:55%"></span><span style="height:92%"></span><span style="height:80%"></span></div></div>
+            </article>
+            <article class="lp-tile lp-reveal">
+              <div class="lp-ico"><i class="ph-fill ph-translate"></i></div>
+              <h3>Sinhala · Tamil · English</h3>
+              <p>A trilingual interface built for local schools and their naming conventions.</p>
+              <div class="lp-viz"><div class="lp-chips"><span>සිංහල</span><span>தமிழ்</span><span>English</span></div></div>
+            </article>
+            <article class="lp-tile lp-reveal">
+              <div class="lp-ico"><i class="ph-fill ph-printer"></i></div>
+              <h3>Print and share</h3>
+              <p>Class, teacher, master and roster timetables, high-contrast and official, on A4 or A3.</p>
+              <div class="lp-viz"><div class="lp-chips"><span>Class timetable</span><span>Teacher timetable</span><span>Master roster</span></div></div>
+            </article>
+            <article class="lp-dark lp-reveal lp-tile-dark" style="grid-column:auto">
+              <div class="lp-ico"><i class="ph-fill ph-shield-check"></i></div>
+              <h3>The principal controls access</h3>
+              <p>Set who can edit, who only views, who can change the school's look, and what each staff role can change.</p>
+              <div class="lp-toggle">Edit timetable <i></i></div>
+              <div class="lp-toggle">View team directory <i></i></div>
+              <div class="lp-toggle">Change school look <i></i></div>
+              <div class="lp-toggle">Change grades <i class="off"></i></div>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <!-- Who it helps -->
+      <section class="lp-sec" style="padding-top:0">
+        <div class="lp-wrap">
+          <div class="lp-reveal"><div class="lp-kicker">Who it's for</div>
+          <h2 class="lp-h2">Each person sees the day that is theirs.</h2></div>
+          <div class="lp-who">
+            <div class="lp-reveal"><i class="ph-fill ph-crown"></i><b>Principal</b><span>Sees the whole school and decides who can change what.</span></div>
+            <div class="lp-reveal"><i class="ph-fill ph-chalkboard-teacher"></i><b>Teachers</b><span>Their own timetable, relief duties and class plans.</span></div>
+            <div class="lp-reveal"><i class="ph-fill ph-clipboard-text"></i><b>Admin office</b><span>Staff records, printing and the term calendar.</span></div>
+            <div class="lp-reveal"><i class="ph-fill ph-student"></i><b>Staff roles</b><span>Only the screens their role allows, nothing more.</span></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- How it works -->
+      <section class="lp-sec" id="how" style="padding-top:0">
+        <div class="lp-wrap">
+          <div class="lp-reveal"><div class="lp-kicker">How it works</div>
+          <h2 class="lp-h2">From an empty school to a full week in one sitting.</h2></div>
+          <ol class="lp-steps" style="list-style:none;padding:0">
+            <li class="lp-step lp-reveal"><div class="n">01</div><h3>Add your staff and classes</h3><p>Enter teachers once and tick the subjects and grades each one teaches.</p></li>
+            <li class="lp-step lp-reveal"><div class="n">02</div><h3>Generate the week</h3><p>One tap builds a clash-free timetable that respects every teacher's limits.</p></li>
+            <li class="lp-step lp-reveal"><div class="n">03</div><h3>Handle the day</h3><p>Mark absences, send relief plans on WhatsApp, and print every class plan.</p></li>
+          </ol>
+        </div>
+      </section>
+
+      <!-- Trial -->
+      <section class="lp-sec" style="padding-top:0">
+        <div class="lp-wrap">
+          <div class="lp-band lp-reveal">
+            <div class="lp-kicker" style="color:#a7f3d0">Start with a free trial</div>
+            <h2><span data-site="trialDays">${esc(String(SiteCfg.val("trialDays")))}</span> days to test it with your own timetable</h2>
+            <p>Then continue on <b data-site="planName">${esc(SiteCfg.val("planName"))}</b> for <b data-site="planPrice">${esc(SiteCfg.val("planPrice"))}</b>. We set up your principal account and walk you through the first week.</p>
+            <div class="lp-ctas">
+              <a class="lp-pill lp-pill-soft" style="color:#047857" data-site-href="wa" href="${SiteCfg.waLink()}" target="_blank" rel="noopener"><i class="ph-fill ph-whatsapp-logo text-xl" style="color:#25D366"></i>Start on WhatsApp</a>
+              <a class="lp-pill lp-pill-ghost" data-site-href="tel" href="${SiteCfg.tel()}"><i class="ph ph-phone"></i><span data-site="phone">${esc(SiteCfg.phone())}</span></a>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Buy: principal contact numbers -->
+      <section class="lp-sec" id="buy" style="padding-top:0">
+        <div class="lp-wrap">
+          <div class="lp-reveal"><div class="lp-kicker">Buy an account</div>
+          <h2 class="lp-h2">Talk to a person who can set up your school.</h2>
+          <p class="lp-lead">Call or WhatsApp to get a principal account for your school. Tell us your school name and the number of teachers.</p></div>
+          <div class="lp-call">
+            <div class="lp-callbox lp-reveal">
+              <div class="lp-kicker">Principal contact</div>
+              <div class="num" data-site="phone">${esc(SiteCfg.phone())}</div>
+              <p>Calls and WhatsApp messages go to the same number. We reply with the next step.</p>
+              <div class="lp-ctas">
+                <a class="lp-pill lp-pill-main" data-site-href="wa" href="${SiteCfg.waLink()}" target="_blank" rel="noopener"><i class="ph-fill ph-whatsapp-logo text-xl"></i>WhatsApp</a>
+                <a class="lp-pill lp-pill-soft" data-site-href="tel" href="${SiteCfg.tel()}"><i class="ph ph-phone"></i>Call</a>
+              </div>
+            </div>
+            <div class="lp-callbox lp-reveal" id="signin-cta">
+              <div class="lp-kicker">Already a customer?</div>
+              <div class="num" style="font-size:26px">Sign in to your workspace</div>
+              <p>Staff and principals sign in with the username your school gave you.</p>
+              <div class="lp-ctas"><a class="lp-pill lp-pill-soft" href="#signin"><i class="ph ph-arrow-square-in"></i>Go to sign in</a></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Sign in (kept exactly as before) -->
+      <section class="lp-sec" style="padding-top:0">
+        <div class="lp-wrap" style="max-width:480px">
+          <div id="signin" class="rise" style="animation-delay:.08s">
+          <div class="card p-6 sm:p-7 shadow-xl shadow-emerald-900/[.07] !border-emerald-100/70 relative">
+            <div class="absolute -top-3 left-6 badge bg-emerald-600 text-white shadow-md">${esc(t("login.signin"))}</div>
+            <div class="flex flex-col items-center mb-5 mt-1">
+              <div class="tile w-14 h-14 rounded-2xl bg-gradient-to-br from-emerald-500 to-teal-600 text-white shadow-xl shadow-emerald-600/30 mb-3"><i class="ph-fill ph-graduation-cap text-2xl"></i></div>
+              <div class="font-display font-bold text-xl tracking-tight">CampusFlow</div>
+              <div class="text-xs text-zinc-500 font-medium mt-1 text-center">Sign in to your school's workspace</div>
+            </div>
+            ${errBanner?`<div class="p-3.5 mb-3 !border-amber-200 bg-amber-50 text-amber-800 text-xs font-semibold rounded-xl rise">${esc(errBanner)}</div>`:""}
+            <form data-form="login" autocomplete="on" class="space-y-4">
+              <div>
+                <label class="label" for="login-email">${esc(t("login.user"))}</label>
+                <input type="text" class="field" id="login-email" name="username" value="${esc(safeStore.get("cf.lastUsername",""))}" placeholder="kamala" required autocomplete="username" autocapitalize="none" spellcheck="false">
+              </div>
+              <div>
+                <div class="flex items-center justify-between"><label class="label !mb-0" for="login-pass">${esc(t("login.pass"))}</label>
+                  <button type="button" class="text-[11px] font-bold text-emerald-600 hover:text-emerald-700 min-h-[28px]" data-action="forgot-pw">${esc(t("login.forgot"))}</button></div>
+                <div class="relative mt-1.5">
+                  <input type="password" class="field !pr-12" id="login-pass" name="password" placeholder="••••••••" required autocomplete="current-password">
+                  <button type="button" class="absolute right-1 top-1/2 -translate-y-1/2 icon-btn !w-10 !h-10" data-action="toggle-pw" aria-label="Show password"><i class="ph ph-eye text-lg"></i></button>
+                </div>
+              </div>
+              <div id="login-err" hidden class="text-xs font-semibold text-rose-600 bg-rose-50 border border-rose-200 rounded-xl px-3 py-2.5" role="alert"></div>
+              <button type="submit" class="btn btn-primary w-full !h-12" id="login-btn"><i class="ph ph-sign-in"></i>${esc(t("login.signin"))}</button>
+              ${cachedSessionAvailable()?`<button type="button" class="btn btn-ghost w-full !h-11" data-action="continue-offline"><i class="ph ph-cloud-slash"></i>Continue offline</button>`:""}
+              <div class="text-[11px] text-zinc-400 text-center leading-relaxed">${esc(t("login.hint"))}<br>
+                <span class="inline-flex items-center gap-2 mt-2">
+                  <span class="w-1.5 h-1.5 rounded-full bg-emerald-500 dot-anim"></span><span id="login-net">Checking connection…</span>
+                </span></div>
+            </form>
+          </div>
+          <div class="text-center mt-4 text-[11px] text-zinc-400 font-medium">CampusFlow is licensed — no self sign-up.
+            <a class="text-emerald-600 font-bold hover:text-emerald-700" data-site-href="tel" href="${SiteCfg.tel()}">Call <span data-site="phone">${esc(SiteCfg.phone())}</span></a></div>
+        </div>
+        </div>
+      </section>
+
+      <!-- FAQ -->
+      <section class="lp-sec" id="faq" style="padding-top:0">
+        <div class="lp-wrap">
+          <div class="lp-reveal" style="text-align:center"><div class="lp-kicker">FAQ</div>
+          <h2 class="lp-h2" style="margin-left:auto;margin-right:auto">Questions schools ask first</h2></div>
+          <div class="lp-faq lp-reveal">
+            <div style="background:#fff;border-radius:24px;box-shadow:0 0 0 1px #dcefe7;overflow:hidden">
+            <details class="group p-5"><summary class="flex items-center justify-between gap-4 cursor-pointer font-bold text-[15px] list-none min-h-[44px]">Does it work without internet?<i class="ph ph-caret-down text-zinc-400 group-open:rotate-180 transition-transform"></i></summary><p class="text-sm text-zinc-500 mt-2 leading-relaxed pr-6">Yes. Changes save on the device and upload when the connection returns. The first sign-in on a new device needs internet.</p></details>
+          <details class="group p-5"><summary class="flex items-center justify-between gap-4 cursor-pointer font-bold text-[15px] list-none min-h-[44px]">Who creates staff accounts?<i class="ph ph-caret-down text-zinc-400 group-open:rotate-180 transition-transform"></i></summary><p class="text-sm text-zinc-500 mt-2 leading-relaxed pr-6">The school principal creates accounts for teachers and staff. There is no self sign-up, so only people the principal adds can get in.</p></details>
+          <details class="group p-5"><summary class="flex items-center justify-between gap-4 cursor-pointer font-bold text-[15px] list-none min-h-[44px]">Can a teacher teach several subjects or only some grades?<i class="ph ph-caret-down text-zinc-400 group-open:rotate-180 transition-transform"></i></summary><p class="text-sm text-zinc-500 mt-2 leading-relaxed pr-6">Yes. Each teacher can have many subjects, and can be limited to the grades they actually teach.</p></details>
+          <details class="group p-5"><summary class="flex items-center justify-between gap-4 cursor-pointer font-bold text-[15px] list-none min-h-[44px]">Can we bring in our current timetable?<i class="ph ph-caret-down text-zinc-400 group-open:rotate-180 transition-transform"></i></summary><p class="text-sm text-zinc-500 mt-2 leading-relaxed pr-6">Yes. Import a CampusFlow backup or an older timetable export. You can also photograph a paper timetable and review every row before it is saved.</p></details>
+          <details class="group p-5"><summary class="flex items-center justify-between gap-4 cursor-pointer font-bold text-[15px] list-none min-h-[44px]">Is our data kept separate and safe?<i class="ph ph-caret-down text-zinc-400 group-open:rotate-180 transition-transform"></i></summary><p class="text-sm text-zinc-500 mt-2 leading-relaxed pr-6">Each school&#x27;s data is kept in its own record, and the database rules check who can read and change it. You can export a full backup at any time.</p></details>
+          </div>
+          </div>
+        </div>
+      </section>
+
+      <footer class="lp-foot">
+        <div class="lp-wrap" style="display:flex;flex-wrap:wrap;gap:14px 24px;align-items:center">
+          <span class="lp-brand" style="color:#fff;font-size:15px"><span class="lp-mark" style="width:28px;height:28px;border-radius:9px"><i class="ph-fill ph-graduation-cap"></i></span>CampusFlow</span>
+          <span>School Management OS · Sri Lanka</span>
+          <span style="margin-left:auto;display:flex;gap:18px;flex-wrap:wrap">
+            <a data-site-href="tel" href="${SiteCfg.tel()}"><i class="ph ph-phone"></i> <span data-site="phone">${esc(SiteCfg.phone())}</span></a>
+            <a data-site-href="wa" href="${SiteCfg.waLink()}" target="_blank" rel="noopener"><i class="ph ph-whatsapp-logo"></i> WhatsApp</a>
+          </span>
+        </div>
+      </footer>
+    </div>
+  </div>`;
+  hydrateSiteSlots();
+  armLandingReveals();
+  updateLoginNet();
+}
+/* Drives the landing-page reveal animation. It only *arms* the hidden state once a
+   working observer is attached, and adds a safety net so a broken observer can never
+   leave the page blank — which is exactly what happened when no script revealed the
+   sections at all. */
+function armLandingReveals(){
+  const root=$(".lp"); if(!root) return;
+  const items=$$(".lp-reveal",root); if(!items.length) return;
+  const reduced=typeof window.matchMedia==="function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if(reduced || !("IntersectionObserver" in window)){
+    items.forEach(el=>el.classList.add("in"));
+    return;
+  }
+  try{
+    const observer=new IntersectionObserver(entries=>entries.forEach(entry=>{
+      if(!entry.isIntersecting) return;
+      entry.target.classList.add("in");
+      observer.unobserve(entry.target);
+    }),{rootMargin:"0px 0px -6% 0px",threshold:0.06});
+    root.classList.add("js-reveal");
+    items.forEach(el=>observer.observe(el));
+    /* If nothing has revealed shortly after load the observer is not doing its job
+       (unsupported rootMargin, blocked rAF, exotic engine) — show everything instead. */
+    setTimeout(()=>{ if(!root.querySelector(".lp-reveal.in")) items.forEach(el=>el.classList.add("in")); },2500);
+  }catch(_){
+    items.forEach(el=>el.classList.add("in"));
+  }
+}
+function updateLoginNet(){
+  const el=$("#login-net"); if(!el) return;
+  const paint=()=>{ if(el.isConnected) el.textContent=navigator.onLine?"Checking Firebase connection…":"Offline — use Continue offline if this device has a saved workspace"; };
+  paint();
+  if(navigator.onLine&&FB.ready){
+    readWithTimeout(FB.db.ref(".info/connected"),4000).then(s=>{
+      if(el.isConnected) el.textContent=s.val()?"Online — ready to sign in":"Internet found, but Firebase is not connected (captive portal or blocker)";
+    }).catch(()=>{ if(el.isConnected) el.textContent="Firebase is unreachable — check Wi-Fi login or a content blocker"; });
+  }
+  /* Bind once per page: this runs on every login render and used to stack listeners. */
+  if(!updateLoginNet._bound){
+    updateLoginNet._bound=true;
+    window.addEventListener("online",()=>{ if(!Session.uid && !(FB.auth&&FB.auth.currentUser) && $("#login-root")?.hidden) showLogin(); });
+    window.addEventListener("offline",()=>{ const e=$("#login-net"); if(e&&e.isConnected) e.textContent="Offline — use Continue offline if this device has a saved workspace"; });
+  }
+}
+function showApp(){
+  /* The splash dissolves only once the app is actually ready — and login must not animate
+     in behind it. showLogin clears it too, so the loop cannot form on sign-out. */
+  Splash.done();
+  $("#login-root").hidden=true;
+  $("#app").hidden=false;
+}
+function showSchoolBlocked(meta,access){
+  showSplash(true); $("#app").hidden=true;
+  const root=$("#login-root"); root.hidden=false;
+  const expired=access.key==="expired";
+  root.innerHTML=`<div class="min-h-dvh flex items-center justify-center p-5 bg-zinc-50">
+    <div class="card w-full max-w-md p-7 text-center">
+      <div class="tile w-16 h-16 rounded-2xl ${expired?"bg-amber-500/10 text-amber-600":"bg-rose-500/10 text-rose-600"} mx-auto mb-4">
+        <i class="ph-fill ${expired?"ph-clock-countdown":"ph-pause-circle"} text-3xl"></i></div>
+      <h1 class="font-display font-bold text-xl tracking-tight">${expired?"Free trial has ended":"School access is paused"}</h1>
+      <p class="text-sm text-zinc-500 leading-relaxed mt-2">${esc(meta.name||"This school")} is safe, but its workspace is temporarily unavailable. Contact CampusFlow to restore access.</p>
+      ${meta.offer?`<div class="badge bg-emerald-100 text-emerald-700 mt-4">${esc(meta.offer)}</div>`:""}
+      <a class="btn btn-primary w-full mt-5" data-site-href="tel" href="${SiteCfg.tel()}"><i class="ph ph-phone"></i>Call <span data-site="phone">${esc(SiteCfg.phone())}</span></a>
+      <button class="btn btn-ghost w-full mt-2" data-action="sign-out"><i class="ph ph-sign-out"></i>Sign out</button>
+    </div></div>`;
+}
+const AUTH_ERRORS={
+  "auth/invalid-email":"That email address doesn't look right.",
+  "auth/user-not-found":"No account exists with this email.",
+  "auth/wrong-password":"Incorrect password — try again.",
+  "auth/invalid-credential":"Incorrect email or password.",
+  "auth/invalid-login-credentials":"Incorrect username/email or password.",
+  "auth/requires-recent-login":"For security, sign out and sign back in, then try again.",
+  "auth/too-many-requests":"Too many attempts. Wait a moment and retry.",
+  "auth/email-already-in-use":"That email is already registered to another account.",
+  "auth/weak-password":"Password must be at least 6 characters.",
+  "auth/network-request-failed":"Network error — check your connection."
+};
+/* Usernames are stored as <user>@campusflow.app inside Firebase Auth
+   because Firebase requires a valid public TLD (.app, .com, .io). */
+const LOCAL_DOMAIN="campusflow.app";
+const toAuthEmail = v => { const s=(v||"").trim(); return s.includes("@") ? s
+  : s.toLowerCase().replace(/[^a-z0-9._-]/g,"")+"@"+LOCAL_DOMAIN; };
+/* Accounts created earlier used @campusflow.local as the username domain. The login must
+   try the current domain first, then legacy, or prior principals can never sign in. */
+const LEGACY_LOCAL_DOMAIN="campusflow.local";
+const LOCAL_DOMAINS=[LOCAL_DOMAIN,LEGACY_LOCAL_DOMAIN];
+const isLocalAcct = e => LOCAL_DOMAINS.some(d=>(e||"").endsWith("@"+d));
+const displayAcct = e => isLocalAcct(e) ? (e||"").split("@")[0] : (e||"");
+async function handleLoginLegacy(form){
+  const raw=($("#login-email",form).value||"").trim();
+  const pass=$("#login-pass",form).value;
+  const err=$("#login-err",form), btn=$("#login-btn",form);
+  const fail=(msg)=>{ err.hidden=false; err.textContent=msg; btn.disabled=false; btn.innerHTML=`<i class="ph ph-sign-in"></i>${esc(t("login.signin"))}`; };
+  err.hidden=true; btn.disabled=true; btn.innerHTML=`<span class="spinner"></span>${esc(t("login.signing"))}`;
+  /* Block a Sinhala/Tamil sign-in name here with a useful message, before it degenerates
+     into "@campusflow.app" and fails cryptically inside Firebase. */
+  const localPart=raw.includes("@")?"":raw.toLowerCase().replace(/[^a-z0-9._-]/g,"");
+  if(!raw.includes("@") && !localPart){
+    fail("Sign-in names need Latin letters or numbers (a-z, 0-9). Ask your principal for the exact username they issued.");
+    return;
+  }
+  const candidates = raw.includes("@")
+    ? [raw]
+    : LOCAL_DOMAINS.map(d=>localPart+"@"+d);
+  const retriable=c=>["auth/user-not-found","auth/invalid-email","auth/invalid-credential","auth/invalid-login-credentials"].includes(c);
+  let lastError=null;
+  for(const email of candidates){
+    try{
+      await FB.auth.signInWithEmailAndPassword(email, pass);
+      return;   /* onAuthStateChanged completes the session from here */
+    }catch(e){
+      lastError=e;
+      if(!retriable(e.code) || email===candidates[candidates.length-1]) break;
+    }
+  }
+  /* Rank the real cause so staff are not told "wrong password" when the account simply
+     never existed on this device or was created on the legacy domain. */
+  let msg;
+  const code=lastError?.code||"";
+  if(code==="auth/user-not-found"||code==="auth/invalid-email")
+    msg=retriable(code)&&candidates.length>1
+      ? "No account exists with this username. Check your spelling — and confirm the password you were issued, including its letter case."
+      : AUTH_ERRORS[code]||"No account exists with this username or email.";
+  else msg=AUTH_ERRORS[code]||("Sign-in failed: "+(code||lastError?.message));
+  fail(msg);
+}
+function normalizeLoginIdentifier(value){
+  const raw=String(value||"").trim();
+  if(!raw) return {ok:false,error:"Enter your username or email."};
+  if(raw.includes("@")){
+    const email=raw.toLowerCase();
+    if(!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) return {ok:false,error:"Enter a valid email address."};
+    return {ok:true,kind:"email",raw,email};
+  }
+  const username=raw.toLowerCase();
+  if(!/^[a-z0-9](?:[a-z0-9._-]{0,38}[a-z0-9])?$/.test(username)){
+    return {ok:false,error:"Username must use Latin letters or numbers, may contain . _ -, and cannot start or end with punctuation."};
+  }
+  return {ok:true,kind:"username",raw,username,email:username+"@"+LOCAL_DOMAIN};
+}
+async function setBestAuthPersistence(){
+  const P=firebase.auth.Auth.Persistence;
+  let last=null;
+  for(const mode of [P.LOCAL,P.SESSION,P.NONE]){
+    try{ await FB.auth.setPersistence(mode); return mode; }catch(error){ last=error; }
+  }
+  throw last||new Error("No authentication persistence mode is available.");
+}
+const LoginFlow={seq:0,inflight:new Map(),cooldown:null};
+function cachedSessionAvailable(){
+  return !!(Session.uid&&Session.schoolId&&safeStore.jsonGet(cacheKey(Session.schoolId),null)?.settings);
+}
+function showLoginRecovery(form,message){
+  const err=$("#login-err",form); if(!err) return;
+  err.hidden=false;
+  err.innerHTML=`<div class="font-semibold">${esc(message)}</div>
+    <div class="flex flex-wrap gap-2 mt-2.5">
+      <button type="button" class="btn btn-ghost !min-h-[38px] !text-xs" data-action="login-retry"><i class="ph ph-arrow-clockwise"></i>Retry</button>
+      ${cachedSessionAvailable()?`<button type="button" class="btn btn-soft !min-h-[38px] !text-xs" data-action="continue-offline"><i class="ph ph-cloud-slash"></i>Continue offline</button>`:""}
+      <button type="button" class="btn btn-ghost !min-h-[38px] !text-xs !text-rose-600" data-action="session-signout"><i class="ph ph-sign-out"></i>Sign out</button>
+    </div>`;
+}
+function startLoginCooldown(form,seconds=30){
+  clearInterval(LoginFlow.cooldown);
+  const btn=$("#login-btn",form),err=$("#login-err",form); let left=seconds;
+  if(err){err.hidden=false;err.textContent=`Too many sign-in attempts. Wait ${left} seconds, then try once.`;}
+  if(btn) btn.disabled=true;
+  LoginFlow.cooldown=setInterval(()=>{
+    left--;
+    if(err) err.textContent=left>0?`Too many sign-in attempts. Wait ${left} seconds, then try once.`:"You can try again now.";
+    if(left<=0){ clearInterval(LoginFlow.cooldown); if(btn){btn.disabled=false;btn.innerHTML=`<i class="ph ph-sign-in"></i>${esc(t("login.signin"))}`;} }
+  },1000);
+}
+/* Usernames: try the current domain, then the legacy @campusflow.local accounts issued earlier. */
+async function signInWithFallback(parsed,pass){
+  if(parsed.kind!=="username") return FB.auth.signInWithEmailAndPassword(parsed.email,pass);
+  let last=null;
+  for(const domain of LOCAL_DOMAINS){
+    try{ return await FB.auth.signInWithEmailAndPassword(parsed.username+"@"+domain,pass); }
+    catch(e){ last=e; if(!["auth/user-not-found","auth/invalid-email"].includes(e?.code)) throw e; }
+  }
+  throw last;
+}
+async function handleLogin(form){
+  if(!LOGIN_V2_ENABLED()) return handleLoginLegacy(form);
+  const input=$("#login-email",form),passEl=$("#login-pass",form),btn=$("#login-btn",form),err=$("#login-err",form);
+  const parsed=normalizeLoginIdentifier(input?.value);
+  if(!parsed.ok){if(err){err.hidden=false;err.textContent=parsed.error;}input?.focus();return;}
+  if(!passEl?.value){if(err){err.hidden=false;err.textContent="Enter your password.";}passEl?.focus();return;}
+  const attempt=++LoginFlow.seq;
+  safeStore.set("cf.lastUsername",parsed.raw);
+  if(err){err.hidden=true;err.textContent="";}
+  btn.disabled=true;btn.innerHTML=`<span class="spinner"></span>${esc(t("login.signing"))}`;
+  try{
+    await setBestAuthPersistence();
+    const credential=await Promise.race([
+      signInWithFallback(parsed,passEl.value),
+      new Promise((_,reject)=>setTimeout(()=>reject(Object.assign(new Error("Sign-in is taking longer than expected."),{code:"auth/login-timeout"})),20000))
+    ]);
+    if(attempt!==LoginFlow.seq) return;
+    await resolveSessionOnce(credential.user,{source:"credential"});
+  }catch(error){
+    if(attempt!==LoginFlow.seq) return;
+    const code=error?.code||"";
+    if(code==="auth/too-many-requests"){startLoginCooldown(form,30);return;}
+    btn.disabled=false;btn.innerHTML=`<i class="ph ph-sign-in"></i>${esc(t("login.signin"))}`;
+    if(code==="auth/login-timeout"){
+      showLoginRecovery(form,"The connection is slow. Retry once, or continue with the last saved workspace offline.");
+      return;
+    }
+    const uniform=["auth/user-not-found","auth/wrong-password","auth/invalid-credential","auth/invalid-login-credentials"].includes(code);
+    if(err){err.hidden=false;err.textContent=uniform?"Username/email or password is incorrect.":(AUTH_ERRORS[code]||error?.message||"Sign-in failed.");}
+  }
+}
+async function signOut(silent=false){
+  const leavingSchool=Session.schoolId;
+  /* Persist under the current school key before clearing the session. If online, start
+     the final Firebase write while the authenticated session is still valid. */
+  Store.flush();
+  if (Sync.active&&(Sync.pending||Sync.localDirty)){
+    const finalWrite=Sync.pushNow();
+    if(finalWrite?.then) await Promise.race([finalWrite,new Promise(r=>setTimeout(r,1200))]);
+  }
+  const unsynced=!!(Sync.pending||Sync.localDirty);
+  try { if (FB.ready && FB.auth.currentUser) await FB.auth.signOut(); } catch(_){ /* sign-out is best effort; local state is cleared anyway */ }
+  Sync.detach(); Team.detach(); Admin.detach(); reliefStopListen(); findStopAttendance(); Admin.schools={}; Admin.allUsers={};
+  Session.role=null; Session.schoolRole=null; Session.schoolId=null; Session.email=null; Session.uid=null; saveSession();
+  /* Shared computers: an explicit sign-out removes this school's offline copy, unless changes
+     are still waiting to upload (keeping those is the lesser harm). */
+  if(!silent && leavingSchool && !unsynced) safeStore.remove(cacheKey(leavingSchool));
+  Store.replaceData(emptyData());
+  if (!silent) showLogin();
+}
+const fetchUserDocLegacy = uid => Promise.race([
+  FB.db.ref("users/"+uid).once("value"),
+  new Promise((_,rej)=>setTimeout(()=>rej(new Error("profile-timeout")), 6000))
+]);
+async function resolveSessionLegacy(user){
+  try {
+    if (isSuperAdminUser(user)){
+      Session.role="super"; Session.schoolRole="superadmin"; Session.uid=user.uid; Session.email=user.email;
+      saveSession(); adminSubscribe();
+      if (Session.schoolId) bootSchool(Session.schoolId);
+      else { showApp(); Store.requestRender(); }
+      return;
+    }
+    const snap=await fetchUserDocLegacy(user.uid);
+    const u=snap.val();
+    if(u&&(u.role==="super"||u.role==="superadmin")){
+      Session.role="super";Session.schoolRole="superadmin";Session.schoolId=null;Session.uid=user.uid;Session.email=user.email;
+      saveSession();adminSubscribe();showApp();Store.requestRender();return;
+    }
+    if (!u){ toast("error","No school membership","This account isn't linked to any school. Contact your principal or the platform admin."); await FB.auth.signOut(); showLogin(); return; }
+    if (u.active===false){ toast("error","Account deactivated","Your access was disabled. Contact your principal."); await FB.auth.signOut(); showLogin(); return; }
+    Session.role="school"; Session.schoolRole=u.role; Session.schoolId=u.schoolId; Session.uid=user.uid; Session.email=user.email;
+    saveSession();
+    bootSchool(u.schoolId);
+  } catch(e){
+    /* Match cached sessions by UID, never email — an email can change; the UID cannot. */
+    if (Session.role && Session.uid===user.uid) return; /* cached fast-path already booted */
+    /* Phase 2 acceptance #4: never drop a signed-in user to a misleading login screen when
+       the credentials were valid but users/{uid} failed to load (offline, rules, timeout).
+       Offer Retry and Sign out; the Auth session stays intact until they choose. */
+    showSessionFailure(user, e);
+  }
+}
+function sleep(ms){ return new Promise(resolve=>setTimeout(resolve,ms)); }
+function readWithTimeout(ref,timeoutMs=12000){
+  let timer;
+  return Promise.race([
+    ref.once("value"),
+    new Promise((_,reject)=>{timer=setTimeout(()=>reject(Object.assign(new Error("profile-timeout"),{code:"profile/timeout"})),timeoutMs);})
+  ]).finally(()=>clearTimeout(timer));
+}
+function retryableProfileError(error){
+  const text=((error?.code||"")+" "+(error?.message||"")).toLowerCase();
+  return /permission.denied|network|unavailable|disconnect|timeout/.test(text);
+}
+async function readProfileRetry(ref){
+  const delays=[0,400,1200,3000]; let last=null;
+  for(let i=0;i<delays.length;i++){
+    if(delays[i]) await sleep(delays[i]);
+    try{return await readWithTimeout(ref,12000);}catch(error){
+      last=error;
+      /* A fresh token is already installed. One permission retry covers RTDB socket
+         re-authentication; a second permission denial is a genuine rules denial. */
+      const denied=/permission.denied/i.test((error?.code||"")+" "+(error?.message||""));
+      if(!retryableProfileError(error)||(denied&&i>=1)) throw error;
+    }
+  }
+  throw last||new Error("profile-unavailable");
+}
+async function awaitAuthReady(user){
+  if(typeof FB.auth.authStateReady==="function"){
+    await Promise.race([FB.auth.authStateReady(),new Promise((_,reject)=>setTimeout(()=>reject(new Error("auth-state-timeout")),12000))]);
+  }
+  await Promise.race([user.getIdToken(true),new Promise((_,reject)=>setTimeout(()=>reject(new Error("token-refresh-timeout")),12000))]);
+}
+function validProfileUser(u){
+  return !!u && u.active===true && ["principal","admin","teacher","staff","super","superadmin"].includes(u.role)
+    && ((u.role==="super"||u.role==="superadmin") || (typeof u.schoolId==="string"&&u.schoolId.length>2));
+}
+function bootCachedSession(user){
+  const p=safeStore.jsonGet(profileKey(user.uid),null);
+  if(!p||p.uid!==user.uid||p.active!==true||!p.schoolId) return false;
+  const workspace=safeStore.jsonGet(cacheKey(p.schoolId),null);
+  if(!workspace?.settings) return false;
+  Session.role="school";Session.schoolRole=p.role;Session.schoolId=p.schoolId;Session.uid=user.uid;Session.email=user.email;saveSession();
+  bootSchool(p.schoolId);
+  return true;
+}
+async function resolveSessionV2(user,{source="auth"}={}){
+  const cacheBooted=bootCachedSession(user);   /* renders immediately, verifies below */
+  try{
+    await awaitAuthReady(user);
+    if(isSuperAdminUser(user)){
+      Session.role="super";Session.schoolRole="superadmin";Session.uid=user.uid;Session.email=user.email;saveSession();
+      adminSubscribe();if(Session.schoolId)bootSchool(Session.schoolId);else{showApp();Store.requestRender();}return;
+    }
+    const userSnap=await readProfileRetry(FB.db.ref("users/"+user.uid));
+    const u=userSnap.val();
+    if(!u){ await FB.auth.signOut();showLogin("This account has no school membership. Contact your principal.");return; }
+    if(!validProfileUser(u)){
+      await FB.auth.signOut();
+      const reason=u.active!==true?"This account is inactive.":"The account profile is incomplete or has an invalid role.";
+      showLogin(reason+" Contact your principal.");return;
+    }
+    if(u.role==="super"||u.role==="superadmin"){
+      Session.role="super";Session.schoolRole="superadmin";Session.schoolId=null;Session.uid=user.uid;Session.email=user.email;saveSession();
+      adminSubscribe();showApp();Store.requestRender();return;
+    }
+    const [memberSnap,profileSnap]=await Promise.all([
+      readProfileRetry(FB.db.ref(`schools/${u.schoolId}/members/${user.uid}`)),
+      readProfileRetry(FB.db.ref(`schools/${u.schoolId}/profile`))
+    ]);
+    const member=memberSnap.val(),profile=profileSnap.val();
+    if(!member||member.active!==true||member.role!==u.role||!profile){
+      await FB.auth.signOut();showLogin("Your school membership is missing, inactive, or does not match your account. Contact the principal.");return;
+    }
+    safeStore.jsonSet(profileKey(user.uid),{uid:user.uid,role:u.role,schoolId:u.schoolId,active:true,cachedAt:Date.now()});
+    Session.role="school";Session.schoolRole=u.role;Session.schoolId=u.schoolId;Session.uid=user.uid;Session.email=user.email;saveSession();
+    if(!cacheBooted) bootSchool(u.schoolId);
+  }catch(error){
+    if(cacheBooted){
+      toast("info","Working offline","Your last saved workspace is open. CampusFlow will verify access when the connection returns.");
+      return;
+    }
+    showSessionFailure(user,error);
+  }
+}
+function resolveSessionOnce(user,opts){
+  if(!LOGIN_V2_ENABLED()) return resolveSessionLegacy(user);
+  if(LoginFlow.inflight.has(user.uid)) return LoginFlow.inflight.get(user.uid);
+  const p=resolveSessionV2(user,opts).finally(()=>LoginFlow.inflight.delete(user.uid));
+  LoginFlow.inflight.set(user.uid,p);return p;
+}
+function resolveSession(user,opts){ return resolveSessionOnce(user,opts); }
+function showSessionFailure(user, err){
+  showSplash(true);
+  $("#app").hidden=true;
+  const root=$("#login-root"); root.hidden=false;
+  const isTimeout=/profile-timeout/.test(err?.message||"");
+  root.innerHTML=`
+  <div class="min-h-dvh flex items-center justify-center p-5 bg-zinc-50">
+    <div class="card w-full max-w-md p-7 text-center">
+      <div class="tile w-14 h-14 rounded-2xl bg-amber-500/10 text-amber-600 mx-auto mb-4"><i class="ph-fill ph-clock-countdown text-2xl"></i></div>
+      <h1 class="font-display font-bold text-lg tracking-tight">Signed in, but your workspace didn't load</h1>
+      <p class="text-sm text-zinc-500 leading-relaxed mt-2">Firebase accepted <b>${esc(displayAcct(user.email||""))}</b>, but your school profile could not be read${isTimeout?" in time":""}. This is usually a network or rules issue — not a wrong password.</p>
+      <button class="btn btn-primary w-full mt-5" data-action="session-retry"><i class="ph ph-arrow-clockwise"></i>Retry</button>
+      <button class="btn btn-ghost w-full mt-2 !text-rose-600 hover:!bg-rose-50" data-action="session-signout"><i class="ph ph-sign-out"></i>Sign out</button>
+      <p class="text-[11px] text-zinc-400 mt-4">If this keeps happening, check the connection and rules for <span class="font-mono">users/${esc(user.uid||"")}</span>.</p>
+    </div>
+  </div>`;
+  LoginFlow.retryUser=user;
+}
+function bootSchool(schoolId){
+  saveSession();
+  const cached=safeStore.jsonGet(cacheKey(schoolId),null);
+  Store.replaceData(cached?.settings ? cached : emptyData());
+  if (!allowedRoutes().includes(Store.raw.ui.route)) Store.raw.ui.route=isSuper()?"admin":"dashboard";
+  Sync.attach(schoolId);
+  Team.attach(schoolId);
+  const accessCache=safeStore.jsonGet(accessKey(schoolId),null);
+  const access=schoolAccessState(accessCache||{});
+  if(!isSuper()&&access.blocked) showSchoolBlocked(accessCache,access);
+  else { showApp(); refresh(); }
+}
+
+/* =================================================================================
+   MEMBER MANAGEMENT HELPERS
+   ================================================================================= */
+const BACKEND_ERRORS={
+  "functions/not-found":"The secure account service is not deployed yet. Deploy Firebase Functions, then retry.",
+  "functions/unavailable":"The secure account service is temporarily unavailable. Check the connection and retry.",
+  "functions/deadline-exceeded":"The secure server took too long. Nothing was charged or changed — retry once.",
+  "functions/permission-denied":"This account is not allowed to perform that operation.",
+  "functions/already-exists":"That username or email already has an account.",
+  "functions/invalid-argument":"Some account details are invalid.",
+  "functions/unauthenticated":"Your session expired. Sign in again."
+};
+function backendMessage(error){
+  return BACKEND_ERRORS[error?.code] || error?.message || "The secure server could not complete the request.";
+}
+let functionsPromise=null;
+async function ensureFunctions(){
+  if(FB.functions) return FB.functions;
+  if(!functionsPromise) functionsPromise=loadScriptOnce("https://www.gstatic.com/firebasejs/10.12.5/firebase-functions-compat.js",()=>typeof firebase?.app?.().functions==="function")
+    .then(()=>{ FB.functions=firebase.app().functions("asia-south1"); return FB.functions; })
+    .catch(error=>{ functionsPromise=null; throw Object.assign(error,{code:"functions/unavailable"}); });
+  return functionsPromise;
+}
+async function callBackend(name,data,timeoutMs=35000){
+  if(!FB.ready) throw Object.assign(new Error("Firebase did not load. Reload while online."),{code:"functions/unavailable"});
+  if(!navigator.onLine) throw Object.assign(new Error("Creating accounts needs an internet connection."),{code:"functions/unavailable"});
+  const functions=await ensureFunctions();
+  const callable=functions.httpsCallable(name);
+  let timer;
+  try{
+    const result=await Promise.race([
+      callable(data),
+      new Promise((_,reject)=>{ timer=setTimeout(()=>reject(Object.assign(new Error("Secure server timeout."),{code:"functions/deadline-exceeded"})),timeoutMs); })
+    ]);
+    return result.data;
+  } finally { clearTimeout(timer); }
+}
+function provisionButton(btn,label,stage){
+  if(!btn) return;
+  btn.disabled=true;
+  btn.innerHTML=`<span class="spinner"></span>${esc(label)}`;
+  const status=btn.parentElement?.querySelector("[data-provision-status]");
+  if(status){ status.hidden=false; status.textContent=stage||label; }
+}
+function resetProvisionButton(btn,html){ if(btn){ btn.disabled=false; btn.innerHTML=html; } }
+/* Account creation cannot depend on Cloud Functions billing. Identity Toolkit's REST
+   endpoint creates an Auth user without switching the platform owner's current session.
+   The returned one-time ID token lets us roll that user back if the database transaction
+   fails, so school creation is all-or-nothing from the user's perspective. */
+const IDENTITY_BASE="https://identitytoolkit.googleapis.com/v1/accounts";
+const IDENTITY_ERRORS={
+  EMAIL_EXISTS:"That username or email is already in use.",
+  EMAIL_NOT_FOUND:"That account does not exist.",
+  OPERATION_NOT_ALLOWED:"Email/password accounts are disabled in Firebase Authentication.",
+  TOO_MANY_ATTEMPTS_TRY_LATER:"Firebase temporarily blocked account creation after too many attempts. Wait a minute and retry.",
+  WEAK_PASSWORD:"The temporary password must be at least 6 characters.",
+  INVALID_EMAIL:"That username or email is not valid.",
+  INVALID_PASSWORD:"The password is not valid.",
+  INVALID_ID_TOKEN:"Firebase returned an expired or invalid rollback token.",
+  NETWORK_REQUEST_FAILED:"The network request failed. Check the connection and retry."
+};
+async function fetchWithTimeout(url,options={},timeout=18000){
+  if(typeof AbortController==="undefined"){
+    return Promise.race([
+      fetch(url,options),
+      new Promise((_,reject)=>setTimeout(()=>reject(Object.assign(new Error("Firebase did not answer within 18 seconds."),{code:"provision/timeout"})),timeout))
+    ]);
+  }
+  const ctrl=new AbortController(), timer=setTimeout(()=>ctrl.abort(),timeout);
+  try{ return await fetch(url,{...options,signal:ctrl.signal}); }
+  catch(error){
+    if(error.name==="AbortError") throw Object.assign(new Error("Firebase did not answer within 18 seconds."),{code:"provision/timeout"});
+    throw Object.assign(new Error("Could not reach Firebase Authentication. Check your connection or browser blocker."),{code:"provision/network"});
+  }finally{ clearTimeout(timer); }
+}
+async function identityRequest(method,payload,timeout=18000){
+  const response=await fetchWithTimeout(`${IDENTITY_BASE}:${method}?key=${encodeURIComponent(firebaseConfig.apiKey)}`,{
+    method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)
+  },timeout);
+  const body=await response.json().catch(()=>({}));
+  if(!response.ok){
+    const raw=String(body?.error?.message||"AUTH_REQUEST_FAILED"), key=raw.split(" : ")[0];
+    throw Object.assign(new Error(IDENTITY_ERRORS[key]||raw.replace(/_/g," ").toLowerCase()),{code:"auth/"+key.toLowerCase().replace(/_/g,"-")});
+  }
+  return body;
+}
+/* One deterministic path. The secondary-app SDK path used here previously can leave
+   createUserWithEmailAndPassword pending forever on a blocked/unstable connection,
+   which is exactly why the button appeared to do nothing. This documented REST endpoint
+   returns both the UID and a one-time token for rollback, and is hard-timed above. */
+const createAuthUser=(email,password)=>identityCreate(email,password);
+const identityCreate=(email,password)=>identityRequest("signUp",{email,password,returnSecureToken:true});
+const identityDelete=idToken=>identityRequest("delete",{idToken},10000).then(()=>true,()=>false);
+const firebaseError = e => e?.code || e?.message || String(e || "Unknown Firebase error");
+function setProvisionStage(form,stage,text,tone="working"){
+  const panel=form?.querySelector("[data-provision-status]"); if(!panel) return;
+  panel.hidden=false; panel.dataset.stage=stage;
+  panel.className=`mt-3 text-xs font-semibold rounded-xl px-3 py-2.5 text-center border ${tone==="error"?"text-rose-700 bg-rose-50 border-rose-200":tone==="success"?"text-emerald-700 bg-emerald-50 border-emerald-200":"text-sky-700 bg-sky-50 border-sky-200"}`;
+  panel.innerHTML=`<span class="inline-flex items-center gap-2">${tone==="working"?'<span class="spinner dark !w-4 !h-4"></span>':tone==="success"?'<i class="ph-fill ph-check-circle"></i>':'<i class="ph-fill ph-warning-circle"></i>'}${esc(text)}</span>`;
+}
+async function registerProvisionedUser({email,password,displayName,schoolId,schoolUpdates,form}){
+  let created=null, userUid=null, wroteProfile=false, wroteMember=false, wroteUser=false;
+  try{
+    setProvisionStage(form,"account","Creating the secure sign-in…");
+    created=await createAuthUser(email,password,displayName);
+    userUid=created.localId||created.uid;
+    if(!userUid) throw Object.assign(new Error("Firebase created no usable account ID."),{code:"provision/no-uid"});
+    setProvisionStage(form,"database","Linking the account to the school…");
+    const recs=schoolUpdates(userUid);
+    if(recs.profile){
+      await Promise.race([FB.db.ref("schools/"+schoolId+"/profile").set(recs.profile), new Promise((_,rj)=>setTimeout(()=>rj(Object.assign(new Error("profile write timed out"),{code:"provision/profile-timeout"})),16000))])
+        .catch(e=>{ throw Object.assign(e,{provisionPath:"schools/"+schoolId+"/profile"}); });
+      wroteProfile=true;
+      setProvisionStage(form,"database-1s","Profile ready · registering the principal membership…");
+    }
+    setProvisionStage(form,"database-2","Registering the principal membership…");
+    await Promise.race([FB.db.ref("schools/"+schoolId+"/members/"+userUid).set(recs.member||{}), new Promise((_,rj)=>setTimeout(()=>rj(Object.assign(new Error("member write timed out"),{code:"provision/member-timeout"})),16000))])
+      .catch(e=>{ throw Object.assign(e,{provisionPath:"schools/"+schoolId+"/members/"+userUid}); });
+    wroteMember=true;
+    setProvisionStage(form,"database-3","Linking the global user record…");
+    await Promise.race([FB.db.ref("users/"+userUid).set(recs.user||{}), new Promise((_,rj)=>setTimeout(()=>rj(Object.assign(new Error("user write timed out"),{code:"provision/user-timeout"})),16000))])
+      .catch(e=>{ throw Object.assign(e,{provisionPath:"users/"+userUid}); });
+    wroteUser=true;
+    if(recs.cleanup && Object.keys(recs.cleanup).length){
+      setProvisionStage(form,"database-4","Removing the old sign-in…");
+      await Promise.race([FB.db.ref().update(recs.cleanup), new Promise((_,rj)=>setTimeout(()=>rj(Object.assign(new Error("cleanup timed out"),{code:"provision/cleanup-timeout"})),16000))])
+        .catch(e=>{ throw Object.assign(e,{provisionPath:"cleanup"}); });
+    }
+    setProvisionStage(form,"done","Account and school records are ready.","success");
+    return {uid:userUid,email,schoolId};
+  }catch(error){
+    /* Remove only the fragments this attempt created. Never delete the parent school for
+       member provisioning, and never leave a profile pointing at a rolled-back Auth UID. */
+    if(userUid&&(wroteProfile||wroteMember||wroteUser)){
+      const cleanup={};
+      if(wroteProfile) cleanup[`schools/${schoolId}/profile`]=null;
+      if(wroteMember) cleanup[`schools/${schoolId}/members/${userUid}`]=null;
+      if(wroteUser) cleanup[`users/${userUid}`]=null;
+      await Promise.race([FB.db.ref().update(cleanup).catch(()=>{}),new Promise(r=>setTimeout(r,3000))]);
+    }
+    if(created?.idToken){
+      setProvisionStage(form,"rollback","Registration failed — removing the incomplete sign-in…");
+      const rolledBack=await Promise.race([identityDelete(created.idToken),new Promise(r=>setTimeout(()=>r(false),3000))]);
+      if(rolledBack!==true&&error&&typeof error==="object") error.orphanEmail=email;
+    }
+    throw error;
+  }
+}
+async function provisionSchoolDirect({name,principalName,email,password,trialDays,offer,form}){
+  if(!isSuper()) throw Object.assign(new Error("Only the platform owner can create schools."),{code:"provision/denied"});
+  const duplicate=Object.values(Admin.schools||{}).some(s=>String(s?.profile?.name||"").trim().toLowerCase()===name.toLowerCase());
+  if(duplicate) throw Object.assign(new Error("A school with this name already exists."),{code:"provision/duplicate-school"});
+  const schoolId=FB.db.ref("schools").push().key;
+  if(!schoolId) throw new Error("Could not reserve a school ID.");
+  const now=Date.now();
+  const result=await registerProvisionedUser({email,password,displayName:principalName,schoolId,form,schoolUpdates:puid=>({
+    profile:{name,logo:"",principalUid:puid,principalEmail:email,
+      status:trialDays?"trial":"active",plan:trialDays?"trial":"paid",offer,
+      trialEnds:trialDays?now+trialDays*86400000:null,createdAt:firebase.database.ServerValue.TIMESTAMP},
+    member:{name:principalName,email,role:"principal",active:true,createdAt:firebase.database.ServerValue.TIMESTAMP},
+    user:{name:principalName,email,role:"principal",schoolId,active:true,createdAt:firebase.database.ServerValue.TIMESTAMP}
+  })});
+  const verify=await FB.db.ref("schools/"+schoolId+"/profile").once("value");
+  if(!verify.exists()) throw Object.assign(new Error("School write returned but no profile exists."),{code:"provision/verify-failed",provisionPath:"schools/"+schoolId+"/profile"});
+  return result;
+}
+async function provisionMemberDirect({schoolId,name,email,password,role,permissions,teacherId,form}){
+  if(!canManageUsers()) throw Object.assign(new Error("Only the principal or platform owner can create accounts."),{code:"provision/denied"});
+  return registerProvisionedUser({email,password,displayName:name,schoolId,form,schoolUpdates:muid=>({
+    profile:null,
+    member:{name,email,role,active:true,permissions:permissions||{},teacherId:teacherId||null,createdAt:firebase.database.ServerValue.TIMESTAMP},
+    user:{name,email,role,schoolId,active:true,createdAt:firebase.database.ServerValue.TIMESTAMP}
+  })});
+}
+async function replaceMemberDirect({schoolId,oldUid,email,password,member,form}){
+  return registerProvisionedUser({email,password,displayName:member.name,schoolId,form,schoolUpdates:newUid=>({
+    profile:null,
+    member:{...member,email,active:true,createdAt:firebase.database.ServerValue.TIMESTAMP},
+    user:{name:member.name,email,role:member.role,schoolId,active:true,createdAt:firebase.database.ServerValue.TIMESTAMP},
+    cleanup:{
+      [`schools/${schoolId}/members/${oldUid}`]:null,
+      [`users/${oldUid}`]:null
+    }
+  })});
+}
+/* The server removes the old Auth account too; the client path cannot, so it is a last resort. */
+async function replaceMemberSecure(args){
+  try{
+    /* 55s: the callable itself is capped at 60s server-side, so cutting in earlier than
+       that only produces a false timeout on a slow-but-successful replacement. */
+    await callBackend("replaceMemberLogin",{schoolId:args.schoolId,oldUid:args.oldUid,email:args.email,password:args.password},55000);
+  }catch(e){
+    if(!["functions/unavailable","functions/deadline-exceeded","functions/not-found"].includes(e?.code)) throw e;
+    await replaceMemberDirect(args);
+    toast("error","Old sign-in still exists","The new sign-in works, but the old account could not be removed by the app. Delete it in Firebase Console → Authentication, or its password keeps working.");
+  }
+}
+function provisionMessage(error){
+  const base=provisionMessageBase(error);
+  return error?.orphanEmail ? base+` An unused sign-in for ${error.orphanEmail} may remain — delete it in Firebase Console → Authentication.` : base;
+}
+function provisionMessageBase(error){
+  const path=error?.provisionPath;
+  if(error?.code==="provision/timeout") return "Firebase Authentication took too long. Check the connection and retry — no account was kept.";
+  if(error?.code==="provision/database-timeout"||error?.code==="provision/profile-timeout"||error?.code==="provision/member-timeout"||error?.code==="provision/user-timeout"||error?.code==="provision/cleanup-timeout")
+    return (path?`Write to ${path} timed out. `:"")+"The incomplete sign-in was removed — check your connection and try once.";
+  if(/permission_denied|permission denied/i.test(error?.message||"")||/PERMISSION_DENIED/i.test(error?.code||""))
+    return (path?`Firebase rejected the write to ${path}. `:"")+`Signed-in UID: ${FB.auth?.currentUser?.uid||"unknown"}. Deploy database.rules.json (firebase deploy --only database), then retry — the incomplete sign-in was removed.`;
+  if(/operation not allowed|email\/password/i.test(error?.message||"")) return "Enable Email/Password in Firebase Console → Authentication → Sign-in method, then retry.";
+  return `${backendMessage(error)} [${firebaseError(error)}]`;
+}
+const forgotState={ email:"", sending:false, error:"" };
+function openAccount(){
+  const u=FB.ready?FB.auth.currentUser:null;
+  const email=Session.email||u?.email||"";
+  const isUser=isLocalAcct(email);
+  const title=Session.schoolRole==="superadmin"?"Platform administrator":(Session.schoolRole?fmtRole(Session.schoolRole):"Account");
+  Modal.open(()=>`
+    <div class="p-6">
+      <div class="flex items-start justify-between gap-3">
+        <div class="flex items-center gap-3 min-w-0">
+          <div class="tile w-12 h-12 rounded-2xl bg-gradient-to-br from-emerald-500 to-teal-600 text-white font-display font-bold text-base">${esc(initials(displayAcct(email)||"U"))}</div>
+          <div class="min-w-0">
+            <div class="font-bold text-[15px] truncate">${esc(title)}</div>
+            <div class="text-[11px] text-zinc-500 font-medium truncate flex items-center gap-1.5">
+              <i class="ph ${isUser?"ph-user-circle":"ph-envelope-simple"}"></i>${esc(displayAcct(email)||"—")}
+              ${isUser?`<span class="badge bg-zinc-100 text-zinc-500">username account</span>`:""}
+            </div>
+          </div>
+        </div>
+        <button class="icon-btn" data-action="modal-close" aria-label="Close"><i class="ph ph-x text-lg"></i></button>
+      </div>
+
+      <form class="mt-5 space-y-3" data-form="change-pass" autocomplete="off">
+        <div class="text-[11px] font-extrabold uppercase tracking-[.08em] text-zinc-400">Change password</div>
+        <div><label class="label">Current password</label>
+          <input type="password" class="field" id="cp-current" required autocomplete="current-password" placeholder="••••••••"></div>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div><label class="label">New password</label>
+            <input type="password" class="field" id="cp-new" required minlength="6" autocomplete="new-password" placeholder="min. 6 characters"></div>
+          <div><label class="label">Repeat new password</label>
+            <input type="password" class="field" id="cp-new2" required minlength="6" autocomplete="new-password" placeholder="repeat it"></div>
+        </div>
+        <div id="cp-err" hidden class="text-xs font-semibold text-rose-600 bg-rose-50 border border-rose-200 rounded-xl px-3 py-2.5"></div>
+        <button type="submit" class="btn btn-primary w-full"><i class="ph ph-key"></i>Update password</button>
+        <p class="text-[11px] text-zinc-400 text-center leading-relaxed">Choose a strong password you don't use anywhere else.</p>
+      </form>
+
+      <div class="border-t border-zinc-100 mt-5 pt-4">
+        <button class="btn btn-ghost w-full !text-rose-600 hover:!bg-rose-50" data-action="sign-out"><i class="ph ph-sign-out"></i>Sign out</button>
+      </div>
+    </div>`,{reactive:false});
+}
+function openMemberReset(muid, m){
+  const old=displayAcct(m.email||"");
+  const pw=genPassword();
+  Modal.open(()=>`
+    <form class="p-6" data-form="member-reset" data-muid="${muid}" autocomplete="off">
+      <div class="flex items-start justify-between"><div>
+        <h3 class="font-display font-bold text-xl tracking-tight">New sign-in for ${esc(m.name||"member")}</h3>
+        <p class="text-xs text-zinc-500 mt-0.5 leading-relaxed">A fresh username and password will be created. Role, permissions and linked teacher carry over.</p></div>
+        <button type="button" class="icon-btn" data-action="modal-close" aria-label="Close"><i class="ph ph-x text-lg"></i></button></div>
+      <div class="mt-4 flex items-start gap-2.5 bg-zinc-50 border border-zinc-200/70 rounded-xl p-3 text-xs leading-relaxed">
+        <i class="ph-fill ph-info text-sky-500 text-base mt-0.5"></i>
+        <span>Username <b>${esc(old)}</b> can't be reused — the old sign-in still occupies it. Pick a new one, e.g. <b>${esc(old)}2</b>.</span>
+      </div>
+      <div class="space-y-3.5 mt-4">
+        <div><label class="label">New username</label>
+          <input type="text" class="field font-mono" id="mr-user" value="${esc(old)}2" autocapitalize="none" spellcheck="false" required></div>
+        <div><label class="label">Temporary password</label>
+          <div class="flex gap-2">
+            <input type="text" class="field font-mono" id="mr-pass" value="${pw}">
+            <button type="button" class="btn btn-ghost flex-none" data-action="gen-pw-member" aria-label="Regenerate password"><i class="ph ph-arrows-clockwise"></i></button>
+          </div></div>
+      </div>
+      <button type="submit" class="btn btn-primary w-full mt-5" id="mr-submit"><i class="ph ph-key"></i>Create new sign-in</button>
+      <div data-provision-status hidden class="mt-3 text-xs font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-xl px-3 py-2.5 text-center">Creating replacement sign-in securely…</div>
+      <p class="text-[11px] text-zinc-400 text-center mt-3 leading-relaxed">The old sign-in stops working immediately. Share the new credentials with them.</p>
+    </form>`,{reactive:false});
+}
+function showCredentialsModal(name, email, pass){
+  const who=displayAcct(email);
+  const label=isLocalAcct(email)?"Username":"Email";
+  const appUrl=location.protocol.startsWith("http")?location.origin:"CampusFlow";
+  const text=`CampusFlow — ${name}\n${appUrl}\n${label}: ${who}\nPassword: ${pass}`;
+  Modal.open(()=>`
+    <div class="p-6">
+      <div class="flex flex-col items-center text-center">
+        <div class="tile w-14 h-14 rounded-2xl bg-emerald-500/10 text-emerald-600 mb-3"><i class="ph-fill ph-user-check text-2xl"></i></div>
+        <h3 class="font-display font-bold text-lg tracking-tight">Account ready</h3>
+        <p class="text-xs text-zinc-500 mt-1">Share these credentials with <b>${esc(name)}</b> — they can sign in immediately.</p>
+      </div>
+      <div class="mt-4 bg-zinc-50 border border-zinc-200 rounded-xl p-4 font-mono text-[12px] leading-relaxed select-all break-all">
+        ${esc(label)}: <b>${esc(who)}</b><br>Password: <b>${esc(pass)}</b>
+      </div>
+      <div class="flex gap-2.5 mt-5">
+        <button class="btn btn-ghost flex-1" data-action="modal-close">Close</button>
+        <a class="btn btn-primary flex-1 !bg-[#25D366] hover:!bg-[#1fb857]" href="https://wa.me/?text=${encodeURIComponent(text)}" target="_blank" rel="noopener"><i class="ph ph-whatsapp-logo"></i>WhatsApp</a>
+        <button class="btn btn-soft flex-1" data-action="copy-text" data-text="${esc(text)}"><i class="ph ph-copy"></i>Copy</button>
+      </div>
+    </div>`);
+}
+function openMemberForm(muid){
+  const draftMemberPw=genPassword(); /* generated once per opening, not on every re-render */
+  if (muid){
+    const m=App.members[muid]; if(!m) return;
+    Modal.open(()=>`
+      <div class="p-6">
+        <div class="flex items-start justify-between">
+          <div><h3 class="font-display font-bold text-xl tracking-tight">${esc(m.name||"Edit member")}</h3>
+          <div class="text-xs text-zinc-500 mt-0.5">${esc(m.email||"")}</div></div>
+          <button class="icon-btn" data-action="modal-close" aria-label="Close"><i class="ph ph-x text-lg"></i></button>
+        </div>
+        <div class="space-y-4 mt-5">
+          <div><label class="label">Display name</label>
+            <input class="field" data-fid="mb-name" data-input="member-name" data-id="${muid}" value="${esc(m.name||"")}" autocomplete="off"></div>
+          <div>
+            <label class="label">Role</label>
+            <div class="grid grid-cols-3 gap-2">
+              ${["admin","teacher","staff"].map(r=>`<label class="role-pick"><input type="radio" name="mrole" class="sr-only" data-change="member-role" data-id="${muid}" value="${r}" ${m.role===r?"checked":""}>
+                <span class="rbox w-full">${fmtRole(r)}</span></label>`).join("")}
+            </div>
+          </div>
+          <div class="space-y-2">
+            <label class="label">Permissions</label>
+            <label class="flex items-center gap-3 p-2.5 rounded-xl border border-zinc-200/80 cursor-pointer min-h-[48px]">
+              <input type="checkbox" class="sr-only" data-change="member-perm" data-id="${muid}" data-perm="editWorkspace" ${m.permissions?.editWorkspace?"checked":""}>
+              <span class="switch"></span>
+              <span class="text-[13px] font-semibold flex-1">Can edit workspace<span class="block text-[10px] font-medium text-zinc-400">Timetable, database &amp; relief changes</span></span>
+            </label>
+            <label class="flex items-center gap-3 p-2.5 rounded-xl border border-zinc-200/80 cursor-pointer min-h-[48px]">
+              <input type="checkbox" class="sr-only" data-change="member-perm" data-id="${muid}" data-perm="viewUsers" ${m.permissions?.viewUsers?"checked":""}>
+              <span class="switch"></span>
+              <span class="text-[13px] font-semibold flex-1">Can view team<span class="block text-[10px] font-medium text-zinc-400">See the member directory</span></span>
+            </label>
+            <label class="flex items-center gap-3 p-2.5 rounded-xl border border-zinc-200/80 cursor-pointer min-h-[48px]">
+              <input type="checkbox" class="sr-only" data-change="member-perm" data-id="${muid}" data-perm="editBranding" ${m.permissions?.editBranding?"checked":""}>
+              <span class="switch"></span>
+              <span class="text-[13px] font-semibold flex-1">Can change school look<span class="block text-[10px] font-medium text-zinc-400">School colours &amp; logo for everyone</span></span>
+            </label>
+          </div>
+          <div><label class="label">Link timetable profile (optional)</label>
+            <select class="field" data-change="member-teacher" data-id="${muid}">
+              <option value="">— none —</option>
+              ${state.teachers.map(t=>`<option value="${t.id}" ${m.teacherId===t.id?"selected":""}>${esc(t.name)} (${esc(t.code||"")})</option>`).join("")}
+            </select></div>
+          <label class="flex items-center gap-3 p-2.5 rounded-xl border ${m.active!==false?"border-emerald-200 bg-emerald-50/40":"border-zinc-200"} cursor-pointer min-h-[48px]">
+            <input type="checkbox" class="sr-only" data-change="member-active" data-id="${muid}" ${m.active!==false?"checked":""}>
+            <span class="switch"></span>
+            <span class="text-[13px] font-semibold flex-1">Account active<span class="block text-[10px] font-medium text-zinc-400">Deactivated users are signed out &amp; blocked instantly</span></span>
+          </label>
+        </div>
+        <button class="btn btn-primary w-full mt-5" data-action="modal-close"><i class="ph ph-check"></i>Done</button>
+        <p class="text-[11px] text-zinc-400 text-center mt-2.5 flex items-center justify-center gap-1.5"><i class="ph-fill ph-lightning text-emerald-500"></i>Every change applies instantly, everywhere</p>
+      </div>`);
+  } else {
+    Modal.open(()=>`
+      <form class="p-6" data-form="member-draft" autocomplete="off">
+        <div class="flex items-start justify-between"><div>
+          <h3 class="font-display font-bold text-xl tracking-tight">Add a user</h3>
+          <p class="text-xs text-zinc-500 mt-1">They'll sign in with the email &amp; temporary password shown next.</p></div>
+          <button type="button" class="icon-btn" data-action="modal-close" aria-label="Close"><i class="ph ph-x text-lg"></i></button></div>
+        <div class="space-y-4 mt-5">
+          <div><label class="label">Full name</label>
+            <input class="field" id="draft-m-name" placeholder="e.g. Priya Nair"></div>
+          <div><label class="label">Username or email</label>
+            <input type="text" class="field" id="draft-m-email" placeholder="priya" autocapitalize="none" spellcheck="false">
+            <p class="text-[11px] text-zinc-400 mt-1.5 leading-relaxed">No email? Just type a simple username like <b>priya</b> — they'll sign in with that. Use a real email only if they want password-reset links.</p></div>
+          <div><label class="label">Role</label>
+            <div class="grid grid-cols-3 gap-2">
+              ${["admin","teacher","staff"].map((r,i)=>`<label class="role-pick"><input type="radio" name="dmrole" class="sr-only" value="${r}" ${i===1?"checked":""}>
+                <span class="rbox w-full">${fmtRole(r)}</span></label>`).join("")}
+            </div>
+            <p class="text-[11px] text-zinc-400 mt-1.5 leading-relaxed">Admins can edit the workspace by default. Teachers &amp; staff start view-only — grant edit rights anytime.</p>
+          </div>
+          <div class="space-y-2">
+            <label class="label">Permissions</label>
+            <label class="flex items-center gap-3 p-2.5 rounded-xl border border-zinc-200/80 cursor-pointer min-h-[48px]">
+              <input type="checkbox" class="sr-only" id="draft-m-edit">
+              <span class="switch"></span>
+              <span class="text-[13px] font-semibold flex-1">Can edit workspace</span>
+            </label>
+            <label class="flex items-center gap-3 p-2.5 rounded-xl border border-zinc-200/80 cursor-pointer min-h-[48px]">
+              <input type="checkbox" class="sr-only" id="draft-m-view">
+              <span class="switch"></span>
+              <span class="text-[13px] font-semibold flex-1">Can view team</span>
+            </label>
+          </div>
+          <div><label class="label">Link timetable profile (optional)</label>
+            <select class="field" id="draft-m-teacher">
+              <option value="">— none —</option>
+              ${state.teachers.map(t=>`<option value="${t.id}">${esc(t.name)} (${esc(t.code||"")})</option>`).join("")}
+            </select></div>
+          <div><label class="label">Temporary password</label>
+            <div class="flex gap-2">
+              <input class="field font-mono" id="draft-m-pass" value="${draftMemberPw}">
+              <button type="button" class="btn btn-ghost flex-none" data-action="gen-pw-member" aria-label="Regenerate password"><i class="ph ph-arrows-clockwise"></i></button>
+            </div></div>
+        </div>
+        <button type="submit" class="btn btn-primary w-full mt-6" id="member-submit"><i class="ph ph-user-plus"></i>Create account</button>
+        <div data-provision-status hidden class="mt-3 text-xs font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-xl px-3 py-2.5 text-center">Contacting secure account service…</div>
+      </form>`,{reactive:false});
+  }
+}
+
+/* =================================================================================
+   EVENT DELEGATION
+   ================================================================================= */
+const needEdit = () => { if (canEdit()) return true; toast("error","View-only access","Ask your principal to grant “Can edit workspace”."); return false; };
+const needSettings = () => { if (canEditSettings()) return true; toast("error","Principal only","Schedule settings & school identity are locked to the principal."); return false; };
+const actions={
+  "nav": el=>{ const r=el.dataset.route;
+    if (r==="admin"){
+      Store.flush();
+      if(Sync.active&&(Sync.pending||Sync.localDirty)) Sync.pushNow();
+      Session.schoolId=null; saveSession(); Sync.detach(); Team.detach();
+      reliefStopListen(); findStopAttendance();
+      if(isSuper()&&!Admin._sRef) adminSubscribe();
+    }
+    if (r!=="relief") reliefStopListen();
+    if (r!=="find") findStopAttendance();
+    Store.raw.ui.route=r; Store.flush(); Store.requestRender(); Modal.close(); },
+  "goto-look": ()=>{ Store.raw.ui.dbTab="branding"; Store.raw.ui.route="database"; Store.flush(); Store.requestRender(); },
+  "goto-database": el=>{ if(el?.dataset?.tab) Store.raw.ui.dbTab=el.dataset.tab; Store.raw.ui.route="database"; Store.flush(); Store.requestRender(); },
+  "toast-close": el=>{ const t=el.closest(".toast"); t?.classList.add("leaving"); setTimeout(()=>t?.remove(),220); },
+  "mkt-platform": el=>{ MKT.platform=el.dataset.id; MKT.variant=0; renderMarketing(); },
+  "mkt-tone": el=>{ MKT.tone=el.dataset.id; MKT.variant=0; renderMarketing(); },
+  "mkt-variant": el=>{ MKT.variant=Number(el.dataset.id)||0; renderMarketing(); },
+  "mkt-copy": async el=>{
+    const v=document.getElementById(el.dataset.field)?.value||"";
+    try{ await navigator.clipboard.writeText(v); toast("success","Copied","Paste it into "+MKT_PLATFORMS[MKT.platform].label+"."); }
+    catch(_){ toast("error","Copy failed","Select the text and copy it manually."); }
+  },
+  "mkt-copy-tags": async el=>{
+    try{ await navigator.clipboard.writeText(el.dataset.text||""); toast("success","Hashtags copied","Paste them after your caption."); }
+    catch(_){ toast("error","Copy failed","Select the text and copy it manually."); }
+  },
+  "mkt-post": el=>{
+    const id=el.dataset.id, spec=CREATIVE_SPECS[id]; if(!spec) return;
+    const canvas=document.createElement("canvas"); drawCreative(canvas,id,true);
+    canvas.toBlob(b=>mktSaveBlob("campusflow-"+MKT.platform+"-"+spec.file.replace(/^campusflow-/,"").replace(".png","")+".png",b),"image/png");
+    const idx=Number(el.dataset.v)||0, tone=el.dataset.tone||MKT.tone;
+    mktSaveBlob("campusflow-"+MKT.platform+"-post-caption.txt",new Blob([mktCaption(MKT.platform,tone,idx)+"\n\n"+mktHashtags(MKT.platform,tone).join(" ")],{type:"text/plain"}));
+    toast("success","Post downloaded","Banner PNG and caption text. If your browser asks, allow multiple downloads.");
+  },
+  "mkt-logo-size": el=>{
+    const px=Number(el.dataset.id), name="campusflow-"+(el.dataset.name||"logo")+"-"+px+".png";
+    mktLogoCanvas("icon",px).toBlob(b=>{ mktSaveBlob(name,b); toast("success","Logo downloaded",name); },"image/png");
+  },
+  "mkt-feedlang": el=>{ MKT.feedLang=el.dataset.id; renderMarketing(); },
+  "mkt-logo": el=>{
+    const id=el.dataset.id;
+    if(id==="svg"){ mktSaveBlob("campusflow-logo.svg",new Blob([MKT_LOGO_SVG],{type:"image/svg+xml"})); toast("success","Logo downloaded","Vector SVG for print and web."); return; }
+    const isLock=id==="lockup", name=isLock?"campusflow-wide-logo.png":"campusflow-profile-"+id+".png";
+    const c=isLock?mktLogoCanvas("lockup"):mktLogoCanvas("icon",Number(id));
+    c.toBlob(b=>{ mktSaveBlob(name,b); toast("success","Logo downloaded",name+" is ready."); },"image/png");
+  },
+  "mkt-pack": el=>{
+    const p=el.dataset.id, P=MKT_PLATFORMS[p]; if(!P) return;
+    for(const id of P.creatives){
+      const spec=CREATIVE_SPECS[id]; const canvas=document.createElement("canvas"); drawCreative(canvas,id,true);
+      canvas.toBlob(b=>mktSaveBlob(spec.file.replace(".png","-"+p+".png"),b),"image/png");
+    }
+    mktLogoCanvas("icon",1024).toBlob(b=>mktSaveBlob("campusflow-profile-1024.png",b),"image/png");
+    mktSaveBlob("campusflow-"+p+"-captions.txt",new Blob([mktPackText(p,MKT.tone)],{type:"text/plain"}));
+    toast("success",P.label+" pack downloaded",(P.creatives.length+2)+" files. If your browser asks, allow multiple downloads.");
+  },
+  "copy-text": async el=>{
+    /* newlines inside an HTML attribute are unreliable across browsers — the caption text
+       is stored with a placeholder and restored here so WhatsApp broadcasts keep line breaks */
+    const text=String(el.dataset.text||"").replace(/\\n/g,"\n");
+    try{
+      await navigator.clipboard.writeText(text);
+      toast("success","Copied","Share it over WhatsApp or email.");
+    }catch(_){
+      const ta=document.createElement("textarea"); ta.value=text; ta.style.position="fixed"; ta.style.opacity="0";
+      document.body.appendChild(ta); ta.select();
+      try{ document.execCommand("copy"); toast("success","Copied","Share it over WhatsApp or email."); }
+      catch(e2){ toast("error","Copy failed","Select and copy manually."); }
+      ta.remove();
+    }
+  },
+
+  "pick-class": el=>{ state.ui.activeClassId=el.dataset.id; },
+  "open-cell": el=>{ if(needEdit() && needUnlocked(el.dataset.cid)) openCellEditor(el.dataset.cid,+el.dataset.d,+el.dataset.p); },
+  "view-cell": el=>openCellViewer(el.dataset.cid,+el.dataset.d,+el.dataset.p),
+  "open-class-grid": el=>{ state.ui.activeClassId=el.dataset.id; Store.raw.ui.route="timetable"; Store.flush(); },
+  "open-class-setup": el=>{ Store.raw.ui.curClassId=el.dataset.id; Store.raw.ui.dbTab="curriculum"; Store.raw.ui.route="database"; Store.flush(); Store.requestRender(); },
+  "cell-show-all": ()=>{ cellEditor.showAll=!cellEditor.showAll; Modal.rerender(); },
+  "clear-cell": el=>{ if(!needEdit()) return; setCell(el.dataset.cid,+el.dataset.d,+el.dataset.p,null); toast("info","Period cleared","The slot is now a free period."); Modal.close(); },
+  "modal-close": ()=>Modal.close(),
+  "modal-run": async el=>{
+    const a=(Modal._cfgActions||[])[+el.dataset.idx]; if(!a) return;
+    try{ await a.action(); }
+    catch(e){ if(e) toast("error","Couldn't finish that",e.message||String(e)); }
+  },
+  "modal-backdrop": (el,e)=>{ if(e.target===el) Modal.close(); },
+  "confirm-respond": el=>{ const r=confirmResolver; confirmResolver=null; Modal.close(); setTimeout(()=>r?.(el.dataset.val==="1"),200); },
+  "db-tab": el=>{ Store.raw.ui.dbTab=el.dataset.tab; Store.flush(); Store.requestRender(); },
+
+  "set-lang": el=>setLang(el.dataset.lang),
+  "toggle-pw": el=>{ const i=$("#login-pass"); if(!i) return;
+    i.type=i.type==="password"?"text":"password";
+    el.innerHTML=`<i class="ph ${i.type==="password"?"ph-eye":"ph-eye-slash"} text-lg"></i>`; i.focus(); },
+  "teacher-all-grades": el=>{ if(!needEdit()) return;
+    const t=T(el.dataset.id); if(!t) return;
+    delete t.grades; t.gradesNone=false;
+    toast("success","Grade limit removed",`${t.name} can now be scheduled in any grade.`);
+  },
+  "tf-toggle-avail": ()=>{ teacherForm.showAvail=!teacherForm.showAvail; Modal.rerender(); },
+  "add-teacher": ()=>{ if(needEdit()) openTeacherForm(null); },
+  "edit-teacher": el=>{ if(needEdit()) openTeacherForm(el.dataset.id); },
+  "delete-teacher": async el=>{
+    if(!needEdit()) return;
+    const t=T(el.dataset.id); if(!t) return;
+    const refs=teacherLoad(t.id);
+    const ok=await confirmDialog({ title:"Delete "+t.name+"?",
+      message:`${refs?`This will unassign <b>${refs} scheduled lesson${refs!==1?"s":""}</b> across all classes. `:""}This action cannot be undone.` });
+    if(!ok) return;
+    for (const cid in state.timetable) state.timetable[cid].forEach(row=>row.forEach((c,p)=>{
+      if (c) row[p]=lessonsOf(c).map(L=>L.teacherId===t.id?{...L,teacherId:null}:L);
+    }));
+    Object.values(state.absences).forEach(rec=>{
+      rec.teachers=(rec.teachers||[]).filter(x=>x!==t.id);
+      Object.keys(rec.relief||{}).forEach(k=>{ if(rec.relief[k]===t.id) rec.relief[k]=null; });
+    });
+    if (canManageUsers()){
+      Object.entries(App.members).forEach(([muid,m])=>{ if(m.teacherId===t.id) FB.db.ref("schools/"+Session.schoolId+"/members/"+muid).update({teacherId:null}).catch(()=>{}); });
+    }
+    state.curriculum=(state.curriculum||[]).map(r=>r.teacherId===t.id?{...r,teacherId:null}:r);
+    state.teachers=state.teachers.filter(x=>x.id!==t.id);
+    toast("success","Teacher removed", t.name+" and all references were cleaned up.");
+  },
+  "add-subject": ()=>{ if(needEdit()) openSubjectForm(null); },
+  "edit-subject": el=>{ if(needEdit()) openSubjectForm(el.dataset.id); },
+  "delete-subject": async el=>{
+    if(!needEdit()) return;
+    const s=S(el.dataset.id); if(!s) return;
+    let refs=0; for (const cid in state.timetable) state.timetable[cid].forEach(r=>r.forEach(c=>{ refs+=lessonsOf(c).filter(L=>L.subjectId===s.id).length; }));
+    const ok=await confirmDialog({ title:"Delete "+s.name+"?",
+      message:`${refs?`<b>${refs} scheduled lesson${refs!==1?"s":""}</b> will be cleared from timetables. `:""}Teachers will lose this qualification too.` });
+    if(!ok) return;
+    for (const cid in state.timetable) state.timetable[cid].forEach(row=>row.forEach((c,p)=>{
+      if (c){ const kept=lessonsOf(c).filter(L=>L.subjectId!==s.id); row[p]=kept.length?kept:null; }
+    }));
+    state.teachers.forEach(t=>{ t.subjectIds=(t.subjectIds||[]).filter(x=>x!==s.id); });
+    state.curriculum=(state.curriculum||[]).filter(r=>r.subjectId!==s.id);
+    state.subjects=state.subjects.filter(x=>x.id!==s.id);
+    toast("success","Subject removed", s.name+" was removed everywhere.");
+  },
+  "delete-class": async el=>{
+    if(!needEdit()) return;
+    const c=C(el.dataset.id); if(!c) return;
+    if (c.locked){ toast("error","Class is locked","Unlock "+c.name+" before deleting it."); return; }
+    const cf=classFill(c.id);
+    const ok=await confirmDialog({ title:"Delete "+c.name+"?",
+      message:`${cf.f?`Its timetable with <b>${cf.f} lesson${cf.f!==1?"s":""}</b> will be permanently removed. `:""}This cannot be undone.` });
+    if(!ok) return;
+    delete state.timetable[c.id];
+    state.curriculum=(state.curriculum||[]).filter(r=>r.classId!==c.id);
+    Object.values(state.absences).forEach(rec=>{ Object.keys(rec.relief||{}).forEach(k=>{ if(k.startsWith(c.id+"|")) delete rec.relief[k]; }); });
+    state.classes=state.classes.filter(x=>x.id!==c.id);
+    if (state.ui.activeClassId===c.id) state.ui.activeClassId=state.classes[0]?.id||null;
+    toast("success","Class removed", c.name+" was deleted.");
+  },
+
+  "export-json": ()=>{
+    const {version,settings,subjects,teachers,classes,curriculum,timetable,absences}=state;
+    let lessons=0;
+    Object.values(timetable||{}).forEach(g=>(g||[]).forEach(r=>(r||[]).forEach(c=>{ lessons+=lessonsOf(c).length; })));
+    const payload={ format:BACKUP_FORMAT, app:"CampusFlow", exportedAt:new Date().toISOString(),
+      /* A manifest makes a backup self-describing: a school can open the file and
+         see what is inside, and an import can say what it found before changing
+         anything. */
+      manifest:{ school:settings.schoolName||"", format:BACKUP_FORMAT, app:"CampusFlow",
+        exportedAt:new Date().toISOString(), counts:{ teachers:teachers.length, subjects:subjects.length, classes:classes.length, lessons } },
+      school: state.settings.schoolName, version, settings, subjects, teachers, classes, curriculum, timetable, absences };
+    const blob=new Blob([JSON.stringify(payload,null,2)],{type:"application/json"});
+    const a=document.createElement("a"); a.href=URL.createObjectURL(blob);
+    a.download=(state.settings.schoolName||"campusflow").replace(/[^a-z0-9]+/gi,"-").toLowerCase()+"-backup-"+localISO()+".json";
+    a.click(); URL.revokeObjectURL(a.href);
+    toast("success","Backup exported","Everything is in that file — keep it somewhere safe.");
+  },
+  "import-trigger": ()=>{ if(needSettings()) $("#import-file").click(); },
+  "import-apply": el=>{
+    const P=importPending; Modal.close(); if(!P) return;
+    importPending=null;
+    if(el.dataset.mode==="merge"){
+      const r=mergeImported(P.conv);
+      toast("success","Merged into your workspace",
+        `${r.addedT} teacher(s), ${r.addedS} subject(s) and ${r.addedC} class(es) added · ${r.filled} lesson(s) placed` +
+        (r.kept?` · ${r.kept} slot(s) already had a lesson and were left exactly as they were`:"")+".");
+    } else {
+      applyConverted(P.conv.data);
+      toast("success","Backup restored",
+        `${P.conv.stats.teachers} teachers · ${P.conv.stats.classes} classes · ${P.conv.stats.lessons} lessons — synced to the cloud.`);
+    }
+  },
+  "export-workbook": async ()=>{
+    if(!needSettings()) return;
+    try{
+      const r=await exportWorkbook();
+      toast("success","Workbook exported",`${r.classes} class timetable(s), ${r.teachers} teachers and ${r.subjects} subjects. Open it in Excel — and it can be imported straight back.`);
+    }catch(err){ toast("error","Export failed",(err&&err.message)||"The workbook could not be built."); }
+  },
+  "reset-workspace": async ()=>{
+    if(!needSettings()) return;
+    const ok=await confirmDialog({ title:"Reset to an empty workspace?",
+      message:"This permanently removes <b>all teachers, subjects, classes, class setup, timetables and relief history</b> from this school on every synced device. The school name, logo, settings and user accounts stay. Export a backup first if you may need the data again.",
+      confirmLabel:"Reset workspace", icon:"ph-broom" });
+    if(!ok) return;
+    resetWorkspaceData();
+    toast("success","Workspace is empty","Sample and school scheduling data were removed locally and queued for cloud sync.");
+  },
+  "clear-all": ()=>actions["reset-workspace"](),
+  "logo-trigger": ()=>{ if(needBranding()) $("#logo-file").click(); },
+  "brand-pick": el=>{ if(!needBranding()) return; const c=el?.dataset?.c||""; state.settings.brand=/^#[0-9a-f]{6}$/i.test(c)?c:""; applyBrand(); Store.flush(); Store.requestRender(); toast("success","Look updated","Every member will see this when they sign in."); },
+  "logo-remove": ()=>{ if(!needBranding()) return; state.settings.logo=""; toast("info","Logo removed","The default monogram is back."); },
+
+  "relief-today": ()=>{ state.ui.reliefDate=localISO(); },
+  "relief-auto": ()=>{
+    if(!needEdit()) return;
+    const iso=state.ui.reliefDate; const dayIdx=dayIndexFor(iso);
+    if (dayIdx<0||dayIdx>=state.settings.daysPerWeek){ toast("error","No school day","Relief cannot be optimized for this date."); return; }
+    const rec=absRecRead(iso); if(!(rec.teachers||[]).length){ toast("info","No absences","Mark a teacher absent first."); return; }
+    const n=autoAssignAll(iso,_reliefAttDay);
+    toast("success","Relief re-optimized", n?n+" cover assignment"+(n!==1?"s":"")+" computed from live availability.":"No free matching teachers found.");
+  },
+  "absence-off": el=>{
+    if(!needEdit()) return;
+    const rec=absRecWrite(state.ui.reliefDate); const tid=el.dataset.id;
+    rec.teachers=(rec.teachers||[]).filter(x=>x!==tid);
+    rec.present=[...new Set([...(rec.present||[]),tid])];
+    const d=dayIndexFor(state.ui.reliefDate);
+    Object.keys(rec.relief||{}).forEach(k=>{
+      const parts=k.split("|"), li=parts.length===3?(+parts[2]||0):0;
+      const L=lessonsOf(getCell(parts[0],d,+parts[1]))[li];
+      if (L?.teacherId===tid) delete rec.relief[k];
+    });
+  },
+  "att-manual-present": async el=>{
+    if(!needEdit()) return;
+    const tid=el.dataset.id; if(!tid) return;
+    try{
+      if(window.ATT){ await ATT.clockManual("in"); toast("success","Marked present","Recorded as a manual sign-in and removed from auto-absent."); }
+      else {
+        const rec=absRecWrite(state.ui.reliefDate);
+        rec.present=[...new Set([...(rec.present||[]),tid])];
+        rec.teachers=(rec.teachers||[]).filter(x=>x!==tid);
+        toast("success","Marked present","They won't be counted as absent today.");
+      }
+    }catch(e){ toast("error","Could not record", backendMessage(e)); }
+  },
+  "copy-whatsapp": async ()=>{
+    const txt=buildWhatsApp(state.ui.reliefDate);
+    try { await navigator.clipboard.writeText(txt); toast("success","Copied to clipboard","Paste it straight into WhatsApp."); }
+    catch(e){
+      const ta=document.createElement("textarea"); ta.value=txt; document.body.appendChild(ta); ta.select();
+      try{ document.execCommand("copy"); toast("success","Copied to clipboard","Paste it straight into WhatsApp."); }
+      catch(_){ toast("error","Copy failed","Select the preview text manually."); }
+      ta.remove();
+    }
+  },
+  "print-now": ()=>{
+    const pr=state.ui.print;
+    const pool=pr.doc==="class"?state.classes:pr.doc==="teacher"?state.teachers:[];
+    const target=pool.find(x=>x.id===pr.targetId)||pool[0];
+    setPaper(pr.paper);
+    $("#print-root").innerHTML=`<div class="pdoc">${buildPrintDoc(pr.doc, target?.id)}</div>`;
+    setTimeout(()=>window.print(), 40);
+  },
+
+  /* team */
+  "add-member": ()=>{ if(canManageUsers()) openMemberForm(null); },
+  "edit-member": el=>{ if(canManageUsers()) openMemberForm(el.dataset.id); },
+  "reset-member-pw": async el=>{
+    const email=el.dataset.email;
+    const m=el.dataset.id?App.members[el.dataset.id]:null;
+    if(!email){ toast("error","No account on record",""); return; }
+    if (isLocalAcct(email)){
+      if (!m){ toast("info","Username account","This principal has no email, so reset links can't be sent. Open the school and reset it from the Team screen."); return; }
+      const ok=await confirmDialog({ title:"Issue new sign-in?",
+        message:`<b>${esc(displayAcct(email))}</b> is a username account, so it can't receive email reset links. We can issue a replacement sign-in with a new username and password — their role, permissions and linked teacher carry over, and the old sign-in stops working immediately.`,
+        confirmLabel:"Continue", tone:"primary", icon:"ph-key" });
+      if(!ok) return;
+      openMemberReset(el.dataset.id, m);
+      return;
+    }
+    try { await FB.auth.sendPasswordResetEmail(email); toast("success","Reset link sent", email+" will receive a password reset link."); }
+    catch(e){ toast("error","Couldn't send reset", AUTH_ERRORS[e.code]||e.message); }
+  },
+  "remove-member": async el=>{
+    if(!canManageUsers()) return;
+    const m=App.members[el.dataset.id]; if(!m) return;
+    const ok=await confirmDialog({ title:"Remove "+(m.name||m.email)+"?",
+      message:"They'll be signed out immediately and lose all access to this school's workspace. Their historical timetable data (as a teacher profile) is untouched.",
+      confirmLabel:"Remove user", icon:"ph-user-minus" });
+    if(!ok) return;
+    try{
+      /* 60s, not 5s: a cold-started callable spends several seconds booting before the
+         handler runs, so the old 5s window timed out and fell back almost every time —
+         leaving the Auth account behind. A timeout is also NOT a fallback trigger any
+         more: "deadline-exceeded" means the server may still be finishing, and deleting
+         records on the client at the same moment is what orphaned sign-ins. Only
+         "not deployed" or "unreachable" take the database-only path. */
+      try{ await callBackend("removeMemberAccount",{schoolId:Session.schoolId,memberUid:el.dataset.id},60000); }
+      catch(serverError){ if(!["functions/not-found","functions/unavailable"].includes(serverError?.code)) throw serverError;
+        /* Functions are optional hardening. Database removal still revokes all app access;
+           the Auth shell can be cleaned later from Firebase Console. */
+        const updates={};
+        updates[`schools/${Session.schoolId}/members/${el.dataset.id}`]=null;
+        updates[`users/${el.dataset.id}`]=null;
+        await FB.db.ref().update(updates);
+      }
+      toast("success","User removed",(m.name||m.email)+" no longer has access.");
+    }catch(e){ toast("error","Removal failed",backendMessage(e)); }
+  },
+  "gen-pw-member": ()=>{ const f=$("#mr-pass")||$("#draft-m-pass"); if(f) f.value=genPassword(); },
+
+  /* auth & platform */
+  "login-retry": el=>{ const f=el.closest("form")||document.querySelector('[data-form="login"]'); if(f) f.requestSubmit(); },
+  "continue-offline": ()=>{
+    if(!cachedSessionAvailable()){ toast("error","No offline workspace","Sign in online once on this device before using offline access."); return; }
+    bootSchool(Session.schoolId); toast("info","Offline workspace","Using the last saved copy. Changes remain on this device until the connection returns.");
+  },
+  "session-retry": el=>{
+    const user=LoginFlow.retryUser||FB.auth?.currentUser; if(!user) return showLogin();
+    el.disabled=true;el.innerHTML=`<span class="spinner"></span>Retrying…`;resolveSessionOnce(user,{source:"retry"});
+  },
+  "session-signout": ()=>signOut(),
+  "sign-out": async ()=>{
+    const ok=await confirmDialog({ title:"Sign out?", message:"Your data stays synced on this device and everywhere else.", confirmLabel:"Sign out", tone:"primary", icon:"ph-sign-out" });
+    if (ok) signOut();
+  },
+  "my-account": ()=>openAccount(),
+  "forgot-pw": ()=>{
+    forgotState.email=""; forgotState.sending=false; forgotState.error="";
+    Modal.open(()=>`
+      <form class="p-6" data-form="forgot" autocomplete="off">
+        <div class="flex items-start justify-between"><h3 class="font-display font-bold text-xl tracking-tight">Reset password</h3>
+        <button type="button" class="icon-btn" data-action="modal-close" aria-label="Close"><i class="ph ph-x text-lg"></i></button></div>
+        <p class="text-xs text-zinc-500 mt-1 leading-relaxed">Enter the email address on the account and we'll send a secure link to set a new password.</p>
+        <div class="mt-4"><label class="label">Email</label>
+          <input type="email" class="field" id="forgot-email" required placeholder="you@school.edu" autocomplete="email" value="${esc(forgotState.email)}"></div>
+        ${forgotState.error?`<div class="mt-3 text-xs font-semibold text-rose-600 bg-rose-50 border border-rose-200 rounded-xl px-3 py-2.5 leading-relaxed">${esc(forgotState.error)}</div>`:""}
+        <button type="submit" class="btn btn-primary w-full mt-5" ${forgotState.sending?"disabled":""}>
+          ${forgotState.sending?`<span class="spinner"></span>Sending…`:`<i class="ph ph-paper-plane-tilt"></i>Send reset link`}</button>
+        <p class="text-[11px] text-zinc-400 text-center mt-3 leading-relaxed">Already signed in? Open <b>My account</b> (top right) to set a new password yourself.</p>
+      </form>`);
+  },
+  "new-school": ()=>{ if(isSuper()) openCreateSchool(); },
+  "retry-school-check": ()=>checkOwnerProvisioning(),
+  "gen-pw": ()=>{ const f=$("#draft-sc-pass"); if(f) f.value=genPassword(); },
+  "school-access": el=>{ if(isSuper()) openSchoolAccess(el.dataset.id); },
+  "school-extend": async el=>{
+    if(!isSuper()) return;
+    const id=el.dataset.id, days=clamp(+el.dataset.days||0,1,365), meta=Admin.schools[id]?.profile||{};
+    const base=Math.max(Date.now(),meta.trialEnds||0);
+    if(meta.plan==="paid"){ toast("error","Paid school","A paid school doesn't use trial days. Use Mark paid & active to change its plan."); return; }
+    const patch={plan:"trial",trialEnds:base+days*86400000};
+    if(meta.status!=="disabled") patch.status="trial"; /* extending never re-enables a disabled school */
+    await FB.db.ref(`schools/${id}/profile`).update(patch);
+    toast("success","Trial extended",`${meta.name||"School"} received ${days} more day(s).`); Modal.close();
+  },
+  "school-activate": async el=>{
+    if(!isSuper()) return; const id=el.dataset.id,meta=Admin.schools[id]?.profile||{};
+    await FB.db.ref(`schools/${id}/profile`).update({status:"active",plan:"paid",trialEnds:null});
+    toast("success","School activated",`${meta.name||"School"} is marked paid and active.`); Modal.close();
+  },
+  "school-enable": async el=>{
+    if(!isSuper()) return; const id=el.dataset.id,meta=Admin.schools[id]?.profile||{};
+    const trialValid=meta.plan==="trial"&&meta.trialEnds>Date.now();
+    /* An expired trial stays "trial" so it remains blocked until extended; it must not become a free "active" school. */
+    await FB.db.ref(`schools/${id}/profile`).update({status:meta.plan==="trial"?"trial":"active"});
+    (trialValid||meta.plan!=="trial")?toast("success","School enabled",`${meta.name||"School"} can sign in again.`):toast("info","School enabled","The trial has ended — extend it to restore access."); Modal.close();
+  },
+  "school-disable": async el=>{
+    if(!isSuper()) return; const id=el.dataset.id,meta=Admin.schools[id]?.profile||{};
+    const ok=await confirmDialog({title:"Disable "+(meta.name||"school")+"?",
+      message:"Staff will be blocked from reading and editing the school workspace. No records are deleted, and you can enable access again at any time.",
+      confirmLabel:"Disable school",icon:"ph-pause-circle"});
+    if(!ok) return;
+    await FB.db.ref(`schools/${id}/profile`).update({status:"disabled"});
+    toast("info","School disabled","Workspace access is now paused.");
+  },
+  "open-school": el=>{
+    if (!isSuper()) return;
+    const meta=Admin.schools[el.dataset.id]?.profile;
+    Store.raw.ui.route="dashboard"; Store.flush();
+    Session.schoolId=el.dataset.id;
+    bootSchool(el.dataset.id);
+    toast("info","Managing "+(meta?.name||"school"),"You're editing as platform admin — changes sync live.");
+  },
+  "reset-admin-pw": "reset-member-pw",
+  "delete-school": async el=>{
+    if(!isSuper()) return;
+    if(!el.dataset.id||!Admin.schools[el.dataset.id]) return;
+    const sc=Admin.schools[el.dataset.id]; const name=sc?.profile?.name||"this school";
+    const memberUids=Object.keys(sc?.members||{});
+    const ok=await confirmDialog({ title:"Delete "+name+"?",
+      message:`The school's <b>entire workspace</b> and its <b>${memberUids.length} user record${memberUids.length!==1?"s":""}</b> will be permanently erased from the platform. Sign-in accounts stop working instantly. This cannot be undone.`,
+      confirmLabel:"Delete school", icon:"ph-bomb" });
+    if(!ok) return;
+    try{
+      /* Same reasoning as remove-member: 8s was shorter than a cold start, and a timeout
+         must not race the server's own deletion. 75s sits under the function's 120s cap. */
+      try{ await callBackend("deleteSchoolAccount",{schoolId:el.dataset.id},75000); }
+      catch(serverError){ if(!["functions/not-found","functions/unavailable"].includes(serverError?.code)) throw serverError;
+        const updates={}; updates[`schools/${el.dataset.id}`]=null;
+        memberUids.forEach(uid=>{ updates[`users/${uid}`]=null; });
+        await FB.db.ref().update(updates);
+      }
+      if (Session.schoolId===el.dataset.id){ Session.schoolId=null; saveSession(); Sync.detach(); Team.detach(); Store.raw.ui.route="admin"; Store.flush(); }
+      toast("success","School deleted", name+" was removed from the platform.");
+    }catch(e){ toast("error","Delete failed",backendMessage(e)); }
+  },
+  "install-app": async ()=>{
+    if (!deferredInstall) return;
+    deferredInstall.prompt();
+    const {outcome}=await deferredInstall.userChoice;
+    if (outcome==="accepted") toast("success","Installing…","CampusFlow is joining the home screen.");
+    deferredInstall=null; renderNav();
+  },
+  /* ---- scanner ---- */
+  "scan-mode": el=>{ Scan.mode=el.dataset.mode; Scan.error=""; Store.requestRender(); },
+  "scan-engine": el=>{
+    if(el.dataset.engine==="local"&&!scanCapability().ocr){
+      toast("error","Not possible on this device",
+        "The on-device reader needs WebAssembly and more memory than this device has. Excel, CSV and PDF files still import here — or use the AI reader with your key.");
+      return;
+    }
+    Scan.engine=el.dataset.engine; Scan.error=""; Store.requestRender();
+  },
+  "scan-lang": el=>{ Scan.langs=el.dataset.lang; Scan.error="";
+    try{ localStorage.setItem("cf.scanLangs",Scan.langs); }catch(_){}
+    Store.requestRender(); },
+  "scan-sheet": el=>{ if(!Scan.doc) return; Scan.doc.sheetIndex=+el.dataset.i; Scan.page=1; scanConvert(); Store.requestRender(); },
+  "scan-page": el=>{ if(!Scan.doc) return; Scan.doc.page=+el.dataset.n; scanConvert(); Store.requestRender(); },
+  "scan-camera": ()=>{ if(needEdit()){ Scan.error=""; $("#scan-cam").click(); } },
+  "scan-pick": ()=>{ if(needEdit()){ Scan.error=""; $("#scan-lib").click(); } },
+  "scan-restart": ()=>{ Scan.step="capture"; Scan.rows=[]; Scan.grid=null; Scan.rawText="";
+    Scan.prepDataUrl=""; Scan.error=""; Scan.progress=0; Scan.doc=null; Scan.docName="";
+    Scan.report=null; Scan.page=1; Scan.sheetIndex=0; Scan.stats=null; Store.requestRender(); },
+  "scan-apply": ()=>scanApply(),
+  "scan-class-page": el=>{
+    const page=+el.dataset.page, d=Scan.doc;
+    if(!d||!d.classPages) return;
+    const a=d.classPages.find(x=>x.page===page); if(a) a.include=el.checked;
+  },
+  "scan-apply-all": ()=>{
+    if(!needEdit()) return;
+    const d=Scan.doc; if(!d||!d.classPages||!d.classPages.length) return;
+    const chosen=d.classPages.filter(a=>a.include!==false);
+    if(!chosen.length){ toast("info","Nothing selected","Tick at least one page to import."); return; }
+    let created=0, filled=0, classes=0, locked=0;
+    chosen.forEach(a=>{
+      const page=d.kind==="pdf"?(d.pages||[]).find(p=>p.page===a.page):d;
+      if(!page||!page.out) return;
+      let cid=a.classId;
+      if(cid&&classLocked(cid)){ locked++; return; }
+      if(!cid){
+        const name=a.label||((d.name||"Scan").replace(/\.[a-z0-9]+$/i,"")+" — page "+a.page);
+        const fresh={id:uid("c"),name,color:PALETTE[state.classes.length%PALETTE.length]};
+        state.classes=[...state.classes,fresh]; cid=fresh.id; created++;
+      }
+      /* A scan comes back as period × day; the app stores day × period. */
+      const out=page.out, grid=out.grid;
+      const needDays=Math.max(state.settings.daysPerWeek,grid[0]?grid[0].length:0);
+      const needPeriods=Math.max(state.settings.periodsPerDay,grid.length);
+      if(needDays>state.settings.daysPerWeek||needPeriods>state.settings.periodsPerDay){
+        state.settings=Object.assign({},state.settings,{daysPerWeek:needDays,periodsPerDay:needPeriods});
+      }
+      const g=blankGrid();
+      grid.forEach((row,p)=>row.forEach((cell,dd)=>{
+        if(!cell||!cell.subjectId) return;
+        if(dd<state.settings.daysPerWeek&&p<state.settings.periodsPerDay){
+          g[dd][p]=[{subjectId:cell.subjectId,teacherId:cell.teacherId||null}];
+        }
+      }));
+      state.timetable[cid]=g;
+      filled+=out.report.matched; classes++;
+    });
+    if(!classes){ toast("error","Nothing was imported",locked?"Those classes are locked.":"No readable timetable was found on the selected pages."); return; }
+    toast("success","Timetables imported",
+      classes+" class timetable(s) written — "+filled+" lesson(s)"+
+      (created?", "+created+" new class(es) created":"")+(locked?", "+locked+" locked class(es) skipped":"")+".");
+    Scan.step="capture"; Scan.doc=null; Scan.grid=null; Scan.report=null; Scan.docNote="";
+    Store.requestRender();
+  },
+
+  "scan-all": el=>{ const on=el.dataset.on==="1"; Scan.rows.forEach(r=>r.include=on); Store.requestRender(); },
+  "scan-copy": async ()=>{
+    try{ await navigator.clipboard.writeText(Scan.rawText); toast("success","Copied","The text is on your clipboard."); }
+    catch(_){ toast("error","Copy failed","Select the text and copy it manually."); }
+  },
+  "download-creative": el=>{
+    const id=el.dataset.id, spec=CREATIVE_SPECS[id];
+    if(!spec){ toast("error","Creative unavailable","Reload the Marketing Studio and try again."); return; }
+    const canvas=document.createElement("canvas"); drawCreative(canvas,id,true);
+    const a=document.createElement("a"); a.download=spec.file; a.href=canvas.toDataURL("image/png",1); a.click();
+    canvas.width=canvas.height=1;
+    toast("success","PNG downloaded",spec.title+" is ready to post.");
+  },
+  "download-all-creatives": ()=>{
+    const entries=Object.entries(CREATIVE_SPECS);
+    for(const [id,spec] of entries){
+      const canvas=document.createElement("canvas"); drawCreative(canvas,id,true);
+      const a=document.createElement("a");a.download=spec.file;a.href=canvas.toDataURL("image/png",1);a.click();
+      canvas.width=canvas.height=1;
+    }
+    toast("success","Creatives downloaded",entries.length+" PNG files were created. If your browser asks, allow multiple downloads.");
+  },
+  "download-promo-video": ()=>exportPromoVideo().catch(err=>{ PromoVideo.recording=false; toast("error","Video export failed",err.message||"Try a current Chrome browser."); }),
+  "restart-promo": ()=>startPromoPreview(),
+  "site-editor": ()=>openSiteEditor(),
+  "header-menu": el=>{
+    const open=el.getAttribute("aria-expanded")==="true";
+    if(open){ el.setAttribute("aria-expanded","false"); Modal.close(); return; }
+    el.setAttribute("aria-expanded","true");
+    Modal.open(()=>`
+      <div class="p-5">
+        <div class="flex items-center gap-2.5 pb-3 border-b border-zinc-100 mb-3 -mt-1">
+          ${brandMark("w-11 h-11 rounded-xl","text-xl")}
+          <div class="min-w-0 flex-1">
+            <div class="font-bold text-[14px] leading-tight" style="overflow-wrap:anywhere">${esc(Session.email?displayAcct(Session.email):"Account")}</div>
+            <div class="text-[11px] text-zinc-500 font-medium">${esc(fmtRole(Session.schoolRole)||"Platform")}</div>
+          </div>
+          <button class="icon-btn !w-11 !h-11 flex-none" data-action="modal-close" aria-label="Close menu"><i class="ph ph-x text-xl"></i></button>
+        </div>
+        <div id="hm-sync" class="flex items-center justify-between py-1 mb-2"></div>
+        <div class="grid grid-cols-2 gap-2">
+          <button class="btn btn-ghost !min-h-[46px]" data-action="undo"><i class="ph ph-arrow-counter-clockwise"></i>Undo</button>
+          <button class="btn btn-ghost !min-h-[46px]" data-action="redo"><i class="ph ph-arrow-clockwise"></i>Redo</button>
+        </div>
+        <div class="grid gap-2 mt-2">
+          ${isSuper()?`<button class="btn btn-soft !min-h-[46px] !justify-start" data-action="nav" data-route="marketing"><i class="ph-fill ph-megaphone"></i>Marketing Studio</button>
+          <button class="btn btn-ghost !min-h-[46px] !justify-start" data-action="site-editor"><i class="ph ph-note-pencil"></i>Edit public site &amp; phone</button>`:""}
+          <button class="btn btn-ghost !min-h-[46px] !justify-start" data-action="nav" data-route="print"><i class="ph ph-printer"></i>Print Center</button>
+          <button class="btn btn-ghost !min-h-[46px] !justify-start" data-action="my-account"><i class="ph ph-user-circle"></i>My account · change password</button>
+          <button class="btn btn-ghost !min-h-[46px] !justify-start !text-rose-600 hover:!bg-rose-50" data-action="sign-out"><i class="ph ph-sign-out"></i>Sign out</button>
+        </div>
+        <button class="btn btn-primary w-full mt-4 !min-h-[48px]" data-action="modal-close"><i class="ph ph-check"></i>Close menu</button>
+      </div>`);
+    setTimeout(()=>{ const src=$("#sync-pill"),dst=$("#hm-sync");
+      if(src&&dst) dst.innerHTML=`<div class="text-[11px] font-bold text-zinc-500">Sync status</div>${src.innerHTML}`;
+    },0);
+  }
+};
+Object.assign(actions, ATT_ACTIONS);
+actions["reset-admin-pw"]=actions["reset-member-pw"];
+
+/* =================================================================================
+   BACKUP CONVERTERS — native (campusflow) + legacy timetable format
+   Legacy shape: { db:{subjects:[names], teachers:[{name,subs,phone}], school, reliefData},
+                   schedule:{ "grade-section-period-day": [{s,t}, …stream groups] } }
+   ================================================================================= */
+const normName = s => (s||"").trim().replace(/\./g,"").replace(/\s+/g," ").toLowerCase();
+function uniqueCode(base, used){
+  base=(base||"X").toUpperCase().replace(/[^A-Z0-9]/g,"")||"X";
+  let code=base.slice(0,4), i=2;
+  while (used.has(code)){ code=(base.slice(0,3)+i).slice(0,5); i++; }
+  used.add(code); return code;
+}
+const subjCodeOf = name => { const w=name.trim().split(/\s+/); return w.length===1 ? w[0].slice(0,4) : w.map(x=>x[0]).join(""); };
+
+/* ==================================================================================
+   BACKUP & RESTORE — one door for every shape a school's data arrives in
+   ----------------------------------------------------------------------------------
+   A school replacing an old system has its data in whatever that system exported:
+   our own backup from an older release, a Firebase Realtime Database export, a
+   spreadsheet the office kept, or a plain list of lessons. All of those are read
+   here, shown as a preview of what was actually understood, and applied either as
+   a full replace or as a merge that never overwrites what is already there.
+   ================================================================================== */
+const BACKUP_FORMAT = "campusflow/4";
+let importPending = null;        /* the analysed file waiting for a decision */
+
+const isWorkspace = o => !!o && typeof o === "object" &&
+  Array.isArray(o.teachers) && Array.isArray(o.subjects) && Array.isArray(o.classes);
+
+/* A Realtime Database export holds everything under schools/<id>/state, but an
+   older app may have written the workspace straight onto the school node. */
+function findWorkspaceNode(p) {
+  if (!p || typeof p !== "object") return null;
+  if (isWorkspace(p)) return p;
+  if (isWorkspace(p.state)) return p.state;
+  if (isWorkspace(p.data)) return p.data;
+  const schools = (p.schools && typeof p.schools === "object") ? p.schools : p;
+  for (const k of Object.keys(schools || {})) {
+    const node = schools[k];
+    if (!node || typeof node !== "object") continue;
+    if (isWorkspace(node.state)) return node.state;
+    if (isWorkspace(node.data)) return node.data;
+    if (isWorkspace(node)) return node;
+    /* A school record often nests one more level (profile/state/workspace). */
+    for (const inner of ["workspace", "timetable", "settings"]) {
+      if (isWorkspace(node[inner])) return node[inner];
+    }
+  }
+  return null;
+}
+
+/* A flat list of lesson rows, however it was wrapped. */
+function flatRowList(p) {
+  if (Array.isArray(p)) return p.filter(r => r && typeof r === "object" && !Array.isArray(r));
+  if (!p || typeof p !== "object") return null;
+  for (const k of ["lessons", "rows", "entries", "records", "data", "items", "schedule"]) {
+    const v = p[k];
+    if (Array.isArray(v) && v.length && v[0] && typeof v[0] === "object" && !Array.isArray(v[0])) return v;
+  }
+  const groups = Object.entries(p).filter(([, v]) => Array.isArray(v) && v.length && v[0] && typeof v[0] === "object" && !Array.isArray(v[0]));
+  if (groups.length && groups.length >= Object.keys(p).length) {
+    const out = [];
+    groups.forEach(([name, arr]) => arr.forEach(r => out.push({ __class: name, ...r })));
+    return out;
+  }
+  return null;
+}
+
+/* Column names differ from system to system, so they are matched loosely. */
+const ROW_KEYS = {
+  className: [/^class/i, /^grade/i, /^section/i, /^division/i, /^group/i, /^form/i],
+  day: [/^day/i, /weekday/i, /^dow\b/i],
+  period: [/^period/i, /^slot/i, /^hour/i, /^p\b/i, /^lesson/i],
+  time: [/^time/i, /^start/i, /from/i],
+  subject: [/^sub/i, /^course/i, /^paper/i, /^module/i],
+  teacher: [/^teach/i, /^staff/i, /^faculty/i, /^instructor/i, /master/i],
+  room: [/^room/i, /^hall/i, /^venue/i]
+};
+const pickBy = (row, pats) => {
+  const keys = Object.keys(row || {});
+  for (const p of pats) { const k = keys.find(k => p.test(String(k).trim())); if (k != null) return k; }
+  return null;
+};
+const rowVal = (row, key) => (key == null ? "" : Scanner.squash(row[key]));
+
+/* Turn "Class | Day | Period | Subject | Teacher" rows into lessons. */
+function convertLessonRows(rows) {
+  const probe = rows[0] || {};
+  const k = {
+    className: pickBy(probe, ROW_KEYS.className), day: pickBy(probe, ROW_KEYS.day),
+    period: pickBy(probe, ROW_KEYS.period), time: pickBy(probe, ROW_KEYS.time),
+    subject: pickBy(probe, ROW_KEYS.subject), teacher: pickBy(probe, ROW_KEYS.teacher),
+    room: pickBy(probe, ROW_KEYS.room)
+  };
+  if (!(k.day || k.period || k.time) || !(k.subject || k.teacher)) return null;
+
+  const notes = [], lessons = [], timesByClass = {};
+  let unresolved = 0, timed = 0;
+  rows.forEach(row => {
+    const className = rowVal(row, k.className) || Scanner.squash(row.__class) || "Imported class";
+    let d = Scanner.dayIndexFromText(rowVal(row, k.day));
+    if (d === -1) {
+      const n = parseInt(rowVal(row, k.day), 10);
+      if (n >= 1 && n <= 7) d = n - 1;                 /* 1 = Monday */
+    }
+    let p = 0;
+    const per = Scanner.periodInfoFromText(rowVal(row, k.period));
+    if (per && per.period) p = per.period;
+    else {
+      const n = parseInt(rowVal(row, k.period), 10);
+      if (n >= 1 && n <= 20) p = n;
+    }
+    if (!p) {
+      const t = rowVal(row, k.time) || (per && per.time) || "";
+      if (t) {                                          /* a time column: order gives the periods */
+        (timesByClass[className] = timesByClass[className] || new Set()).add(t);
+        row.__time = t; timed++;
+      }
+    }
+    const subject = rowVal(row, k.subject), teacher = rowVal(row, k.teacher);
+    if (!subject && !teacher) { unresolved++; return; }
+    lessons.push({ className, d, p, time: row.__time || "", subject, teacher, room: rowVal(row, k.room) });
+  });
+  /* Times become period numbers in the order they happen. */
+  Object.entries(timesByClass).forEach(([className, set]) => {
+    const order = Array.from(set).sort();
+    lessons.filter(L => L.className === className && !L.p && L.time)
+      .forEach(L => { L.p = order.indexOf(L.time) + 1; });
+  });
+  lessons.forEach(L => { if (!L.p) L.p = 1; });
+  if (timed) notes.push("Period numbers came from the order of the times in each class.");
+  if (unresolved) notes.push(unresolved + " row(s) had no subject or teacher and were skipped.");
+  return lessons.length ? { lessons, notes } : null;
+}
+
+/* Build a complete workspace out of plain lessons. */
+function buildFromLessons(o) {
+  const subjects = [], teachers = [], classes = [], notes = o.notes || [];
+  const subjByName = {}, teachByName = {}, classByName = {};
+  const usedSC = new Set(), usedTC = new Set();
+  const ensureSubject = raw => {
+    const nm = Scanner.squash(raw); if (!nm || nm.length < 2) return null;
+    const key = normName(nm);
+    if (subjByName[key]) return subjByName[key];
+    const rec = { id: uid("s"), name: nm, code: uniqueCode(subjCodeOf(nm), usedSC), color: SUBJ_COLORS[subjects.length % SUBJ_COLORS.length] };
+    subjects.push(rec); subjByName[key] = rec; return rec;
+  };
+  const ensureTeacher = raw => {
+    const nm = Scanner.squash(raw); if (!nm || nm.length < 2) return null;
+    const key = normName(nm);
+    if (teachByName[key]) return teachByName[key];
+    const rec = { id: uid("t"), name: nm, code: uniqueCode(initials(nm), usedTC), color: PALETTE[teachers.length % PALETTE.length], subjectIds: [] };
+    teachers.push(rec); teachByName[key] = rec; return rec;
+  };
+  const ensureClass = raw => {
+    const nm = Scanner.squash(raw) || "Imported class";
+    const key = normName(nm);
+    if (classByName[key]) return classByName[key];
+    const rec = { id: uid("c"), name: nm };
+    classes.push(rec); classByName[key] = rec; return rec;
+  };
+  (o.teacherList || []).forEach(t => {
+    const rec = ensureTeacher(t.name); if (!rec) return;
+    if (t.phone) rec.phone = t.phone;
+    (t.subjects || []).forEach(sn => { const s = ensureSubject(sn); if (s && !rec.subjectIds.includes(s.id)) rec.subjectIds.push(s.id); });
+  });
+  (o.subjectList || []).forEach(nm => ensureSubject(nm));
+
+  let maxD = 0, maxP = 0, placed = 0, streams = 0, skipped = 0;
+  const cells = {};                                   /* className → d → p → [{subjectId,teacherId}] */
+  o.lessons.forEach(L => {
+    const subj = ensureSubject(L.subject), teach = ensureTeacher(L.teacher);
+    if (!subj && !teach) return;
+    if (L.d < 0 || L.p < 1 || L.p > 20) { skipped++; return; }
+    const cls = ensureClass(L.className);
+    maxD = Math.max(maxD, L.d); maxP = Math.max(maxP, L.p);
+    const key = cls.id;
+    cells[key] = cells[key] || {};
+    (cells[key][L.d] = cells[key][L.d] || {});
+    const slot = (cells[key][L.d][L.p] = cells[key][L.d][L.p] || []);
+    if (slot.length) streams++;
+    slot.push({ subjectId: subj ? subj.id : null, teacherId: teach ? teach.id : null });
+    placed++;
+  });
+
+  const days = clamp(maxD >= 5 ? 6 : 5, 5, 6);
+  const periods = clamp(maxP || 8, 4, 10);
+  const timetable = {};
+  classes.forEach(c => {
+    const grid = Array.from({ length: days }, () => Array(periods).fill(null));
+    const byClass = cells[c.id] || {};
+    Object.keys(byClass).forEach(dk => {
+      const d = +dk; if (d >= days) { skipped += Object.values(byClass[d]).reduce((n, a) => n + a.length, 0); return; }
+      Object.keys(byClass[d]).forEach(pk => {
+        const p = +pk;
+        if (p > periods) { skipped += byClass[d][p].length; return; }
+        grid[d][p - 1] = byClass[d][p];
+      });
+    });
+    timetable[c.id] = grid;
+  });
+  if (skipped) notes.push(skipped + " lesson(s) fell outside a 6 × 10 grid and were left out.");
+
+  return {
+    kind: o.kind || "lessons", source: o.source || "Lesson list",
+    data: { settings: { daysPerWeek: days, periodsPerDay: periods, maxLoad: 28, loadCap: 35, ...(o.settingsPatch || {}) },
+      teachers, subjects, classes, curriculum: [], timetable, absences: {} },
+    stats: { teachers: teachers.length, subjects: subjects.length, classes: classes.length,
+      lessons: placed, reliefAssigned: 0, days, periods, streams, unresolved: skipped },
+    notes
+  };
+}
+
+/* Read a spreadsheet dump from an old system: one sheet per class, a teacher
+   list, a subject list, or a flat table of lessons. */
+async function parseBackupWorkbook(file) {
+  await ensureScanner();
+  const book = await Scanner.readSheetFile(file);
+  const notes = [], lessons = [], teacherList = [], subjectList = [];
+  const settingsPatch = {};
+  let classSheets = 0, skippedSheets = 0;
+  /* In a workbook the parts of "Maths · Mr Perera" are unambiguous: a part with a
+     title or initials is a teacher, everything else is a subject. Matching both
+     ways at once would turn every subject into a teacher and every teacher into a
+     subject, which is how one modest staff list became eight names. */
+  const TEACHERISH = /^(mr|mrs|ms|miss|mstr|master|dr|rev|sir|madam|teacher|ven|prof)\.?\s/i;
+  const looksLikeTeacher = s => TEACHERISH.test(s) || /^[A-Z]{1,3}\.?\s+[A-Z]/.test(s) || /\b(?:mrs?|ms|miss|dr)\.?\s/i.test(s);
+  const anySub = t => {
+    const nm = Scanner.squash(t);
+    if (!nm || nm.length < 2 || /^\d+$/.test(nm) || looksLikeTeacher(nm)) return { item: null, score: 0 };
+    return { item: { id: "s:" + nm, name: nm }, score: 1 };
+  };
+  const anyTch = t => {
+    const nm = Scanner.squash(t);
+    if (!nm || nm.length < 2 || !looksLikeTeacher(nm)) return { item: null, score: 0 };
+    return { item: { id: "t:" + nm, name: nm }, score: 1 };
+  };
+
+  for (const sh of book.sheets) {
+    const matrix = (sh.matrix || []).map(r => r.map(v => Scanner.squash(v)));
+    const allCells = matrix.slice(0, 5).flat();
+    const lower = allCells.map(s => s.toLowerCase());
+    const has = re => lower.some(s => re.test(s));
+    const dayRow = matrix.find(r => r.filter(c => Scanner.dayIndexFromText(c) !== -1).length >= 2);
+
+    /* 1. The sheet our own export writes. */
+    if (/^(school|info|about|setup)$/i.test(sh.name) || lower.includes("school name")) {
+      matrix.forEach(row => {
+        const key = (row[0] || "").toLowerCase(), val = row[1] || "";
+        if (/school name/.test(key) && val) settingsPatch.schoolName = val;
+        if (/days per week/.test(key)) { const n = parseInt(val, 10); if (n >= 4 && n <= 6) settingsPatch.daysPerWeek = n; }
+        if (/periods per day/.test(key)) { const n = parseInt(val, 10); if (n >= 4 && n <= 10) settingsPatch.periodsPerDay = n; }
+      });
+      continue;
+    }
+
+    /* 2. A flat table of lessons. */
+    if ((has(/^class/) || has(/^grade/)) && (has(/^day/) || has(/^period/) || has(/^time/)) && (has(/^sub/) || has(/^teach/))) {
+      const rows = [];
+      const header = matrix[0] || [];
+      matrix.slice(1).forEach(r => {
+        if (r.every(c => !c)) return;
+        const obj = {}; header.forEach((h, i) => { if (h) obj[h] = r[i] || ""; });
+        rows.push(obj);
+      });
+      const conv = convertLessonRows(rows);
+      if (conv) {
+        conv.lessons.forEach(L => lessons.push(L));
+        conv.notes.forEach(n => notes.push(n));
+        notes.push("Sheet “" + sh.name + "” was read as a table of lessons.");
+        continue;
+      }
+    }
+
+    /* 3. A class timetable. */
+    if (dayRow) {
+      const model = Scanner.interpretGrid(sh.grid, { daysPerWeek: 7 });
+      if (model.recognised) {
+        const out = Scanner.gridToTimetable(model, { periodsPerDay: 12, daysPerWeek: 7, matchSubject: anySub, matchTeacher: anyTch });
+        let label = "";
+        matrix.slice(0, 3).some(r => r.some(c => {
+          const m = c.match(/(?:class|grade|section)\s*[:\-]?\s*(.+)$/i);
+          if (m && m[1] && m[1].length < 20) { label = m[1]; return true; }
+          return false;
+        }));
+        const clsName = (label || sh.name.replace(/\b(timetable|schedule|time ?table|class|sheet)\b/gi, "").trim() || sh.name);
+        out.report.cells.forEach(cell => {
+          const p = (model.periodByRow[cell.r] && model.periodByRow[cell.r].period) || cell.slot + 1;
+          const parsed = cell.parsed || {};
+          lessons.push({ className: clsName, d: cell.d, p,
+            subject: parsed.subject ? parsed.subject.name : "", teacher: parsed.teacher ? parsed.teacher.name : "",
+            room: parsed.room || "" });
+        });
+        classSheets++;
+        continue;
+      }
+    }
+
+    /* 4. Teachers, with the subjects they take. */
+    if (has(/teacher|staff|faculty/) || /teacher|staff/i.test(sh.name)) {
+      const head = matrix[0] || [];
+      const nameCol = Math.max(0, head.findIndex(h => /name/i.test(h)));
+      const subjCol = head.findIndex(h => /sub/i.test(h));
+      const phoneCol = head.findIndex(h => /phone|mobile|contact/i.test(h));
+      matrix.slice(head.some(h => /name/i.test(h)) ? 1 : 0).forEach(r => {
+        const nm = Scanner.squash(r[nameCol]); if (!nm || nm.length < 2 || /^(name|teacher)$/i.test(nm)) return;
+        teacherList.push({ name: nm, phone: phoneCol >= 0 ? Scanner.squash(r[phoneCol]) : "",
+          subjects: subjCol >= 0 ? Scanner.squash(r[subjCol]).split(/[,;|/]+/).map(s => s.trim()).filter(Boolean) : [] });
+      });
+      notes.push("Sheet “" + sh.name + "” was read as a teacher list (" + teacherList.length + " so far).");
+      continue;
+    }
+
+    /* 5. A plain list of subjects. */
+    if (has(/subject|course/) || /subject/i.test(sh.name)) {
+      const head = matrix[0] || [];
+      const col = Math.max(0, head.findIndex(h => /subject|name|course/i.test(h)));
+      matrix.forEach((r, i) => {
+        const nm = Scanner.squash(r[col]);
+        if (!nm || nm.length < 2 || (i === 0 && /subject|name|course/i.test(nm))) return;
+        subjectList.push(nm);
+      });
+      notes.push("Sheet “" + sh.name + "” was read as a subject list.");
+      continue;
+    }
+
+    skippedSheets++;
+    notes.push("Sheet “" + sh.name + "” had no timetable, teacher or subject list in it, so it was ignored.");
+  }
+
+  if (!lessons.length && !teacherList.length && !subjectList.length) return null;
+  const conv = buildFromLessons({ lessons, teacherList, subjectList, settingsPatch, notes,
+    kind: "workbook", source: "Workbook — " + classSheets + " class timetable sheet(s)" + (book.sheets.length > classSheets ? " of " + book.sheets.length : "") });
+  return conv;
+}
+
+/* One entry point for a JSON file of any age or shape. */
+function parseBackupJson(parsed) {
+  if (!parsed || typeof parsed !== "object") return null;
+  if (Array.isArray(parsed) || flatRowList(parsed)) {
+    const rows = Array.isArray(parsed) ? parsed : flatRowList(parsed);
+    const conv = convertLessonRows(rows || []);
+    if (conv) return buildFromLessons({ lessons: conv.lessons, notes: conv.notes, kind: "lessons", source: "List of lessons" });
+  }
+  const node = findWorkspaceNode(parsed);
+  if (node) {
+    const conv = convertNativeBackup({
+      settings: node.settings, teachers: node.teachers || [], subjects: node.subjects || [], classes: node.classes || [],
+      curriculum: node.curriculum, timetable: node.timetable || {}, absences: node.absences || {}
+    });
+    conv.kind = "workspace";
+    conv.source = (parsed.format || "").startsWith("campusflow") ? "CampusFlow backup (" + parsed.format + ")"
+      : /^{?"?schools"?/.test(JSON.stringify(parsed).slice(0, 40)) ? "Firebase database export" : "Workspace data";
+    if (parsed.exportedAt) conv.exportedAt = parsed.exportedAt;
+    return conv;
+  }
+  if (parsed.db && (parsed.schedule || parsed.db.subjects)) {
+    const conv = convertLegacyBackup(parsed);
+    conv.source = "Older timetable export (db / schedule)";
+    return conv;
+  }
+  return null;
+}
+
+/* What the file would do to the workspace that is already here. */
+function analyseImport(conv) {
+  const cur = Store.raw;
+  const count = (list, pool) => list.reduce((n, x) => n + (pool.some(y => normName(y.name) === normName(x.name)) ? 0 : 1), 0);
+  const have = (list, pool) => list.length - count(list, pool);
+  const out = {
+    newTeachers: count(conv.data.teachers, cur.teachers), haveTeachers: have(conv.data.teachers, cur.teachers),
+    newSubjects: count(conv.data.subjects, cur.subjects), haveSubjects: have(conv.data.subjects, cur.subjects),
+    newClasses: count(conv.data.classes, cur.classes), haveClasses: have(conv.data.classes, cur.classes),
+    fill: 0, busy: 0, outside: 0
+  };
+  const days = cur.settings.daysPerWeek, periods = cur.settings.periodsPerDay;
+  const byName = {};
+  (conv.data.classes || []).forEach(c => { byName[normName(c.name)] = c.id; });
+  Object.entries(conv.data.timetable || {}).forEach(([cid, grid]) => {
+    const src = (conv.data.classes || []).find(c => c.id === cid);
+    const target = src ? cur.classes.find(c => normName(c.name) === normName(src.name)) : null;
+    (grid || []).forEach((row, d) => (row || []).forEach((cell, p) => {
+      const n = lessonsOf(cell).length; if (!n) return;
+      if (d >= days || p >= periods) { out.outside += n; return; }
+      const there = target ? lessonsOf(target && cur.timetable[target.id] && cur.timetable[target.id][d] ? cur.timetable[target.id][d][p] : null).length : 0;
+      if (there) out.busy += n; else out.fill += n;
+    }));
+  });
+  return out;
+}
+
+/* Merge: add what is missing, never overwrite what exists. Timetable cells are
+   only filled where the class has nothing in that slot. */
+function mergeImported(conv) {
+  const next = JSON.parse(JSON.stringify({ teachers: Store.raw.teachers, subjects: Store.raw.subjects,
+    classes: Store.raw.classes, curriculum: Store.raw.curriculum || [], timetable: Store.raw.timetable || {},
+    absences: Store.raw.absences || {}, settings: Store.raw.settings }));
+  const sMap = {}, tMap = {}, cMap = {};
+  let addedT = 0, addedS = 0, addedC = 0, filled = 0, kept = 0;
+
+  (conv.data.subjects || []).forEach(s => {
+    const ex = next.subjects.find(x => normName(x.name) === normName(s.name));
+    if (ex) { sMap[s.id] = ex.id; return; }
+    const fresh = { ...s, id: uid("s") };
+    next.subjects.push(fresh); sMap[s.id] = fresh.id; addedS++;
+  });
+  (conv.data.teachers || []).forEach(t => {
+    const ex = next.teachers.find(x => normName(x.name) === normName(t.name));
+    if (ex) {
+      tMap[t.id] = ex.id;
+      const subj = (t.subjectIds || []).map(id => sMap[id]).filter(Boolean);
+      subj.forEach(id => { if (!Array.isArray(ex.subjectIds)) ex.subjectIds = []; if (!ex.subjectIds.includes(id)) ex.subjectIds.push(id); });
+      if (!ex.phone && t.phone) ex.phone = t.phone;
+      return;
+    }
+    const fresh = { ...t, id: uid("t"), subjectIds: (t.subjectIds || []).map(id => sMap[id]).filter(Boolean) };
+    next.teachers.push(fresh); tMap[t.id] = fresh.id; addedT++;
+  });
+  (conv.data.classes || []).forEach(c => {
+    const ex = next.classes.find(x => normName(x.name) === normName(c.name));
+    if (ex) { cMap[c.id] = ex.id; return; }
+    const fresh = { ...c, id: uid("c") };
+    next.classes.push(fresh); cMap[c.id] = fresh.id; addedC++;
+  });
+
+  /* Growing the week is safe; shrinking would delete lessons, so it never happens here. */
+  let needD = 0, needP = 0;
+  Object.values(conv.data.timetable || {}).forEach(grid => (grid || []).forEach((row, d) => (row || []).forEach((cell, p) => {
+    if (lessonsOf(cell).length) { needD = Math.max(needD, d + 1); needP = Math.max(needP, p + 1); }
+  })));
+  next.settings = { ...next.settings };
+  next.settings.daysPerWeek = Math.max(next.settings.daysPerWeek || 5, needD || 5);
+  next.settings.periodsPerDay = Math.max(next.settings.periodsPerDay || 8, needP || 8);
+
+  Object.entries(conv.data.timetable || {}).forEach(([oldCid, grid]) => {
+    const target = cMap[oldCid]; if (!target) return;
+    if (!next.timetable[target]) next.timetable[target] = Array.from({ length: next.settings.daysPerWeek }, () => Array(next.settings.periodsPerDay).fill(null));
+    (grid || []).forEach((row, d) => (row || []).forEach((cell, p) => {
+      const ls = lessonsOf(cell); if (!ls.length) return;
+      if (d >= next.settings.daysPerWeek || p >= next.settings.periodsPerDay) { kept++; return; }
+      if (!next.timetable[target][d]) next.timetable[target][d] = [];
+      if (lessonsOf(next.timetable[target][d][p]).length) { kept++; return; }
+      next.timetable[target][d][p] = ls.map(L => ({ subjectId: sMap[L.subjectId] || null, teacherId: tMap[L.teacherId] || null })).filter(L => L.subjectId || L.teacherId);
+      filled += ls.length;
+    }));
+  });
+
+  next.ui = Store.raw.ui;
+  Store.replaceData(next);
+  Store.raw.ui.dbTab = "teachers";
+  Store.flush();
+  if (Sync.active) { Sync._lastSig = null; Sync.pushNow(); }
+  return { addedT, addedS, addedC, filled, kept };
+}
+
+/* The preview. Nothing is written until the user picks a button here, and the
+   two honest choices are spelled out: replace everything, or merge without
+   overwriting a single existing record. */
+function openImportModal(){
+  Modal.open(()=>{
+    const P=importPending;
+    if(!P) return `<div class="p-6"><p class="text-sm text-zinc-600">Nothing left to import.</p>
+      <button class="btn btn-primary w-full mt-4" data-action="modal-close">Close</button></div>`;
+    const c=P.conv, st=c.stats, a=P.analysed;
+    const tile=(v,l)=>`<div class="bg-zinc-50 border border-zinc-200/70 rounded-xl py-2.5">
+      <div class="font-display font-bold text-lg leading-none tabular-nums">${v}</div>
+      <div class="text-[10px] font-bold uppercase tracking-wide text-zinc-400 mt-1">${l}</div></div>`;
+    const mixed=(total,fresh)=>total?`<span class="text-[10px] text-zinc-400">${fresh} new</span>`:"";
+    return `<div class="p-5 sm:p-6 max-h-[85vh] overflow-auto">
+      <div class="flex items-start gap-3">
+        <div class="tile bg-sky-500/10 text-sky-600 flex-none"><i class="ph-fill ph-vault text-xl"></i></div>
+        <div class="min-w-0">
+          <h3 class="font-display font-bold text-[16px]">Read “${esc(P.fileName)}”</h3>
+          <p class="text-[12px] text-zinc-500 mt-0.5 leading-relaxed">Recognised as <b>${esc(c.source||"school data")}</b>${c.exportedAt?` · exported ${esc(String(c.exportedAt).slice(0,10))}`:""}. Nothing has changed yet.</p>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-3 gap-2 my-4 text-center">
+        ${tile(st.teachers,"Teachers")}${tile(st.subjects,"Subjects")}${tile(st.classes,"Classes")}
+        ${tile(st.lessons,"Lessons")}${tile(st.reliefAssigned||0,"Relief covers")}${tile(st.days+" × "+st.periods,"Grid")}
+      </div>
+
+      <div class="rounded-xl border border-zinc-200 p-3 mb-3">
+        <div class="text-[11px] font-extrabold uppercase tracking-wide text-zinc-400 mb-2">What each choice does</div>
+        <div class="text-[12px] text-zinc-600 leading-relaxed space-y-1.5">
+          <div><b>Replace everything</b> — your workspace becomes exactly this file: ${st.teachers} teachers, ${st.subjects} subjects, ${st.classes} classes, ${st.lessons} lessons. Current data is removed (Undo restores it).</div>
+          <div><b>Merge</b> — keeps everything you have and adds what is missing: ${a.newTeachers} new teacher(s) ${mixed(st.teachers,a.newTeachers)}, ${a.newSubjects} new subject(s), ${a.newClasses} new class(es), and ${a.fill} lesson(s) placed in empty slots${a.busy?` (${a.busy} slot(s) already have a lesson and stay exactly as they are)`:""}.</div>
+        </div>
+      </div>
+
+      ${(c.notes&&c.notes.length)?`<div class="text-[11px] text-zinc-500 bg-zinc-50 border border-zinc-200/70 rounded-xl p-3 mb-3 leading-relaxed">
+        ${c.notes.map(n=>`<div class="flex items-start gap-1.5"><i class="ph-fill ph-info text-sky-400 mt-0.5 flex-none"></i><span>${esc(n)}</span></div>`).join("")}
+      </div>`:""}
+      ${a.outside?`<div class="text-[11px] text-amber-800 bg-amber-50 border border-amber-200/70 rounded-xl p-3 mb-3 leading-relaxed">
+        <b>${a.outside} lesson(s)</b> in this file sit outside your school's ${state.settings.daysPerWeek}-day, ${state.settings.periodsPerDay}-period week. Replace imports them as far as the grid allows; Merge grows the week so nothing is lost.</div>`:""}
+      ${(st.streams>0)?`<div class="text-[11px] text-emerald-800 bg-emerald-50 border border-emerald-200/70 rounded-xl p-3 mb-3 leading-relaxed">
+        ${st.streams} slot(s) hold more than one subject group; every group is imported.</div>`:""}
+      ${(st.unresolved>0)?`<div class="text-[11px] text-zinc-500 mb-3">${st.unresolved} record(s) could not be used and were skipped.</div>`:""}
+
+      <div class="flex flex-wrap gap-2.5 mt-4">
+        <button class="btn btn-soft" data-action="import-apply" data-mode="merge"><i class="ph ph-git-merge"></i>Merge into my workspace</button>
+        <button class="btn btn-danger" data-action="import-apply" data-mode="replace"><i class="ph ph-arrows-clockwise"></i>Replace everything</button>
+        <button class="btn btn-ghost" data-action="modal-close">Cancel</button>
+      </div>
+      <p class="text-[11px] text-zinc-400 mt-3 leading-relaxed">Ctrl+Z undoes the import either way.</p>
+    </div>`;
+  });
+}
+
+/* The spreadsheet writer, from the same vendored copy the reader uses. */
+let xlsxWriterPromise = null;
+function ensureXlsx(){
+  if (window.XLSX) return Promise.resolve(window.XLSX);
+  if (!xlsxWriterPromise) xlsxWriterPromise = loadScriptOnce("vendor/xlsx.full.min.js", () => !!window.XLSX)
+    .then(() => window.XLSX)
+    .catch(e => { xlsxWriterPromise = null; throw new Error("The spreadsheet writer could not start. " + e.message); });
+  return xlsxWriterPromise;
+}
+
+/* An .xlsx a school can open, read, edit and hand back to us. */
+async function exportWorkbook() {
+  const XLSX = await ensureXlsx();
+  const wb = XLSX.utils.book_new();
+  const s = state.settings;
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([
+    ["School name", s.schoolName || "School"], ["Days per week", s.daysPerWeek], ["Periods per day", s.periodsPerDay],
+    ["Format", BACKUP_FORMAT], ["Exported", new Date().toISOString().slice(0, 16).replace("T", " ")]
+  ]), "School");
+
+  const used = new Set(["school"]);
+  state.classes.forEach(c => {
+    const rows = [["Period", ...DAYS_SHORT.slice(0, s.daysPerWeek)]];
+    for (let p = 0; p < s.periodsPerDay; p++) {
+      const row = ["P" + (p + 1)];
+      for (let d = 0; d < s.daysPerWeek; d++) {
+        const ls = lessonsOf(state.timetable[c.id] && state.timetable[c.id][d] ? state.timetable[c.id][d][p] : null);
+        row.push(ls.map(L => {
+          const su = S(L.subjectId), te = T(L.teacherId);
+          return [su ? su.name : "", te ? te.name : ""].filter(Boolean).join(" · ");
+        }).join(" / "));
+      }
+      rows.push(row);
+    }
+    let name = String(c.name || "class").replace(/[\\/?*[\]:]/g, " ").slice(0, 28) || "class";
+    while (used.has(name.toLowerCase())) name = name.slice(0, 25) + " (2)";
+    used.add(name.toLowerCase());
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(rows), name);
+  });
+
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([["Name", "Code", "Subjects", "Phone"],
+    ...state.teachers.map(t => [t.name, t.code || "", (t.subjectIds || []).map(id => S(id) ? S(id).name : "").filter(Boolean).join(", "), t.phone || ""])]), "Teachers");
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([["Name", "Code"],
+    ...state.subjects.map(x => [x.name, x.code || ""])]), "Subjects");
+
+  const relief = [];
+  Object.entries(state.absences || {}).forEach(([date, rec]) => {
+    Object.entries(rec.relief || {}).forEach(([key, teacherId]) => {
+      const [cid, p] = key.split("|");
+      relief.push([date, (rec.teachers || []).map(id => T(id) ? T(id).name : "").filter(Boolean).join(", "),
+        C(cid) ? C(cid).name : cid, "P" + (parseInt(p, 10) + 1), T(teacherId) ? T(teacherId).name : ""]);
+    });
+  });
+  if (relief.length) XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([["Date", "Absent", "Class", "Period", "Covered by"], ...relief]), "Relief");
+
+  const buf = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([buf], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }));
+  a.download = (s.schoolName || "school").replace(/[^a-z0-9]+/gi, "-").toLowerCase() + "-timetable-" + localISO() + ".xlsx";
+  a.click(); URL.revokeObjectURL(a.href);
+  return { classes: state.classes.length, teachers: state.teachers.length, subjects: state.subjects.length };
+}
+
+function convertLegacyBackup(p){
+  /* subjects: plain name strings → entities */
+  const subjByNorm={}, usedSubjCodes=new Set(), subjects=[];
+  (p.db?.subjects||[]).forEach(name=>{
+    const nm=(name||"").trim(); const key=normName(nm);
+    if (!nm || subjByNorm[key]) return;
+    const id=uid("s");
+    subjects.push({ id, name:nm, code:uniqueCode(subjCodeOf(nm), usedSubjCodes), color:SUBJ_COLORS[subjects.length % SUBJ_COLORS.length] });
+    subjByNorm[key]=id;
+  });
+  /* teachers (db list first, strays referenced only in schedule auto-created) */
+  const teacherByNorm={}, usedTCodes=new Set(), teachers=[];
+  let strayTeachers=0;
+  const ensureTeacher = (rawName, fromList=false) => {
+    const nm=(rawName||"").trim(); const key=normName(nm);
+    if (!key) return null;
+    if (teacherByNorm[key]) return teacherByNorm[key];
+    const id=uid("t"); if (!fromList) strayTeachers++;
+    teachers.push({ id, name:nm, code:uniqueCode(initials(nm), usedTCodes), color:PALETTE[teachers.length % PALETTE.length], subjectIds:[] });
+    teacherByNorm[key]=id; return id;
+  };
+  (p.db?.teachers||[]).forEach(t=>{
+    const id=ensureTeacher(t.name, true); if (!id) return;
+    const rec=teachers.find(x=>x.id===id);
+    if (t.phone) rec.phone=t.phone;
+    (t.subs||[]).forEach(sn=>{ const sid=subjByNorm[normName(sn)]; if (sid && !rec.subjectIds.includes(sid)) rec.subjectIds.push(sid); });
+  });
+  /* schedule keys "grade-section-period-day" (1-based period, 0-based day) */
+  const classOrder=[], classSeen=new Set(), parsed=[];
+  let maxP=0, maxD=0, streams=0, unresolved=0, lessons=0;
+  Object.entries(p.schedule||{}).forEach(([k,arr])=>{
+    const parts=String(k).split("-");
+    if (parts.length<4 || !Array.isArray(arr) || !arr.length) return;
+    const cname=parts[0]+"-"+parts[1];
+    const pNum=parseInt(parts[2],10), dIdx=parseInt(parts[3],10);
+    if (!pNum || isNaN(dIdx) || dIdx<0) return;
+    maxP=Math.max(maxP,pNum); maxD=Math.max(maxD,dIdx);
+    if (!classSeen.has(cname)){ classSeen.add(cname); classOrder.push(cname); }
+    const valid=[];
+    arr.forEach(e=>{
+      const sid=subjByNorm[normName(e.s)];
+      if (!sid){ unresolved++; return; }
+      const tid=(e.t && String(e.t).trim()) ? ensureTeacher(e.t) : null;
+      valid.push({ subjectId:sid, teacherId:tid });
+    });
+    if (!valid.length) return;
+    if (valid.length>1) streams+=valid.length-1;
+    parsed.push({ cname, dIdx, pNum, lessons:valid }); lessons+=valid.length;
+  });
+  classOrder.sort((a,b)=>{ const ga=parseInt(a,10)||99, gb=parseInt(b,10)||99; return ga-gb || a.localeCompare(b); });
+  const periods=clamp(maxP||8,4,10), days=maxD>=5?6:5;
+  const classIdByName={}; const classes=classOrder.map(cname=>{ const id=uid("c"); classIdByName[cname]=id; return { id, name:cname }; });
+  const timetable={};
+  classes.forEach(c=>{ timetable[c.id]=Array.from({length:days},()=>Array(periods).fill(null)); });
+  parsed.forEach(({cname,dIdx,pNum,lessons:Ls})=>{
+    if (dIdx<days && pNum<=periods) timetable[classIdByName[cname]][dIdx][pNum-1]=Ls;
+    else lessons-=Ls.length;
+  });
+  /* relief history (keys "n-grade-section-period-day" → cover teacher name) */
+  const absences={}; let reliefAssigned=0, reliefSkipped=0;
+  Object.entries(p.db?.reliefData||{}).forEach(([date,rec])=>{
+    const absentIds=[...new Set((rec?.absent||[]).map(n=>teacherByNorm[normName(n)]).filter(Boolean))];
+    const relief={};
+    Object.entries(rec?.assignments||{}).forEach(([k,teacherName])=>{
+      const parts=String(k).split("-");
+      if (parts.length<5){ reliefSkipped++; return; }
+      const cname=parts[1]+"-"+parts[2], pNum=parseInt(parts[3],10);
+      const cid=classIdByName[cname], rid=teacherByNorm[normName(teacherName)];
+      if (!cid || !rid || !pNum){ reliefSkipped++; return; }
+      relief[cid+"|"+(pNum-1)]=rid; reliefAssigned++;
+    });
+    if (absentIds.length || reliefAssigned) absences[date]={ teachers:absentIds, relief };
+  });
+  return {
+    legacy:true,
+      data:{ settings:{ daysPerWeek:days, periodsPerDay:periods, maxLoad:28, loadCap:35 }, teachers, subjects, classes, curriculum:[], timetable, absences },
+    stats:{ teachers:teachers.length, subjects:subjects.length, classes:classes.length, lessons,
+      reliefAssigned, days, periods, streams, unresolved:unresolved+reliefSkipped, strayTeachers }
+  };
+}
+function convertNativeBackup(p){
+  let lessons=0; Object.values(p.timetable||{}).forEach(g=>(g||[]).forEach(r=>(r||[]).forEach(c=>{ if(c) lessons++; })));
+  let reliefAssigned=0; Object.values(p.absences||{}).forEach(rec=>{ Object.values(rec?.relief||{}).forEach(v=>{ if(v) reliefAssigned++; }); });
+  return {
+    legacy:false,
+    data:{ settings:{ daysPerWeek:p.settings?.daysPerWeek||5, periodsPerDay:p.settings?.periodsPerDay||7, maxLoad:p.settings?.maxLoad||28, loadCap:p.settings?.loadCap||35 },
+      teachers:p.teachers.map(t=>({ subjectIds:[], code:initials(t.name), color:PALETTE[0], ...t })),
+      subjects:p.subjects, classes:p.classes, curriculum:p.curriculum||[], timetable:p.timetable||{}, absences:p.absences||{} },
+    stats:{ teachers:p.teachers.length, subjects:p.subjects.length, classes:p.classes.length, lessons,
+      reliefAssigned, days:p.settings?.daysPerWeek||5, periods:p.settings?.periodsPerDay||7, condensed:0, unresolved:0 }
+  };
+}
+function applyConverted(data){
+  if (!Array.isArray(data.curriculum)) data.curriculum=[];
+  data.settings={ ...Store.raw.settings, ...(data.settings||{}), schoolName:Store.raw.settings.schoolName, logo:Store.raw.settings.logo };
+  Store.replaceData(data);
+  Store.raw.ui.activeClassId=data.classes[0]?.id||null;
+  Store.raw.ui.dbTab="teachers";
+  Store.flush();
+  if (Sync.active){ Sync._lastSig=null; Sync.pushNow(); }
+}
+
+/* ---- resize guard: reducing days/periods DROPS lessons. Count them, show the real
+   impact, and force an explicit confirmation with a full restore path. ---- */
+async function resizeGuard(el, kind){
+  if(!needSettings()) return;
+  const next=+el.value;
+  const cur=kind==="days" ? state.settings.daysPerWeek : state.settings.periodsPerDay;
+  if(next===cur) return;
+  let doomed=0;
+  state.classes.forEach(c=>{
+    (state.timetable[c.id]||[]).forEach((row,d)=>row.forEach((cell,p)=>{
+      if(!cell) return;
+      const drop=(kind==="days"&&d>=next)||(kind==="periods"&&p>=next);
+      if(drop) doomed+=lessonsOf(cell).length;
+    }));
+  });
+  el.checked=el.value=String(cur);
+  let proceed=true;
+  if(doomed>0){
+    proceed=await confirmDialog({
+      title:`${doomed} lesson${doomed!==1?"s":""} will be removed`,
+      message:`Reducing to <b>${next} ${kind==="days"?"school days":"periods per day"}</b> removes <b>${doomed}</b> scheduled lesson${doomed!==1?"s":""} that fall outside the new grid, <b>permanently</b>, on every synced device. A full backup will be kept in undo history (Ctrl+Z).`,
+      confirmLabel:"Remove them",
+      icon:"ph-warning-octagon"
+    });
+  }
+  if(!proceed) return;
+  const backup=JSON.parse(JSON.stringify(Store.raw));
+  el.value=String(next);
+  if(kind==="days") state.settings.daysPerWeek=next;
+  else state.settings.periodsPerDay=next;
+  normalize();
+  if(doomed>0){
+    try{
+      const old=Object.keys(localStorage).filter(k=>k.startsWith("cf.resizeBackup.")).sort();
+      while(old.length>=2) localStorage.removeItem(old.shift());
+      localStorage.setItem("cf.resizeBackup."+Date.now(),JSON.stringify(backup));
+    }catch(_){ toast("info","Backup not saved","Undo (Ctrl+Z) still works for this session."); }
+    toast("info","Timetable resized",`${doomed} lesson${doomed!==1?"s":""} outside the new grid were removed. Undo restores them.`);
+  } else {
+    toast("success","Timetable resized","All lessons were remapped — nothing was lost.");
+  }
+}
+
+/* ---- change handlers ---- */
+function memberUpdate(muid, patch, alsoUser=null){
+  const updates={};
+  Object.entries(patch||{}).forEach(([k,v])=>{ updates[`schools/${Session.schoolId}/members/${muid}/${k}`]=v; });
+  Object.entries(alsoUser||{}).forEach(([k,v])=>{ updates[`users/${muid}/${k}`]=v; });
+  return FB.db.ref().update(updates).catch(e=>{
+    toast("error","Update rejected",e.message||"");
+  });
+}
+const changeHandlers={
+  "cell-subject": el=>{ if(!canEdit()||!needUnlocked(el.dataset.cid)) return; const {cid,d,p,li}=el.dataset;
+    const cls=C(cid); const ct=cls?.classTeacherId?T(cls.classTeacherId):null;
+    const sticky=cls?.preferClassTeacher && ct && (ct.subjectIds||[]).includes(el.value);
+    const cur=lessonsOf(getCell(cid,+d,+p));
+    cur[+li]={ subjectId:el.value||null, teacherId: sticky && el.value ? cls.classTeacherId : null };
+    if (sticky && el.value && cur[+li].teacherId) toast("info","Class teacher assigned", `${T(cls.classTeacherId)?.name||""} was auto-assigned (sticky class teacher).`);
+    setCell(cid,+d,+p,cur); },
+  "cell-teacher": el=>{ if(!canEdit()||!needUnlocked(el.dataset.cid)) return; const {cid,d,p,li}=el.dataset;
+    const cur=lessonsOf(getCell(cid,+d,+p)); if(!cur[+li]) return;
+    const t=el.value?T(el.value):null;
+    const patch={...cur[+li], teacherId:el.value||null};
+    /* teacher-first flow: choosing a teacher with no subject auto-fills from their subjects */
+    if (t && !patch.subjectId && (t.subjectIds||[]).length){
+      patch.subjectId=t.subjectIds[0];
+      toast("info","Subject auto-filled", `${S(patch.subjectId)?.name||""} assigned — change it anytime; their other subjects are listed first.`);
+    }
+    cur[+li]=patch; setCell(cid,+d,+p,cur); },
+  "absence-toggle": el=>{
+    if(!canEdit()){ el.checked=!el.checked; toast("error","View-only access","Ask your principal to grant edit rights."); return; }
+    const iso=state.ui.reliefDate; const dayIdx=dayIndexFor(iso);
+    const rec=absRecWrite(iso); const tid=el.dataset.id; const t=T(tid);
+    if (el.checked){
+      if(!rec.teachers.includes(tid)) rec.teachers.push(tid);
+      const n=autoAssignForTeacher(iso,tid,_reliefAttDay);
+      const slots=dayIdx>=0?slotsOfTeacherOn(tid,dayIdx).length:0;
+      if (slots===0) toast("info", t.name+" marked absent","No lessons scheduled that day — nothing to cover.");
+      else if (n>0) toast("success","Relief auto-assigned", n+" of "+slots+" period"+(slots!==1?"s":"")+" covered by the best-matched free teachers.");
+      else toast("error","No free substitutes", slots+" period"+(slots!==1?"s":"")+" affected but no matching free teachers.");
+    } else actions["absence-off"](el);
+  },
+  "relief-pick": el=>{ if(!canEdit()) return; const rec=absRecWrite(el.dataset.iso); rec.relief[el.dataset.key]=el.value||null;
+    if(!el.value) toast("info","Slot left uncovered","It will be flagged in the WhatsApp plan."); },
+  "relief-date": el=>{ if(el.value) state.ui.reliefDate=el.value; },
+  "home-class": el=>{ state.ui.homeClassId=el.value; },
+  "class-teacher": el=>{ if(!canEdit()) return; const c=C(el.dataset.id); if(!c) return;
+    c.classTeacherId=el.value||null;
+    if (!c.classTeacherId) c.preferClassTeacher=false;
+    if (c.classTeacherId) toast("success","Class teacher set", `${T(c.classTeacherId)?.name||""} now looks after ${c.name}.`); },
+  "class-sticky": el=>{ if(!canEdit()) return; const c=C(el.dataset.id); if(!c) return;
+    if (el.checked && !c.classTeacherId){ toast("error","Pick a class teacher first","Choose their name in the dropdown, then enable sticky."); el.checked=false; return; }
+    if (el.checked && !canTeachClass(T(c.classTeacherId),c.id)){ toast("error","Teacher is outside this grade","Update the teacher's grade limits before making them sticky for "+c.name+"."); el.checked=false; return; }
+    c.preferClassTeacher=el.checked;
+    toast("info", el.checked?"Sticky class teacher on":"Sticky class teacher off", el.checked?`${T(c.classTeacherId)?.name||""} will be auto-preferred for ${c.name}'s lessons & relief.`:""); },
+  "set-days": el=>resizeGuard(el,"days"),
+  "set-periods": el=>resizeGuard(el,"periods"),
+  "set-maxload": el=>{ if(!needSettings()) return; state.settings.maxLoad=clamp(parseInt(el.value)||28,1,60);
+    if (state.settings.loadCap<state.settings.maxLoad){ state.settings.loadCap=state.settings.maxLoad; toast("info","Limits adjusted","The overload limit can't be lower than the teaching target."); } },
+  "set-loadcap": el=>{ if(!needSettings()) return; const v=clamp(parseInt(el.value)||35,1,60);
+    if (v<state.settings.maxLoad){ toast("error","Too low","The overload limit can't be below the teaching target ("+state.settings.maxLoad+")."); return; }
+    state.settings.loadCap=v; },
+  "live-teacher-subj": el=>{
+    if(!canEdit()) return;
+    const t=T(el.dataset.id); if(!t) return;
+    const has=(t.subjectIds||[]).includes(el.dataset.sid);
+    t.subjectIds = el.checked ? (has?t.subjectIds:[...(t.subjectIds||[]),el.dataset.sid]) : (t.subjectIds||[]).filter(x=>x!==el.dataset.sid);
+  },
+  "live-teacher-color": el=>{ if(!canEdit()) return; const t=T(el.dataset.id); if(t) t.color=el.value; },
+  "live-teacher-grade": el=>{ if(!canEdit()) return;
+    const t=T(el.dataset.id); if(!t) return;
+    const g=el.dataset.g;
+    const cur=teacherGrades(t);
+    /* “Any grade” is the neutral default; tapping Grade 6 means Grade 6 only. */
+    const base = cur===null ? [] : cur;
+    const next = el.checked ? [...new Set([...base,g])] : base.filter(x=>x!==g);
+    if (next.length){ t.grades=next; t.gradesNone=false; } else { t.grades=null; t.gradesNone=true; }
+    if (next.length===0) toast("error","No grades selected",`${t.name} can't be scheduled anywhere until you tick at least one grade.`);
+  },
+  "live-subject-color": el=>{ if(!canEdit()) return; const s=S(el.dataset.id); if(s) s.color=el.value; },
+  "pdoc-type": el=>{
+    state.ui.print.doc=el.value;
+    const pool=el.value==="class"?state.classes:el.value==="teacher"?state.teachers:null;
+    if (pool && !pool.some(x=>x.id===state.ui.print.targetId)) state.ui.print.targetId=pool[0]?.id||"";
+  },
+  "pdoc-target": el=>{ state.ui.print.targetId=el.value; },
+  "pdoc-paper": el=>{ state.ui.print.paper=el.value; setPaper(el.value); },
+  "import-file": async el=>{
+    if(!canEditSettings()) return;
+    const f=el.files?.[0]; el.value=""; if(!f) return;
+    try{
+      /* JSON backups are read with the same day/period/normalisation helpers the
+         scanner uses, so make sure that module is present (it ships offline). */
+      await ensureScanner();
+      let conv=null;
+      if(/\.(xlsx|xlsm|xls|csv|tsv|ods)$/i.test(f.name)) conv=await parseBackupWorkbook(f);
+      else {
+        const text=await f.text();
+        let parsed=null;
+        try{ parsed=JSON.parse(text); }catch(_){ parsed=null; }
+        conv = parsed ? parseBackupJson(parsed) : await parseBackupWorkbook(f).catch(()=>null);
+      }
+      if(!conv||(!conv.data.teachers.length&&!conv.data.subjects.length&&!conv.data.classes.length)) throw new Error("unrecognised");
+      importPending={ conv, analysed:analyseImport(conv), fileName:f.name };
+      openImportModal();
+    }catch(err){
+      toast("error","Import failed",
+        (err && err.message==="unrecognised")
+          ? "That file isn't a CampusFlow backup, a database export, a timetable spreadsheet or a list of lessons."
+          : "That file could not be read"+(err&&err.message?" — "+err.message:"")+".");
+    }
+  },
+  "brand-custom": el=>{ if(!needBranding()) return; const c=String(el.value||""); if(/^#[0-9a-f]{6}$/i.test(c)){ state.settings.brand=c; applyBrand(); Store.flush(); Store.requestRender(); } },
+  "logo-file": el=>{
+    if(!canEditBranding()) return;
+    const f=el.files?.[0]; el.value=""; if(!f) return;
+    if(!f.type.startsWith("image/")){ toast("error","Not an image","Pick a PNG, JPG or SVG file."); return; }
+    const rd=new FileReader();
+    rd.onload=()=>{
+      const img=new Image();
+      img.onload=()=>{
+        const size=256, cv=document.createElement("canvas");
+        cv.width=cv.height=size;
+        const ctx=cv.getContext("2d");
+        if (!ctx){ toast("error","Image tools unavailable","This browser couldn't process the logo. Try a PNG on another device."); return; }
+        const scale=Math.max(size/img.width, size/img.height);
+        const w=img.width*scale, h=img.height*scale;
+        if (ctx.roundRect){ ctx.beginPath(); ctx.roundRect(0,0,size,size,56); ctx.clip(); }
+        ctx.fillStyle="#fff"; ctx.fillRect(0,0,size,size);
+        ctx.drawImage(img,(size-w)/2,(size-h)/2,w,h);
+        const dataUrl=cv.toDataURL("image/png");
+        if (dataUrl.length>380000){ toast("error","Logo too large","Try a simpler image — the logo must stay lightweight for sync."); return; }
+        state.settings.logo=dataUrl;
+        toast("success","Logo updated","It now appears across the app and on printed documents.");
+      };
+      img.onerror=()=>toast("error","Couldn't read image","Try a different file.");
+      img.src=rd.result;
+    };
+    rd.onerror=()=>toast("error","Couldn't read image","The file may be damaged or unavailable.");
+    rd.readAsDataURL(f);
+  },
+  /* ---- team member live-edit ---- */
+  "member-role": el=>{ if(!canManageUsers()) return; memberUpdate(el.dataset.id, {role:el.value}, {role:el.value}); },
+  "member-perm": el=>{ if(!canManageUsers()) return;
+    const m=App.members[el.dataset.id]; if(!m) return;
+    memberUpdate(el.dataset.id, {permissions:{...(m.permissions||{}), [el.dataset.perm]:el.checked}}); },
+  "member-teacher": el=>{ if(!canManageUsers()) return;
+    memberUpdate(el.dataset.id, {teacherId:el.value||null}); },
+  "member-active": el=>{ if(!canManageUsers()) return;
+    const active=el.checked;
+    memberUpdate(el.dataset.id, {active}, {active}); },
+};
+/* ---- input handlers ---- */
+const inputHandlers={
+  "db-search": el=>{ App.dbQuery=el.value; Store.requestRender(); },
+  "scan-key": el=>{ Scan.aiKey=el.value.trim();
+    /* Gemini key in browser: only persisted when the user explicitly opts in. Default is
+       in-memory only — nothing sensitive is written to localStorage without consent. */
+    if($("#scan-remember-key")?.checked){
+      localStorage.setItem("cf.aiKey",Scan.aiKey);
+    } else {
+      localStorage.removeItem("cf.aiKey");
+    }
+  },
+  "scan-key-remember": el=>{ if(!el.checked){ localStorage.removeItem("cf.aiKey"); toast("info","Key forgotten","The Gemini key has been removed from this device."); } },
+  "scan-key-clear": el=>{ const i=$("#scan-key"); if(i) i.value=""; Scan.aiKey=""; localStorage.removeItem("cf.aiKey"); toast("info","Key cleared","The Gemini key is removed from this device."); },
+  "scan-model": el=>{ const v=el.value.trim(); if(v) localStorage.setItem("cf.geminiModel",v); },
+  "scan-text": el=>{ Scan.rawText=el.value; },
+  "scan-name": el=>{ const r=Scan.rows[+el.dataset.i]; if(r) r.name=el.value; },
+  "school-offer": el=>{ if(!isSuper()) return;
+    clearTimeout(el._offerTimer); el._offerTimer=setTimeout(()=>{
+      FB.db.ref(`schools/${el.dataset.id}/profile/offer`).set(el.value.trim()||"Standard").catch(err=>toast("error","Offer not saved",err.message||""));
+    },500); },
+  "live-teacher-name": el=>{ if(!canEdit()) return; const t=T(el.dataset.id); if(t) t.name=el.value; },
+  "live-teacher-code": el=>{ if(!canEdit()) return; const t=T(el.dataset.id); if(t) t.code=el.value.toUpperCase().slice(0,5); },
+  "live-subject-name": el=>{ if(!canEdit()) return; const s=S(el.dataset.id); if(s) s.name=el.value; },
+  "live-subject-code": el=>{ if(!canEdit()) return; const s=S(el.dataset.id); if(s) s.code=el.value.toUpperCase().slice(0,5); },
+  "set-school": el=>{ if(!canEditSettings()) return; state.settings.schoolName=el.value; },
+  "member-name": el=>{ if(!canManageUsers()) return;
+    clearTimeout(el._t); el._t=setTimeout(()=>memberUpdate(el.dataset.id,{name:el.value.trim()||el.value},{name:el.value.trim()||el.value}),600); }
+};
+
+/* ---- forms ---- */
+async function handleForm(form){
+  const kind=form.dataset.form;
+  if (kind==="site-edit"){
+    if(!isSuper()){ toast("error","Owner only","Site content is controlled by the platform owner."); return; }
+    const btn=$("#se-submit",form);
+    btn.disabled=true; btn.innerHTML=`<span class="spinner"></span>Publishing…`;
+    const features=[];
+    for(let i=0;i<6;i++){
+      const title=($(`[data-feature-title="${i}"]`,form)?.value||"").trim();
+      const text=($(`[data-feature-text="${i}"]`,form)?.value||"").trim();
+      if(title&&text) features.push({title,text});
+    }
+    const payload={
+      waMsg:      $("#se-wamsg",form).value.trim().slice(0,200)||undefined,
+      heroTitle:  $("#se-title",form).value.trim().slice(0,140)||undefined,
+      heroSubtitle:$("#se-sub",form).value.trim().slice(0,320)||undefined,
+      trialDays:  clamp(parseInt($("#se-trial",form).value)||0,0,365),
+      planName:   $("#se-planname",form).value.trim().slice(0,40)||undefined,
+      planPrice:  $("#se-planprice",form).value.trim().slice(0,60)||undefined,
+      features:   features.length?features:SiteCfg.features()
+    };
+    Object.keys(payload).forEach(k=>payload[k]===undefined&&delete payload[k]);
+    try{
+      await FB.db.ref("site/config").update(payload);
+      Modal.close();
+      toast("success","Site content published","The landing page and every creative now use your settings — live on all devices.");
+    }catch(e){
+      btn.disabled=false; btn.innerHTML=`<i class="ph ph-cloud-check"></i>Publish site content`;
+      toast("error","Couldn't publish",e.message||"Check the connection and rules for site/config.");
+    }
+    return;
+  }
+  if (kind==="login") return handleLogin(form);
+  if (kind==="forgot"){
+    if (!FB.ready){ toast("error","Offline","Reconnect to the internet and try again."); return; }
+    const email=$("#forgot-email",form).value.trim();
+    forgotState.email=email;
+    if (!email || !email.includes("@")){
+      forgotState.error="Enter the full email address on the account. Usernames (like “priya”) can't receive reset links — ask your principal to issue new credentials.";
+      Modal.rerender(); return;
+    }
+    forgotState.sending=true; forgotState.error=""; Modal.rerender();
+    try{
+      /* Use Firebase's hosted reset handler. An in-app action link requires a complete
+         oobCode verification screen; requesting one without that screen produced dead links. */
+      await FB.auth.sendPasswordResetEmail(email);
+      Modal.close();
+      toast("success","Reset link sent","Check "+email+" — the link expires in one hour.");
+    }catch(e){
+      forgotState.sending=false;
+      forgotState.error=AUTH_ERRORS[e.code]||("Couldn't send the link: "+(e.code||e.message));
+      Modal.rerender();
+    }
+    return;
+  }
+  if (kind==="change-pass"){
+    if (!FB.ready || !FB.auth.currentUser){ toast("error","Not signed in","Sign in again to change your password."); return; }
+    const cur=$("#cp-current",form), nw=$("#cp-new",form), nw2=$("#cp-new2",form);
+    const err=$("#cp-err",form);
+    const show=m=>{ err.hidden=false; err.textContent=m; };
+    err.hidden=true;
+    if (nw.value.length<6){ show("New password must be at least 6 characters."); nw.focus(); return; }
+    if (nw.value!==nw2.value){ show("The two new passwords don't match."); nw2.focus(); return; }
+    if (nw.value===cur.value){ show("The new password must be different from the current one."); return; }
+    const btn=form.querySelector('button[type="submit"]');
+    btn.disabled=true; btn.innerHTML=`<span class="spinner"></span>Updating…`;
+    try{
+      const user=FB.auth.currentUser;
+      await user.reauthenticateWithCredential(firebase.auth.EmailAuthProvider.credential(user.email, cur.value));
+      await user.updatePassword(nw.value);
+      Modal.close();
+      toast("success","Password updated","Use your new password the next time you sign in.");
+    }catch(e){
+      btn.disabled=false; btn.innerHTML=`<i class="ph ph-key"></i>Update password`;
+      if (e.code==="auth/wrong-password"||e.code==="auth/invalid-credential"||e.code==="auth/invalid-login-credentials") show("Your current password is incorrect.");
+      else if (e.code==="auth/too-many-requests") show("Too many attempts — wait a minute and try again.");
+      else if (e.code==="auth/requires-recent-login") show("For security, sign out and sign back in, then try again.");
+      else if (e.code==="auth/weak-password") show("New password must be at least 6 characters.");
+      else show("Couldn't update: "+(e.code||e.message));
+    }
+    return;
+  }
+  if (kind==="member-reset"){
+    if(!canManageUsers()){ toast("error","Principal only","Only the principal or platform owner can replace sign-ins."); return; }
+    const muid=form.dataset.muid; const m=App.members[muid];
+    if (!m){ toast("error","Member not found","They may already have been removed."); Modal.close(); return; }
+    const who=($("#mr-user",form).value.trim()||"").toLowerCase();
+    const pass=$("#mr-pass",form).value;
+    const btn=$("#mr-submit",form);
+    if (!who || !/^[a-z0-9._-]+$/.test(who)){ toast("error","Check the username","Usernames can use only letters, numbers, dot, dash and underscore."); return; }
+    if (who===displayAcct(m.email).toLowerCase()){ toast("error","Pick a different username","The old sign-in still occupies that name."); return; }
+    if (pass.length<6){ toast("error","Check the password","It must be at least 6 characters."); return; }
+    provisionButton(btn,"Creating replacement…","The secure server is preserving their role and permissions…");
+    try{
+      const email=toAuthEmail(who);
+      await replaceMemberSecure({schoolId:Session.schoolId,oldUid:muid,email,password:pass,member:m,form});
+      Modal.close();
+      toast("success","New sign-in created", m.name+" now signs in as “"+who+"”. The old one no longer works.");
+      showCredentialsModal(m.name, email, pass);
+    }catch(e){
+      resetProvisionButton(btn,`<i class="ph ph-key"></i>Create new sign-in`);
+      setProvisionStage(form,"error",provisionMessage(e),"error");
+      toast("error","Couldn't create it",provisionMessage(e));
+    }
+    return;
+  }
+  if (kind==="school-draft"){
+    const current=FB.auth?.currentUser;
+    if(!current){ toast("error","Not signed in","Sign in again, then create the school."); return; }
+    if(!isSuper()){
+      toast("error","Super Admin required",`This account is ${current.email||current.uid}. It is not allowed by the current database rules. Sign in with ${SUPER_EMAIL} / UID ${SUPER_UID}, or deploy database.rules.json.`);
+      return;
+    }
+    const name=$("#draft-sc-name",form).value.trim();
+    const pname=$("#draft-sc-pname",form).value.trim();
+    const emailRaw=$("#draft-sc-email",form).value.trim();
+    const email=toAuthEmail(emailRaw);
+    const pass=$("#draft-sc-pass",form).value;
+    const trialDays=clamp(parseInt($("#draft-sc-trial",form)?.value)||0,0,365);
+    const offer=$("#draft-sc-offer",form)?.value.trim()||"Standard";
+    const btn=$("#school-submit",form);
+    /* Say exactly which field is wrong — the old catch-all "Check the form" surfaced when
+       a Sinhala/Tamil school name silently left the username field empty. */
+    const missing=[];
+    if(!name) missing.push("the school name");
+    if(!pname) missing.push("the principal's full name");
+    if(!emailRaw) missing.push("the principal's username — a Sinhala/Tamil school name can't be converted automatically, so type one (e.g. principal.sunrise)");
+    if(pass.length<6) missing.push("a password of at least 6 characters");
+    if(missing.length){ toast("error","Check the form","Missing: "+missing.join(" · ")); return; }
+    if(!/^[a-z0-9._-]+$/i.test(email.split("@")[0])){
+      toast("error","Username can't be used","Sign-in names need Latin letters or numbers (a-z, 0-9). Try something like “principal.sunrise”.");
+      return;
+    }
+    provisionButton(btn,"Creating securely…","Step 1 of 2 · Creating the principal sign-in…");
+    try{
+      await provisionSchoolDirect({name,principalName:pname,email,password:pass,trialDays,offer,form});
+      Modal.close();
+      toast("success","School created", name+" is live on the platform.");
+      showCredentialsModal(pname, email, pass);
+    }catch(e){
+      resetProvisionButton(btn,`<i class="ph ph-buildings"></i>Create school &amp; principal`);
+      setProvisionStage(form,"error",provisionMessage(e),"error");
+      toast("error","Couldn't create school",provisionMessage(e));
+    }
+    return;
+  }
+  if (kind==="member-draft"){
+    const name=$("#draft-m-name",form).value.trim();
+    const emailRaw=$("#draft-m-email",form).value.trim();
+    const email=toAuthEmail(emailRaw);
+    const role=form.querySelector('input[name="dmrole"]:checked')?.value||"teacher";
+    const editW=$("#draft-m-edit",form).checked;
+    const viewU=$("#draft-m-view",form).checked;
+    const teacherId=$("#draft-m-teacher",form).value||null;
+    const pass=$("#draft-m-pass",form).value;
+    const btn=$("#member-submit",form);
+    if(!name||!emailRaw||pass.length<6){ toast("error","Check the form","Name, a username (or email) and a 6+ character password are required."); return; }
+    provisionButton(btn,"Creating securely…","Creating the sign-in and linking it to this school…");
+    try{
+      const permissions={};
+      if (editW || role==="admin") permissions.editWorkspace=true;
+      if (viewU || role==="admin") permissions.viewUsers=true;
+      await provisionMemberDirect({schoolId:Session.schoolId,name,email,password:pass,role,permissions,teacherId,form});
+      Modal.close();
+      toast("success","User added", name+" is now part of "+(state.settings.schoolName||"the school")+".");
+      showCredentialsModal(name, email, pass);
+    }catch(e){
+      resetProvisionButton(btn,`<i class="ph ph-user-plus"></i>Create account`);
+      setProvisionStage(form,"error",provisionMessage(e),"error");
+      toast("error","Couldn't create user",provisionMessage(e));
+    }
+    return;
+  }
+  if (kind==="teacher-draft"){
+    if(!needEdit()) return;
+    const name=$("#draft-t-name",form).value.trim();
+    if(!name){ toast("error","Name required","Give the teacher a name first."); return; }
+    const code=($("#draft-t-code",form).value.trim().toUpperCase()||initials(name)).slice(0,5);
+    const color=form.querySelector(".draft-t-color:checked")?.value||PALETTE[0];
+    const subs=$$(".draft-t-subj:checked",form).map(i=>i.value);
+    const grades=$$(".draft-t-grade:checked",form).map(i=>i.value);
+    state.teachers=[...state.teachers,{id:uid("t"),name,code,color,subjectIds:subs,grades:grades.length?grades:null}];
+    Modal.close(); toast("success","Teacher added", name+" is ready to be scheduled.");
+    return;
+  }
+  if (kind==="subject-draft"){
+    if(!needEdit()) return;
+    const name=$("#draft-s-name",form).value.trim();
+    if(!name){ toast("error","Name required","Give the subject a name first."); return; }
+    const code=($("#draft-s-code",form).value.trim().toUpperCase()||initials(name)).slice(0,5);
+    const color=form.querySelector(".draft-s-color:checked")?.value||SUBJ_COLORS[0];
+    state.subjects=[...state.subjects,{id:uid("s"),name,code,color}];
+    Modal.close(); toast("success","Subject added", name+" can now be taught & scheduled.");
+    return;
+  }
+  if (kind==="class-draft"){
+    if(!needEdit()) return;
+    const input=$("#draft-c-name",form); const name=input.value.trim();
+    if(!name){ toast("error","Name required","Give the class a name first."); return; }
+    const id=uid("c");
+    state.classes=[...state.classes,{id,name}];
+    state.timetable[id]=blankGrid();
+    toast("success","Class created", name+" has a fresh "+state.settings.daysPerWeek+"×"+state.settings.periodsPerDay+" grid.");
+  }
+}
+
+/* ---- global listeners ---- */
+function reportUIError(err, area="action"){
+  console.warn("CampusFlow "+area+" failed:",err);
+  toast("error","That didn't work","Nothing was lost. Close this window and try again; if it repeats, check your connection.");
+}
+document.addEventListener("click", e=>{
+  const el=e.target.closest("[data-action]");
+  if(!el) return;
+  const fn=actions[el.dataset.action];
+  if(fn){
+    /* The modal backdrop wraps EVERY dialog, so closest() reaches it from a click on any
+       button inside a dialog. Cancelling its default action also cancelled the native
+       submit of every form in a modal — Create school, Add user, Add teacher, Add subject,
+       password reset. The backdrop itself has no default action, so it must not be cancelled. */
+    if (el.dataset.action!=="modal-backdrop") e.preventDefault();
+    try { const out=fn(el,e); if(out&&typeof out.catch==="function") out.catch(err=>reportUIError(err,"action")); }
+    catch(err){ reportUIError(err,"action"); }
+  }
+});
+document.addEventListener("change", e=>{
+  const key=e.target.dataset?.change;
+  if(key&&changeHandlers[key]){
+    try { const out=changeHandlers[key](e.target); if(out&&typeof out.catch==="function") out.catch(err=>reportUIError(err,"change")); }
+    catch(err){ reportUIError(err,"change"); }
+  }
+});
+document.addEventListener("input", e=>{
+  const key=e.target.dataset?.input;
+  if(key&&inputHandlers[key]){
+    /* the field already shows what was typed — don't rebuild the dialog around it */
+    if (Modal.current) Modal.skipNext=true;
+    try { inputHandlers[key](e.target); } catch(err){ reportUIError(err,"input"); }
+  }
+  if(e.target.id==="draft-t-name"){ const c=$("#draft-t-code"); if(c&&!c.value) c.placeholder=initials(e.target.value||"??"); }
+  if(e.target.id==="draft-sc-email") e.target.dataset.manual="1";
+  if(e.target.id==="draft-sc-name"){
+    const u=$("#draft-sc-email");
+    if(u&&!u.dataset.manual){
+      const slug=e.target.value.toLowerCase().replace(/[^a-z0-9]+/g,".").replace(/^\.|\.$/g,"").slice(0,28);
+      /* Sinhala / Tamil school names contain no a-z0-9, so the slug comes out empty.
+         Blanking the field silently made the form unsubmittable with a vague error, so
+         ask for a Latin username instead and explain why. */
+      if(slug){ u.value="principal."+slug; u.placeholder=""; }
+      else { u.value=""; u.placeholder="Latin letters only — e.g. principal.sunrise"; }
+    }
+  }
+});
+document.addEventListener("submit", e=>{
+  const form=e.target.closest("[data-form]");
+  if(form){
+    e.preventDefault();
+    try { const out=handleForm(form); if(out&&typeof out.catch==="function") out.catch(err=>reportUIError(err,"form")); }
+    catch(err){ reportUIError(err,"form"); }
+  }
+});
+document.addEventListener("keydown", e=>{ if(e.key==="Escape"&&Modal.current){ Modal.close(); confirmResolver?.(false); confirmResolver=null; } });
+window.addEventListener("beforeunload", ()=>{ Store.flush(); if(Sync.pending&&Sync.active) Sync.pushNow(); });
+
+/* ---- History API: phone Back must close the topmost dialog first, then the previous
+   in-app route — never sign out or dump the user on a churned full reload. Navigation
+   pushes one entry per user tap; internal data renders never push their own entries. */
+const HistoryNav={
+  initialized:false,
+  current(){
+    return Modal.current ? "__modal" : (Store.raw.ui.route||"dashboard");
+  },
+  init(){
+    if(this.initialized) return;
+    this.initialized=true;
+    history.replaceState({cf:this.current()},"");
+    window.addEventListener("popstate", e=>{
+      const state=e.state?.cf;
+      if(Modal.current){ Modal.close(); this.push(); return; }
+      if(state && state!=="__modal"){
+        Store.raw.ui.route=state;
+        Store.flush(); Store.requestRender();
+      }
+    });
+  },
+  push(){
+    if(!this.initialized) return;
+    history.pushState({cf:this.current()},"");
+  }
+};
+document.addEventListener("click",e=>{
+  const nav=e.target.closest("[data-action='nav'],[data-action='goto-database'],[data-action='open-class-grid'],[data-action='goto-class-setup']");
+  if(nav) requestAnimationFrame(()=>HistoryNav.push());
+});
+HistoryNav.init();
+
+/* ================= PWA ================= */
+let deferredInstall=null;
+window.addEventListener("beforeinstallprompt", e=>{ e.preventDefault(); deferredInstall=e; renderNav?.(); });
+window.addEventListener("appinstalled", ()=>{ deferredInstall=null; toast("success","Installed","CampusFlow now lives on this device."); });
+
+/* ---- Safe service-worker update flow. The new shell waits deliberately; the user is
+   told when it is ready, at a point chosen not to interrupt unsaved work. A detected
+   updated shell no longer takes over immediately. ---- */
+let swRegistration=null;
+if ("serviceWorker" in navigator && location.protocol.startsWith("http")){
+  navigator.serviceWorker.register("sw.js").then(reg=>{
+    swRegistration=reg;
+    const promptUpdate=()=>{
+      toast("info","Update ready","CampusFlow has a new version. Reload when you're ready — your work is saved.");
+      if(confirmResolver) return;
+      const bd=document.createElement("div");
+      bd.className="toast";
+      bd.innerHTML=`<div class="tile w-8 h-8 rounded-lg bg-emerald-500/10 text-emerald-600"><i class="ph-fill ph-cloud-arrow-down text-base"></i></div>
+        <div class="min-w-0 flex-1"><div class="text-[13px] font-bold">Update ready</div>
+        <div class="text-xs text-zinc-500">A new CampusFlow version is installed. Reload to use it.</div></div>
+        <button class="btn btn-primary !min-h-[36px] !px-3 !text-xs" id="sw-update-btn">Reload</button>
+        <button class="icon-btn !w-8 !h-8 !rounded-lg" id="sw-update-later" aria-label="Later"><i class="ph ph-x"></i></button>`;
+      $("#toast-root").appendChild(bd);
+      bd.querySelector("#sw-update-btn").onclick=()=>{
+        if(reg.waiting) reg.waiting.postMessage("skipWaiting");
+        bd.remove();
+      };
+      bd.querySelector("#sw-update-later").onclick=()=>bd.remove();
+    };
+    if(reg.waiting) promptUpdate();
+    reg.addEventListener("updatefound",()=>{
+      const next=reg.installing;
+      if(!next) return;
+      next.addEventListener("statechange",()=>{
+        if(next.state==="installed"&&navigator.serviceWorker.controller) promptUpdate();
+      });
+    });
+  }).catch(err=>console.warn("service worker registration failed:",err.message));
+  navigator.serviceWorker.addEventListener("controllerchange",()=>{
+    window.location.reload();
+  });
+}
+(function pwaIcons(){
+  try{
+    const cv=document.createElement("canvas"); cv.width=cv.height=512;
+    const x=cv.getContext("2d");
+    if(!x) return;
+    const g=x.createLinearGradient(0,0,512,512); g.addColorStop(0,"#10b981"); g.addColorStop(1,"#0d9488");
+    x.beginPath(); if(x.roundRect) x.roundRect(0,0,512,512,112); else x.rect(0,0,512,512); x.fillStyle=g; x.fill();
+    x.fillStyle="#fff";
+    x.beginPath(); x.moveTo(256,132); x.lineTo(72,226); x.lineTo(256,320); x.lineTo(440,226); x.closePath(); x.fill();
+    x.globalAlpha=.92;
+    x.beginPath(); x.moveTo(160,278); x.lineTo(160,352); x.bezierCurveTo(160,384,203,406,256,406); x.bezierCurveTo(309,406,352,384,352,352); x.lineTo(352,278); x.lineTo(256,326); x.closePath(); x.fill();
+    x.globalAlpha=1; x.fillRect(426,226,12,118); x.beginPath(); x.arc(432,358,16,0,7); x.fill();
+    const png=cv.toDataURL("image/png");
+    const link=document.createElement("link"); link.rel="apple-touch-icon"; link.href=png; document.head.appendChild(link);
+  }catch(_){ /* non-fatal: the screen still works without this step */ }
+})();
+
+/* =================================================================================
+   CLASS SETUP (subject + optional teacher + optional exact frequency) + GENERATOR
+   The internal `curriculum` key is retained for backward-compatible cloud/backup data.
+   ================================================================================= */
+const curriculumOf = cid => (state.curriculum||[]).filter(r=>r.classId===cid);
+const weekCapacity = () => state.settings.daysPerWeek*state.settings.periodsPerDay;
+const classLocked = cid => !!C(cid)?.locked;
+function needUnlocked(cid){
+  if (!classLocked(cid)) return true;
+  toast("error","Class is locked",`${C(cid)?.name||"This class"} is locked — unlock it to make changes.`);
+  return false;
+}
+/* Learn Class setup from whatever is already on the grid (great after an import). */
+function deriveCurriculum(){
+  const map=new Map();
+  state.classes.forEach(c=>(state.timetable[c.id]||[]).forEach(row=>row.forEach(cell=>lessonsOf(cell).forEach(L=>{
+    if (!L.subjectId) return;
+    const k=c.id+"|"+L.subjectId+"|"+(L.teacherId||"");
+    map.set(k,(map.get(k)||0)+1);
+  }))));
+  const out=[];
+  map.forEach((n,k)=>{ const [classId,subjectId,teacherId]=k.split("|");
+    out.push({ id:uid("cur"), classId, subjectId, teacherId:teacherId||null, periodsPerWeek:n }); });
+  return out;
+}
+/* Rough draft for classes without setup: all subjects that have a qualified teacher.
+   This is deliberately labelled as a draft because grade-specific Ministry allocations
+   cannot be inferred from teacher qualifications alone. */
+function roughPlanFor(cid){
+  const cap=weekCapacity();
+  const pool=state.subjects.filter(s=>teacherOfSubject(s.id,cid).length>0);
+  if (!pool.length) return [];
+  const rows=[];
+  const base=Math.floor(cap/pool.length), extra=cap%pool.length;
+  pool.forEach((s,idx)=>rows.push({ subjectId:s.id, teacherId:null, periodsPerWeek: base+(idx<extra?1:0) }));
+  return rows.filter(r=>r.periodsPerWeek>0);
+}
+/* User-facing Class setup may leave frequency on Auto (0). Exact values are kept,
+   then the remaining slots are shared among Auto subjects. */
+function planForClass(cid){
+  const rows=curriculumOf(cid);
+  if (!rows.length) return roughPlanFor(cid);
+  const cap=weekCapacity();
+  const exact=rows.reduce((n,r)=>n+Math.max(0,parseInt(r.periodsPerWeek)||0),0);
+  const auto=rows.filter(r=>(parseInt(r.periodsPerWeek)||0)===0);
+  const remaining=Math.max(0,cap-exact);
+  const base=auto.length?Math.floor(remaining/auto.length):0;
+  let extra=auto.length?remaining%auto.length:0;
+  return rows.map(r=>{
+    const fixed=Math.max(0,parseInt(r.periodsPerWeek)||0);
+    return {...r, periodsPerWeek:fixed || (base+(extra-->0?1:0))};
+  }).filter(r=>r.periodsPerWeek>0);
+}
+/* Constraint-aware generator: teacher clashes, blocked periods, locks, subject spread.
+   Teachers may be fixed in Class setup or chosen dynamically by subject qualification. */
+function generateTimetables(opts){
+  const days=state.settings.daysPerWeek, periods=state.settings.periodsPerDay;
+  const targets=state.classes.filter(c=>!c.locked && (opts.scope==="all"||c.id===opts.classId));
+  if (!targets.length) return { placed:0, unplaced:[], targets:0, skipped:state.classes.filter(c=>c.locked).length };
+  const tIds=new Set(targets.map(c=>c.id));
+  const occ=new Set();                                   // teacher busy map (locked/out-of-scope classes)
+  state.classes.forEach(c=>{ if(tIds.has(c.id)) return;
+    (state.timetable[c.id]||[]).forEach((row,d)=>row.forEach((cell,p)=>lessonsOf(cell).forEach(L=>{
+      if(L.teacherId) occ.add(L.teacherId+"|"+d+"|"+p); })));
+  });
+  targets.forEach(c=>{ state.timetable[c.id]=blankGrid(); });
+  const wLoad={};                                        // running weekly load for fair spreading
+  state.teachers.forEach(t=>{ wLoad[t.id]=0; });
+  const units=[];
+  targets.forEach(c=>{
+    const plan=planForClass(c.id);
+    plan.forEach(r=>{
+      const n=clamp(parseInt(r.periodsPerWeek)||0,0,days*periods);
+      const ct=c.classTeacherId?T(c.classTeacherId):null;
+      const sticky=c.preferClassTeacher && ct && (ct.subjectIds||[]).includes(r.subjectId) ? ct.id : null;
+      const pinned=r.teacherId || sticky || null;
+      for(let i=0;i<n;i++) units.push({ classId:c.id, subjectId:r.subjectId, teacherId:pinned });
+    });
+  });
+  /* pinned-teacher units first (least flexible), then scarce subjects */
+  const supply={}; state.subjects.forEach(s=>{ supply[s.id]=teacherOfSubject(s.id).length; });
+  units.sort((a,b)=>(b.teacherId?1:0)-(a.teacherId?1:0) || (supply[a.subjectId]||0)-(supply[b.subjectId]||0));
+  const pick=(u,d,p)=>{                                  // best free qualified teacher for this slot
+    const cls=C(u.classId);
+    const cands=teacherOfSubject(u.subjectId, u.classId).filter(t=>!occ.has(t.id+"|"+d+"|"+p) && !isBlocked(t,d,p));
+    if (!cands.length) return undefined;
+    /* a teacher already at the overload limit is only used if nobody else can take it */
+    const overCap = t => teacherLoad(t.id) >= state.settings.loadCap ? 1 : 0;
+    return cands.sort((a,b)=>
+      ((cls?.classTeacherId===b.id?1:0)-(cls?.classTeacherId===a.id?1:0)) ||
+      (overCap(a)-overCap(b)) ||
+      (wLoad[a.id]-wLoad[b.id]) || teacherLoad(a.id)-teacherLoad(b.id))[0].id;
+  };
+  const subjDay=new Map(); const unplaced=[]; let placed=0;
+  units.forEach(u=>{
+    let best=null;
+    for(let d=0; d<days; d++) for(let p=0; p<periods; p++){
+      const grid=state.timetable[u.classId];
+      if (grid[d][p]) continue;                                    // class busy
+      let tid=u.teacherId;
+      if (tid){
+        if (occ.has(tid+"|"+d+"|"+p)) continue;                    // pinned teacher clash
+        const t=T(tid);
+        if (!t || !canTeachClass(t,u.classId)) continue;            // outside this grade / removed
+        if (isBlocked(t,d,p)) continue;                             // pinned teacher unavailable
+      } else {
+        tid=pick(u,d,p);
+        if (tid===undefined) continue;                             // nobody qualified is free here
+      }
+      const sk=u.classId+"|"+u.subjectId+"|"+d;
+      const same=subjDay.get(sk)||0;
+      let dayFill=0; for(let q=0;q<periods;q++) if(grid[d][q]) dayFill++;
+      const score = same*1000 + dayFill*3 + p*0.4 + (tid?wLoad[tid]*0.2:0);
+      if (!best || score<best.score) best={d,p,score,sk,same,tid};
+    }
+    if (!best){ unplaced.push(u); return; }
+    state.timetable[u.classId][best.d][best.p]=[{ subjectId:u.subjectId, teacherId:best.tid||null }];
+    if (best.tid){ occ.add(best.tid+"|"+best.d+"|"+best.p); wLoad[best.tid]=(wLoad[best.tid]||0)+1; }
+    subjDay.set(best.sk,best.same+1);
+    placed++;
+  });
+  return { placed, unplaced, targets:targets.length, skipped:state.classes.filter(c=>c.locked).length };
+}
+const genOpts={ scope:"all", classId:null }; let genReport=null;
+function openGenerator(){
+  genOpts.classId=genOpts.classId&&C(genOpts.classId)?genOpts.classId:(state.ui.activeClassId||state.classes[0]?.id||null);
+  Modal.open(()=>{
+    const scoped=genOpts.scope==="all"?state.classes.filter(c=>!c.locked):[C(genOpts.classId)].filter(Boolean).filter(c=>!c.locked);
+    const totalReq=scoped.reduce((n,c)=>n+planForClass(c.id).reduce((x,r)=>x+(r.periodsPerWeek||0),0),0);
+    const configured=scoped.filter(c=>curriculumOf(c.id).length>0).length;
+    const rough=scoped.length-configured;
+    const teachable=state.subjects.filter(s=>teacherOfSubject(s.id).length>0).length;
+    const ready=scoped.length>0 && teachable>0;
+    if (genReport){
+      const grouped={};
+      genReport.unplaced.forEach(u=>{ const k=u.classId+"|"+u.subjectId; grouped[k]=(grouped[k]||0)+1; });
+      return `<div class="p-6">
+        <div class="flex flex-col items-center text-center">
+          <div class="tile w-14 h-14 rounded-2xl ${genReport.unplaced.length?"bg-amber-500/10 text-amber-600":"bg-emerald-500/10 text-emerald-600"} mb-3">
+            <i class="ph-fill ${genReport.unplaced.length?"ph-warning":"ph-check-circle"} text-2xl"></i></div>
+          <h3 class="font-display font-bold text-lg tracking-tight">${genReport.placed} lessons scheduled</h3>
+          <p class="text-xs text-zinc-500 mt-1">${genReport.targets} class(es) generated${genReport.skipped?` · ${genReport.skipped} locked class(es) untouched`:""}</p>
+        </div>
+        ${Object.keys(grouped).length?`
+        <div class="mt-4"><div class="text-[10px] font-extrabold uppercase tracking-wide text-amber-600 mb-1.5">Couldn't place (${genReport.unplaced.length})</div>
+        <div class="space-y-1.5 max-h-[34vh] overflow-y-auto pr-1">
+          ${Object.entries(grouped).map(([k,n])=>{ const [cid,sid]=k.split("|");
+            return `<div class="flex items-center gap-2 bg-amber-50/70 border border-amber-200/70 rounded-xl p-2.5 text-xs">
+              <i class="ph-fill ph-warning-circle text-amber-500"></i><b>${esc(C(cid)?.name||"?")}</b> · ${esc(S(sid)?.name||"?")}
+              <span class="ml-auto font-bold tabular-nums">${n} period(s)</span></div>`; }).join("")}
+        </div>
+        <p class="text-[11px] text-zinc-400 mt-2.5 leading-relaxed">Usually the teacher is already fully booked, blocked in those periods, or the week has no free slots left. Free up capacity and run again, or place them by hand.</p></div>`:""}
+        <div class="flex gap-2.5 mt-5">
+          <button class="btn btn-ghost flex-1" data-action="gen-reset">Generate again</button>
+          <button class="btn btn-primary flex-1" data-action="modal-close"><i class="ph ph-check"></i>Done</button>
+        </div>
+        <p class="text-[11px] text-zinc-400 text-center mt-3">Not happy? <b>Ctrl+Z</b> restores the previous timetable.</p>
+      </div>`;
+    }
+    return `<div class="p-6">
+      <div class="flex items-start justify-between">
+        <div><h3 class="font-display font-bold text-xl tracking-tight">Auto-generate timetable</h3>
+        <p class="text-xs text-zinc-500 mt-0.5">Uses Class setup where available and avoids teacher clashes.</p></div>
+        <button class="icon-btn" data-action="modal-close" aria-label="Close"><i class="ph ph-x text-lg"></i></button>
+      </div>
+      <div class="mt-4 space-y-3">
+        <div><label class="label">What should be generated?</label>
+          <select class="field" data-change="gen-opt" data-key="scope">
+            <option value="all" ${genOpts.scope==="all"?"selected":""}>All unlocked classes</option>
+            <option value="class" ${genOpts.scope==="class"?"selected":""}>Only one class</option>
+          </select></div>
+        ${genOpts.scope==="class"?`<div><label class="label">Class</label>
+          <select class="field" data-change="gen-opt" data-key="classId">
+            ${state.classes.map(c=>`<option value="${c.id}" ${genOpts.classId===c.id?"selected":""}>${esc(c.name)}${c.locked?" · LOCKED":""}</option>`).join("")}
+          </select></div>`:""}
+        <div class="flex items-center gap-3 bg-zinc-50 border border-zinc-200/70 rounded-xl p-3.5">
+          <div class="tile w-11 h-11 rounded-xl ${ready?"bg-emerald-500/10 text-emerald-600":"bg-amber-500/10 text-amber-600"}"><i class="ph-fill ph-sparkle text-lg"></i></div>
+          <div class="min-w-0">
+            <div class="font-display font-bold text-lg leading-none tabular-nums">${scoped.length} class${scoped.length!==1?"es":""} · ${totalReq} lesson${totalReq!==1?"s":""}</div>
+            <div class="text-[11px] text-zinc-500 font-semibold mt-0.5">${configured} class setup${configured!==1?"s":""} · ${teachable} teachable subject${teachable!==1?"s":""}</div></div>
+        </div>
+        ${rough?`<div class="text-xs text-amber-800 bg-amber-50 border border-amber-200/70 rounded-xl p-3 leading-relaxed">
+          <b>${rough} class${rough!==1?"es have":" has"} no Class setup.</b> For those classes only, CampusFlow will make a <b>rough draft using every subject that has a qualified teacher</b>. This may include subjects that grade does not study.
+          <div class="flex flex-wrap gap-2 mt-2.5">
+            <button class="btn btn-soft !min-h-[38px]" data-action="goto-class-setup"><i class="ph ph-list-plus"></i>Set up classes first</button>
+            ${state.classes.some(c=>classFill(c.id).f)?`<button class="btn btn-ghost !min-h-[38px]" data-action="derive-class-setup"><i class="ph ph-magic-wand"></i>Learn from current timetable</button>`:""}
+          </div></div>`:
+          `<p class="text-[11px] text-emerald-700 bg-emerald-50 border border-emerald-200/70 rounded-xl p-3 leading-relaxed"><b>Ready.</b> Selected subjects are used, Auto frequencies share free slots fairly, and fixed teachers are honoured where possible.</p>`}
+        ${!teachable?`<p class="text-xs text-rose-700 bg-rose-50 border border-rose-200/70 rounded-xl p-3"><b>No subject has a teacher yet.</b> Edit teachers and tick every subject they can teach.</p>`:""}
+        <p class="text-[11px] text-zinc-400 leading-relaxed"><b>Locked classes are never touched</b> — and their teachers stay reserved so nothing clashes.</p>
+        <p class="text-[11px] text-rose-600 bg-rose-50 border border-rose-200/70 rounded-xl p-3 leading-relaxed"><b>Before generating:</b> existing lessons in the selected unlocked classes will be replaced. Undo restores them immediately.</p>
+      </div>
+      <div class="flex gap-2.5 mt-5">
+        <button class="btn btn-ghost flex-1" data-action="modal-close">Cancel</button>
+        <button class="btn btn-primary flex-1 ${ready?"":"opacity-50 pointer-events-none"}" data-action="gen-run"><i class="ph ph-magic-wand"></i>${rough?"Generate rough draft":"Generate timetable"}</button>
+      </div>
+    </div>`;
+  });
+}
+Object.assign(actions,{
+  "generator": ()=>{ if(needEdit()){ genReport=null; openGenerator(); } },
+  "gen-reset": ()=>{ genReport=null; Modal.rerender(); },
+  "gen-run": ()=>{ if(!needEdit()) return;
+    genReport=generateTimetables({...genOpts});
+    if (!genReport.targets){ genReport=null; toast("info","Nothing to generate","Every class is locked, or there are no classes yet."); Modal.rerender(); return; }
+    toast(genReport.unplaced.length?"info":"success","Timetable generated",
+      `${genReport.placed} lessons placed${genReport.unplaced.length?` · ${genReport.unplaced.length} couldn't fit`:""}. Ctrl+Z to undo.`);
+    Modal.rerender(); },
+  "goto-class-setup": ()=>{ Modal.close(); Store.raw.ui.dbTab="curriculum"; Store.raw.ui.route="database"; Store.flush(); Store.requestRender(); },
+  "derive-class-setup": ()=>{ if(!needEdit()) return;
+    const built=deriveCurriculum();
+    if (!built.length){ toast("info","Nothing to learn","The timetable is empty."); return; }
+    state.curriculum=built;
+    toast("success","Class setup created", `${built.length} subject and teacher assignments learned from the current timetable.`);
+    Modal.rerender(); },
+  "toggle-lock": el=>{ if(!needEdit()) return;
+    const c=C(el.dataset.cid); if(!c) return;
+    c.locked=!c.locked;
+    toast(c.locked?"success":"info", c.locked?"Class locked":"Class unlocked",
+      c.locked?`${c.name} is protected from edits, bulk tools and auto-generation.`:`${c.name} can be edited again.`); },
+  "cur-del": el=>{ if(!needEdit()) return;
+    state.curriculum=(state.curriculum||[]).filter(r=>r.id!==el.dataset.id); },
+  "plan-add-subject": el=>{ if(!needEdit()) return;
+    const {cid,sid}=el.dataset;
+    if ((state.curriculum||[]).some(r=>r.classId===cid&&r.subjectId===sid)) return;
+    state.curriculum=[...(state.curriculum||[]),{id:uid("cur"),classId:cid,subjectId:sid,teacherId:null,periodsPerWeek:0}];
+    toast("success","Subject added",`${S(sid)?.name||"Subject"} will be scheduled for ${C(cid)?.name||"this class"}; teacher and frequency stay automatic.`); },
+  "plan-add-all": el=>{ if(!needEdit()) return;
+    const cid=el.dataset.cid; const existing=new Set(curriculumOf(cid).map(r=>r.subjectId));
+    const add=state.subjects.filter(s=>!existing.has(s.id)&&teacherOfSubject(s.id,cid).length>0)
+      .map(s=>({id:uid("cur"),classId:cid,subjectId:s.id,teacherId:null,periodsPerWeek:0}));
+    state.curriculum=[...(state.curriculum||[]),...add];
+    toast(add.length?"success":"info",add.length?"Subjects added":"Nothing to add",add.length?`${add.length} teachable subjects added with Auto settings.`:"Every teachable subject is already selected."); },
+  "cur-fill-teachers": el=>{ if(!needEdit()) return;
+    let n=0;
+    state.curriculum=(state.curriculum||[]).map(r=>{
+      if (r.classId!==el.dataset.cid || r.teacherId) return r;
+      const pool=teacherOfSubject(r.subjectId, r.classId);
+      if (!pool.length) return r;
+      const pick=[...pool].sort((a,b)=>teacherLoad(a.id)-teacherLoad(b.id))[0];
+      n++; return {...r, teacherId:pick.id};
+    });
+    toast(n?"success":"info", n?"Teachers auto-filled":"Nothing to fill", n?`${n} allocation(s) matched to the lightest-loaded qualified teacher.`:"Every row already has a teacher."); }
+});
+Object.assign(changeHandlers,{
+  "gen-opt": el=>{ genOpts[el.dataset.key]=el.value; Modal.rerender(); },
+  "cur-class": el=>{ Store.raw.ui.curClassId=el.value; Store.flush(); Store.requestRender(); },
+  "cur-teacher": el=>{ if(!canEdit()) return; const r=(state.curriculum||[]).find(x=>x.id===el.dataset.id); if(r) r.teacherId=el.value||null; },
+  "cur-periods": el=>{ if(!canEdit()) return; const r=(state.curriculum||[]).find(x=>x.id===el.dataset.id); if(r) r.periodsPerWeek=clamp(parseInt(el.value)||0,0,40); }
+});
+
+/* ================= CLEAR & RESET CENTER =================
+   Schools need surgical clearing, not just "erase everything":
+   by class · day · period column · teacher · subject · unassigned · whole school · old relief records */
+const clearOpts={ mode:"class", classId:null, day:0, period:0, teacherId:null, subjectId:null, teacherMode:"unassign", beforeDate:localISO() };
+function clearImpact(){
+  const o=clearOpts; let n=0, label="";
+  const scan=(fn)=>{ state.classes.filter(c=>!c.locked).forEach(c=>(state.timetable[c.id]||[]).forEach((row,d)=>row.forEach((cell,p)=>{
+    lessonsOf(cell).forEach(L=>{ if(fn(c,d,p,L)) n++; }); }))); };
+  switch(o.mode){
+    case "class": { const c=C(o.classId); scan((cc)=>cc.id===o.classId); label=`lessons in ${c?.name||"—"}`; break; }
+    case "day": scan((_c,d)=>d===+o.day); label=`lessons on ${DAYS_FULL[o.day]} (all classes)`; break;
+    case "period": scan((_c,_d,p)=>p===+o.period); label=`lessons in period ${+o.period+1} (all days, all classes)`; break;
+    case "teacher": scan((_c,_d,_p,L)=>L.teacherId===o.teacherId); label=`lessons taught by ${T(o.teacherId)?.name||"—"}`; break;
+    case "subject": scan((_c,_d,_p,L)=>L.subjectId===o.subjectId); label=`lessons of ${S(o.subjectId)?.name||"—"}`; break;
+    case "unassigned": scan((_c,_d,_p,L)=>!L.teacherId); label="lessons with no teacher assigned"; break;
+    case "all": scan(()=>true); label="lessons across the whole school"; break;
+    case "relief": { n=Object.keys(state.absences||{}).length; label="absence / relief day records"; break; }
+    case "reliefOld": { n=Object.keys(state.absences||{}).filter(k=>k<o.beforeDate).length; label=`relief records before ${o.beforeDate}`; break; }
+  }
+  return { n, label };
+}
+function applyClear(){
+  const o=clearOpts;
+  const strip=(pred)=>{ state.classes.filter(c=>!c.locked).forEach(c=>{ const g=state.timetable[c.id]; if(!g) return;
+    g.forEach((row,d)=>row.forEach((cell,p)=>{
+      if (!cell) return;
+      const kept=lessonsOf(cell).filter(L=>!pred(c,d,p,L));
+      row[p]=kept.length?kept:null;
+    })); }); };
+  switch(o.mode){
+    case "class": if(state.timetable[o.classId]&&!classLocked(o.classId)) state.timetable[o.classId]=blankGrid(); break;
+    case "day": strip((_c,d)=>d===+o.day); break;
+    case "period": strip((_c,_d,p)=>p===+o.period); break;
+    case "teacher":
+      if (o.teacherMode==="unassign"){
+        state.classes.filter(c=>!c.locked).forEach(c=>{ const g=state.timetable[c.id]; if(!g) return;
+          g.forEach(row=>row.forEach((cell,p)=>{ if(cell) row[p]=lessonsOf(cell).map(L=>L.teacherId===o.teacherId?{...L,teacherId:null}:L); })); });
+      } else strip((_c,_d,_p,L)=>L.teacherId===o.teacherId);
+      break;
+    case "subject": strip((_c,_d,_p,L)=>L.subjectId===o.subjectId); break;
+    case "unassigned": strip((_c,_d,_p,L)=>!L.teacherId); break;
+    case "all": state.classes.filter(c=>!c.locked).forEach(c=>{ state.timetable[c.id]=blankGrid(); }); break;
+    case "relief": state.absences={}; break;
+    case "reliefOld": Object.keys(state.absences||{}).forEach(k=>{ if(k<o.beforeDate) delete state.absences[k]; }); break;
+  }
+}
+const CLEAR_MODES=[
+  ["class","ph-student","One class"],["day","ph-calendar-x","A whole day"],["period","ph-rows","A period column"],
+  ["teacher","ph-chalkboard-teacher","By teacher"],["subject","ph-books","By subject"],["unassigned","ph-user-dashed","Unassigned only"],
+  ["all","ph-trash","Whole school"],["relief","ph-user-switch","All relief records"],["reliefOld","ph-clock-counter-clockwise","Old relief records"]
+];
+function openClearCenter(){
+  if (!clearOpts.classId) clearOpts.classId=state.ui.activeClassId||state.classes[0]?.id||null;
+  if (!clearOpts.teacherId) clearOpts.teacherId=state.teachers[0]?.id||null;
+  if (!clearOpts.subjectId) clearOpts.subjectId=state.subjects[0]?.id||null;
+  Modal.open(()=>{
+    const o=clearOpts; const imp=clearImpact();
+    const sel=(name,val,opts)=>`<select class="field" data-change="clear-opt" data-key="${name}">${opts.map(([v,l])=>`<option value="${v}" ${String(val)===String(v)?"selected":""}>${esc(l)}</option>`).join("")}</select>`;
+    return `
+    <div class="p-6">
+      <div class="flex items-start justify-between">
+        <div><h3 class="font-display font-bold text-xl tracking-tight">Clear &amp; Reset</h3>
+        <p class="text-xs text-zinc-500 mt-0.5">Surgical clearing — locked classes are protected. Undo (Ctrl+Z) restores it.</p></div>
+        <button class="icon-btn" data-action="modal-close" aria-label="Close"><i class="ph ph-x text-lg"></i></button>
+      </div>
+      <div class="grid grid-cols-3 gap-2 mt-4">
+        ${CLEAR_MODES.map(([m,ic,lbl])=>`<button class="flex flex-col items-center justify-center gap-1 min-h-[62px] rounded-xl border text-[10px] font-bold text-center px-1 transition-all
+          ${o.mode===m?"border-rose-300 bg-rose-50 text-rose-700":"border-zinc-200 text-zinc-500 hover:border-zinc-300"}"
+          data-action="clear-mode" data-mode="${m}"><i class="ph-fill ${ic} text-base"></i>${lbl}</button>`).join("")}
+      </div>
+      <div class="mt-4 space-y-3">
+        ${o.mode==="class"?`<div><label class="label">Class</label>${sel("classId",o.classId,state.classes.map(c=>[c.id,c.name]))}</div>`:""}
+        ${o.mode==="day"?`<div><label class="label">Day</label>${sel("day",o.day,Array.from({length:state.settings.daysPerWeek},(_,d)=>[d,DAYS_FULL[d]]))}</div>`:""}
+        ${o.mode==="period"?`<div><label class="label">Period</label>${sel("period",o.period,Array.from({length:state.settings.periodsPerDay},(_,p)=>[p,"Period "+(p+1)+" · "+bell(p)]))}</div>`:""}
+        ${o.mode==="teacher"?`<div><label class="label">Teacher</label>${sel("teacherId",o.teacherId,state.teachers.map(t=>[t.id,t.name]))}</div>
+          <div><label class="label">What to do</label>${sel("teacherMode",o.teacherMode,[["unassign","Keep lessons, remove the teacher only"],["remove","Delete those lessons entirely"]])}</div>`:""}
+        ${o.mode==="subject"?`<div><label class="label">Subject</label>${sel("subjectId",o.subjectId,state.subjects.map(s=>[s.id,s.name]))}</div>`:""}
+        ${o.mode==="reliefOld"?`<div><label class="label">Delete records before</label>
+          <input type="date" class="field" data-change="clear-opt" data-key="beforeDate" value="${o.beforeDate}"></div>`:""}
+        ${o.mode==="unassigned"?`<p class="text-xs text-zinc-500 leading-relaxed">Removes every lesson that still has no teacher — handy for cleaning up after imports or staff changes.</p>`:""}
+        ${o.mode==="all"?`<p class="text-xs text-rose-600 font-semibold leading-relaxed">Wipes every lesson in every class. Teachers, subjects and classes stay.</p>`:""}
+      </div>
+      <div class="mt-4 flex items-center gap-3 bg-zinc-50 border border-zinc-200/70 rounded-xl p-3.5">
+        <div class="tile w-11 h-11 rounded-xl ${imp.n?"bg-rose-500/10 text-rose-600":"bg-zinc-200/60 text-zinc-400"}"><i class="ph-fill ph-target text-lg"></i></div>
+        <div><div class="font-display font-bold text-xl leading-none tabular-nums">${imp.n}</div>
+        <div class="text-[11px] text-zinc-500 font-semibold mt-0.5">${esc(imp.label)} will be cleared</div></div>
+      </div>
+      <div class="flex gap-2.5 mt-5">
+        <button class="btn btn-ghost flex-1" data-action="modal-close">Cancel</button>
+        <button class="btn btn-danger flex-1 ${imp.n?"":"opacity-50 pointer-events-none"}" data-action="clear-apply"><i class="ph ph-eraser"></i>Clear ${imp.n||""}</button>
+      </div>
+    </div>`;
+  });
+}
+
+/* ================= FREE TEACHER FINDER ================= */
+const finder={ day:0, period:0 };
+const isBlocked=(t,d,p)=>Array.isArray(t.unavailable)&&t.unavailable.includes(d+"-"+p);
+const coverCount=tid=>{ let n=0; Object.values(state.absences||{}).forEach(r=>Object.values(r?.relief||{}).forEach(v=>{ if(v===tid) n++; })); return n; };
+function openFinder(){
+  const now=dayIndexFor(localISO());
+  if (finder.day==null) finder.day=0;
+  if (now>=0 && now<state.settings.daysPerWeek && finder._init!==true){ finder.day=now; finder._init=true; }
+  Modal.open(()=>{
+    const d=clamp(+finder.day,0,state.settings.daysPerWeek-1), p=clamp(+finder.period,0,state.settings.periodsPerDay-1);
+    const busy=[], free=[], blocked=[];
+    state.teachers.forEach(t=>{
+      const at=busyAtSlot(t.id,d,p);
+      if (at) busy.push({t, where:at.name});
+      else if (isBlocked(t,d,p)) blocked.push({t});
+      else free.push({t});
+    });
+    free.sort((a,b)=>dayLoad(a.t.id,d)-dayLoad(b.t.id,d));
+    const gTag = t => teacherGrades(t)!==null
+      ? ` · ${t.grades.length?esc(t.grades.map(g=>gradeLabel(g)).join(", ")):"no grades"}`
+      : "";
+    const row=(x,tone,extra)=>`<div class="flex items-center gap-2.5 p-2 pl-2.5 rounded-xl border ${tone}">
+      <div class="tile w-9 h-9 rounded-lg text-[11px] font-extrabold" style="background:${x.t.color}1a;color:${x.t.color}">${esc(x.t.code||initials(x.t.name))}</div>
+      <div class="min-w-0 flex-1"><div class="text-[12.5px] font-bold truncate">${esc(x.t.name)}</div>
+      <div class="text-[10px] font-semibold text-zinc-400 truncate">${extra}</div></div></div>`;
+    return `
+    <div class="p-6">
+      <div class="flex items-start justify-between">
+        <div><h3 class="font-display font-bold text-xl tracking-tight">Free teacher finder</h3>
+        <p class="text-xs text-zinc-500 mt-0.5">Who's available right now — for cover, duties or extra classes.</p></div>
+        <button class="icon-btn" data-action="modal-close" aria-label="Close"><i class="ph ph-x text-lg"></i></button>
+      </div>
+      <div class="grid grid-cols-2 gap-2.5 mt-4">
+        <div><label class="label">Day</label>
+          <select class="field" data-change="finder-opt" data-key="day">
+            ${Array.from({length:state.settings.daysPerWeek},(_,i)=>`<option value="${i}" ${d===i?"selected":""}>${DAYS_FULL[i]}</option>`).join("")}
+          </select></div>
+        <div><label class="label">Period</label>
+          <select class="field" data-change="finder-opt" data-key="period">
+            ${Array.from({length:state.settings.periodsPerDay},(_,i)=>`<option value="${i}" ${p===i?"selected":""}>P${i+1} · ${bell(i)}</option>`).join("")}
+          </select></div>
+      </div>
+      <div class="flex gap-2 mt-4 text-center">
+        ${[[free.length,"Free","text-emerald-600 bg-emerald-50 border-emerald-200"],[busy.length,"Teaching","text-zinc-600 bg-zinc-50 border-zinc-200"],[blocked.length,"Unavailable","text-amber-600 bg-amber-50 border-amber-200"]]
+          .map(([n,l,c])=>`<div class="flex-1 border rounded-xl py-2 ${c}"><div class="font-display font-bold text-lg leading-none tabular-nums">${n}</div><div class="text-[10px] font-bold uppercase tracking-wide mt-0.5">${l}</div></div>`).join("")}
+      </div>
+      <div class="mt-3 space-y-1.5 max-h-[38vh] overflow-y-auto pr-1">
+        ${free.length?free.map(x=>row(x,"border-emerald-200/70 bg-emerald-50/40",`Free · ${dayLoad(x.t.id,d)} lesson(s) today · ${coverCount(x.t.id)} cover(s) done${gTag(x.t)}`)).join(""):`<p class="text-xs text-zinc-400 text-center py-4">Nobody is free in this slot.</p>`}
+        ${blocked.map(x=>row(x,"border-amber-200/70 bg-amber-50/40","Marked unavailable in this period"+gTag(x.t))).join("")}
+        ${busy.map(x=>row(x,"border-zinc-200/70 bg-white opacity-70",`Teaching ${esc(x.where)}${gTag(x.t)}`)).join("")}
+      </div>
+    </div>`;
+  });
+}
+Object.assign(actions,{
+  "clear-center": ()=>{ if(needEdit()) openClearCenter(); },
+  "clear-mode": el=>{ clearOpts.mode=el.dataset.mode; Modal.rerender(); },
+  "clear-apply": async ()=>{
+    if(!needEdit()) return;
+    const imp=clearImpact();
+    const ok=await confirmDialog({ title:`Clear ${imp.n} ${imp.label.split(" ")[0]}?`,
+      message:`<b>${imp.n}</b> ${esc(imp.label)} will be removed. This syncs to every device — but <b>Ctrl+Z undoes it</b>.`,
+      confirmLabel:"Clear now", icon:"ph-eraser" });
+    if(!ok) return;
+    applyClear();
+    toast("success","Cleared", `${imp.n} ${imp.label} removed. Undo is one tap away.`);
+  },
+  "finder": ()=>openFinder(),
+  "finder-slot": el=>{ finder.day=+el.dataset.d; finder.period=+el.dataset.p; finder._init=true; openFinder(); }
+});
+Object.assign(changeHandlers,{
+  "scan-file": el=>{ const f=el.files?.[0]; el.value=""; if(!f) return; scanRun(f); },
+  "scan-class": el=>{ Scan.classId=el.value; Store.requestRender(); },
+  "scan-row": el=>{ const r=Scan.rows[+el.dataset.i]; if(r){ r.include=el.checked; Store.requestRender(); } },
+  "scan-cell": el=>{ const p=+el.dataset.p, d=+el.dataset.d;
+    if(!Scan.grid?.[p]) return;
+    const sid=el.value||null;
+    Scan.grid[p][d]= sid ? {...(Scan.grid[p][d]||{}),subjectId:sid,raw:Scan.grid[p][d]?.raw||"",score:1} : null; },
+  "clear-opt": el=>{ clearOpts[el.dataset.key]= /^(day|period)$/.test(el.dataset.key) ? +el.value : el.value; Modal.rerender(); },
+  "finder-opt": el=>{ finder[el.dataset.key]=+el.value; finder._init=true; Modal.rerender(); },
+  "teacher-block": el=>{ if(!canEdit()) return;
+    const t=T(el.dataset.id); if(!t) return;
+    const key=el.dataset.d+"-"+el.dataset.p;
+    const cur=Array.isArray(t.unavailable)?t.unavailable:[];
+    t.unavailable = el.checked ? [...new Set([...cur,key])] : cur.filter(x=>x!==key); }
+});
+
+/* ================= CONFLICT CENTER (one-tap auto-resolution) ================= */
+function autoResolveConflicts(){
+  const occ=new Map(); const key=(d,p)=>d+"|"+p;
+  state.classes.forEach(c=>(state.timetable[c.id]||[]).forEach((row,d)=>row.forEach((cell,p)=>{
+    lessonsOf(cell).forEach(L=>{ if(L.teacherId){ const k=key(d,p); if(!occ.has(k)) occ.set(k,new Set()); occ.get(k).add(L.teacherId); }});
+  })));
+  const results=[];
+  computeConflicts().list.forEach(item=>{
+    const d=item.d, p=item.p, tid=item.teacher?.id;
+    if (!tid) return;
+    const involved=[];
+    state.classes.forEach(c=>lessonsOf(getCell(c.id,d,p)).forEach((L,li)=>{ if(L.teacherId===tid) involved.push({cid:c.id,li}); }));
+    if (involved.length<2) return;
+    /* priority: never move locked classes; then keep the teacher in their own class */
+    involved.sort((a,b)=>
+      ((C(b.cid)?.locked?1:0)-(C(a.cid)?.locked?1:0)) ||
+      ((C(b.cid)?.classTeacherId===tid?1:0)-(C(a.cid)?.classTeacherId===tid?1:0)));
+    const keep=involved[0];
+    involved.slice(1).forEach(({cid,li})=>{
+      const cls=C(cid); const cur=lessonsOf(getCell(cid,d,p)); const L=cur[li];
+      if (!L) return;
+      if (cls?.locked){ results.push({ok:false,text:`${DAYS_SHORT[d]} P${p+1} — ${cls.name} is locked; conflict left unchanged`}); return; }
+      const free=state.teachers.filter(t=>t.id!==tid && (t.subjectIds||[]).includes(L.subjectId)
+        && canTeachClass(t,cid) && !isBlocked(t,d,p) && !(occ.get(key(d,p))||new Set()).has(t.id));
+      free.sort((x,y)=>
+        ((cls?.classTeacherId===y.id?1:0)-(cls?.classTeacherId===x.id?1:0)) ||
+        ((teacherLoad(x.id)>=state.settings.loadCap?1:0)-(teacherLoad(y.id)>=state.settings.loadCap?1:0)) ||
+        dayLoad(x.id,d)-dayLoad(y.id,d));
+      const pick=free[0]||null;
+      cur[li]={...L, teacherId:pick?pick.id:null};
+      setCell(cid,d,p,cur);
+      if (pick){ occ.get(key(d,p)).add(pick.id); results.push({ok:true, text:`${DAYS_SHORT[d]} P${p+1} — ${item.teacher.code} keeps ${C(keep.cid)?.name}; ${cls?.name} → ${pick.name}`}); }
+      else results.push({ok:false, text:`${DAYS_SHORT[d]} P${p+1} — ${cls?.name}: no free qualified teacher (left unassigned)`});
+    });
+  });
+  return results;
+}
+let lastResolve=null;
+function openConflictCenter(){
+  Modal.open(()=>{
+    const conf=App.cache.conflicts;
+    if (!conf.count && !lastResolve){
+      return `<div class="p-8 text-center">
+        <div class="tile w-14 h-14 rounded-2xl bg-emerald-500/10 text-emerald-600 mx-auto mb-3"><i class="ph-fill ph-shield-check text-2xl"></i></div>
+        <h3 class="font-display font-bold text-lg tracking-tight">Schedule is clean</h3>
+        <p class="text-xs text-zinc-500 mt-1.5 leading-relaxed">No teacher is double-booked anywhere in the school.</p>
+        <button class="btn btn-primary w-full mt-5" data-action="modal-close">Close</button></div>`;
+    }
+    return `
+    <div class="p-6">
+      <div class="flex items-start justify-between">
+        <div><h3 class="font-display font-bold text-xl tracking-tight">Conflict Center</h3>
+        <p class="text-xs text-zinc-500 mt-0.5">${conf.count? `${conf.count} double-booking${conf.count>1?"s":""} need attention` : "All conflicts resolved"}</p></div>
+        <button class="icon-btn" data-action="modal-close" aria-label="Close"><i class="ph ph-x text-lg"></i></button>
+      </div>
+      <div class="mt-4 space-y-2 max-h-[46vh] overflow-y-auto pr-1">
+        ${conf.list.map(c=>`
+          <div class="flex items-start gap-2.5 bg-rose-50/70 border border-rose-200/70 rounded-xl p-3">
+            <i class="ph-fill ph-warning-octagon text-rose-500 mt-0.5"></i>
+            <div class="text-xs leading-relaxed"><b>${esc(c.teacher?.name||"?")}</b> (${esc(c.teacher?.code||"")}) is booked in
+            <b>${c.classes.map(esc).join(" × ")}</b><br><span class="text-zinc-500 font-semibold">${DAYS_FULL[c.d]} · Period ${c.p+1}</span></div>
+          </div>`).join("")}
+        ${lastResolve? lastResolve.map(r=>`
+          <div class="flex items-start gap-2.5 ${r.ok?"bg-emerald-50/70 border-emerald-200/70":"bg-amber-50/70 border-amber-200/70"} border rounded-xl p-3">
+            <i class="ph-fill ${r.ok?"ph-check-circle text-emerald-500":"ph-warning text-amber-500"} mt-0.5"></i>
+            <div class="text-xs leading-relaxed">${esc(r.text)}</div>
+          </div>`).join(""):""}
+      </div>
+      <div class="flex gap-2.5 mt-5">
+        <button class="btn btn-ghost flex-1" data-action="modal-close">Close</button>
+        ${conf.count?`<button class="btn btn-primary flex-1" data-action="resolve-conflicts"><i class="ph ph-magic-wand"></i>Resolve automatically</button>`
+                    :`<button class="btn btn-primary flex-1" data-action="nav" data-route="timetable"><i class="ph ph-calendar-check"></i>Open timetable</button>`}
+      </div>
+      <p class="text-[11px] text-zinc-400 text-center mt-3 leading-relaxed">Each teacher keeps one class — prioritised to their own class if they're a class teacher — while other groups get the best free qualified replacement.</p>
+    </div>`;
+  });
+}
+Object.assign(actions,{
+  "conflict-center": ()=>{ lastResolve=null; openConflictCenter(); },
+  "resolve-conflicts": ()=>{
+    if (!needEdit()) return;
+    lastResolve=autoResolveConflicts();
+    App.cache.conflicts=computeConflicts();
+    const fixed=lastResolve.filter(r=>r.ok).length, open=lastResolve.length-fixed;
+    toast(fixed?"success":"info","Conflicts processed",
+      fixed+` resolved automatically`+(open?` · ${open} left for manual review`:"")+`. Undo (Ctrl+Z) restores everything.`);
+    Modal.rerender();
+  }
+});
+
+/* ================= UNDO ENGINE (up to 20 steps, per-mutation breadcrumbing) ================= */
+const UndoEngine={
+  stack:[], future:[], last:null, _t:null,
+  snap(){ const {ui,...d}=Store.raw; return JSON.parse(JSON.stringify(d)); },
+  reset(){ clearTimeout(UndoEngine._t); UndoEngine._t=null; UndoEngine.stack=[]; UndoEngine.future=[]; UndoEngine.last=UndoEngine.snap(); updateUndoBtn(); },
+  dirty(){ clearTimeout(UndoEngine._t); UndoEngine._t=setTimeout(()=>{
+      const next=UndoEngine.snap();
+      if (UndoEngine.last && JSON.stringify(next)===JSON.stringify(UndoEngine.last)){ updateUndoBtn(); return; }
+      if (UndoEngine.last) UndoEngine.stack.push(UndoEngine.last);
+      if (UndoEngine.stack.length>20) UndoEngine.stack.shift();
+      UndoEngine.future=[];               /* a fresh mutation forks history — redo is gone */
+      UndoEngine.last=next; updateUndoBtn();
+    },700); },
+  unredo(restore, pushTo, toastMsg){
+    pushTo.push(UndoEngine.last);
+    if (pushTo===UndoEngine.future && pushTo.length>20) pushTo.shift();
+    UndoEngine.last=restore;
+    window.__undoApplying=true;
+    Store.replaceData(restore);
+    window.__undoApplying=false;
+    if (Sync.active){ Sync._lastSig=null; Sync.pushNow(); }
+    updateUndoBtn();
+    toast("info", toastMsg, "Synced everywhere.");
+  },
+  undo(){
+    const prev=UndoEngine.stack.pop();
+    if (!prev){ updateUndoBtn(); toast("info","Nothing to undo","You're at the earliest change."); return; }
+    UndoEngine.unredo(prev, UndoEngine.future, "Undone");
+  },
+  redo(){
+    const nxt=UndoEngine.future.pop();
+    if (!nxt){ updateUndoBtn(); toast("info","Nothing to redo","You're at the latest change."); return; }
+    UndoEngine.unredo(nxt, UndoEngine.stack, "Redone");
+  }
+};
+function updateUndoBtn(){
+  [["undo", UndoEngine.stack.length],["redo", UndoEngine.future.length]].forEach(([action,n])=>{
+    $$(`[data-action="${action}"]`).forEach(b=>{
+      const on=canEdit() && n>0;
+      b.classList.toggle("opacity-40", !on);
+      b.classList.toggle("pointer-events-none", !on);
+      b.classList.toggle("text-emerald-600", on);
+    });
+  });
+}
+document.addEventListener("keydown", e=>{
+  if (!canEdit()) return;
+  const k=e.key.toLowerCase();
+  const isUndo=(e.ctrlKey||e.metaKey) && k==="z" && !e.shiftKey;
+  const isRedo=((e.ctrlKey||e.metaKey) && k==="z" && e.shiftKey) || ((e.ctrlKey||e.metaKey) && k==="y");
+  if (!isUndo && !isRedo) return;
+  const ae=document.activeElement;
+  if (ae && ["INPUT","TEXTAREA","SELECT"].includes(ae.tagName) && !ae.closest("#view")) return;
+  e.preventDefault();
+  isUndo ? UndoEngine.undo() : UndoEngine.redo();
+});
+Object.assign(actions,{
+  "undo": ()=>{ if(needEdit()) UndoEngine.undo(); },
+  "redo": ()=>{ if(needEdit()) UndoEngine.redo(); },
+  "cell-add": el=>{ if(!needEdit()||!needUnlocked(el.dataset.cid)) return;
+    if (!state.subjects.length){ toast("error","No subjects","Create subjects first (Database → Subjects)."); return; }
+    const {cid,d,p}=el.dataset; const cur=lessonsOf(getCell(cid,+d,+p));
+    setCell(cid,+d,+p, [...cur, { subjectId: state.subjects[0].id, teacherId:null }]); },
+  "cell-quick": el=>{ if(!needEdit()||!needUnlocked(el.dataset.cid)) return;
+    const {cid,d,p,tid,sid}=el.dataset;
+    const cur=lessonsOf(getCell(cid,+d,+p));
+    setCell(cid,+d,+p, [...cur, { subjectId:sid||null, teacherId:tid||null }]);
+    const busy=tid?busyAtSlot(tid,+d,+p,cid):null;
+    if (busy) toast("error","Conflict flagged", `${T(tid)?.name||""} is also teaching ${busy.name} — open the Conflict Center to auto-resolve.`); },
+  "cell-remove": el=>{ if(!needEdit()||!needUnlocked(el.dataset.cid)) return;
+    const {cid,d,p,li}=el.dataset;
+    setCell(cid,+d,+p, lessonsOf(getCell(cid,+d,+p)).filter((_,i)=>i!==+li)); },
+  "cell-repeat-day": el=>{ if(!needEdit()||!needUnlocked(el.dataset.cid)) return;
+    const {cid,d,p,target}=el.dataset; const cur=lessonsOf(getCell(cid,+d,+p));
+    if (!cur.length){ toast("info","Nothing to repeat","The slot is empty."); return; }
+    setCell(cid,+target,+p, cur.map(L=>({...L})));
+    toast("success","Slot repeated", `Copied to ${DAYS_SHORT[+target]} · P${+p+1}.`); },
+  "day-tools": el=>{ if(needEdit() && needUnlocked(el.dataset.cid)) openDayTools(el.dataset.cid); },
+  "day-copy-apply": el=>{ if(!needEdit()||!needUnlocked(el.dataset.cid)) return;
+    const cid=el.dataset.cid; const src=+($("#dt-src")?.value||0);
+    const targets=$$(".dt-dst:checked").map(i=>+i.value).filter(x=>x!==src);
+    if (!targets.length){ toast("info","Pick target days","Select at least one day to copy onto."); return; }
+    const srcCol=state.timetable[cid]?.[src]||[];
+    targets.forEach(d2=>{
+      for (let p=0;p<state.settings.periodsPerDay;p++)
+        setCell(cid,d2,p, srcCol[p]? lessonsOf(srcCol[p]).map(L=>({...L})) : null);
+    });
+    Modal.close();
+    toast("success","Day duplicated", `${DAYS_SHORT[src]} copied onto ${targets.map(x=>DAYS_SHORT[x]).join(", ")}.`);
+  },
+  "class-clear-week": async el=>{ if(!needEdit()||!needUnlocked(el.dataset.cid)) return;
+    const cid=el.dataset.cid; const cls=C(cid); if(!cls) return;
+    const ok=await confirmDialog({ title:"Clear entire week?", message:`Every lesson in <b>${esc(cls.name)}</b> will be removed. Undo (Ctrl+Z) brings it back.`, confirmLabel:"Clear week", icon:"ph-eraser" });
+    if (!ok) return;
+    state.timetable[cid]=blankGrid();
+    Modal.close();
+    toast("info","Week cleared","The grid is empty — undo is one tap away.");
+  }
+});
+
+/* ================= BOOT ================= */
+document.documentElement.lang=LANG;
+setPaper("a4l");
+renderSyncPill();
+/* Users must reach CampusFlow over the real product origins — never as a saved HTML file,
+   never copied to another domain. This is the honest version of "can't download the app
+   and use it": client source can always be viewed by a browser, but it will not RUN here. */
+const ALLOWED_HOSTS = ["campusflow.cc","www.campusflow.cc","localhost","127.0.0.1"];
+function authorizedOrigin(){
+  const h=location.hostname;
+  if(!h) return true;                        /* file:// handled separately */
+  if(ALLOWED_HOSTS.includes(h)) return true;
+  if(h.endsWith(".web.app")||h.endsWith(".firebaseapp.com")){
+    return h.startsWith("mom-school-time-table"); /* hosting + preview channels */
+  }
+  return false;
+}
+function showHostedOnly(){
+  showSplash(true);
+  $("#app").hidden=true;
+  const root=$("#login-root");
+  root.hidden=false;
+  const unauth = !authorizedOrigin();
+  root.innerHTML=`
+    <div class="min-h-dvh flex items-center justify-center p-5 bg-zinc-50">
+      <div class="card w-full max-w-md p-7 text-center">
+        <div class="tile w-16 h-16 rounded-3xl bg-gradient-to-br from-emerald-500 to-teal-600 text-white mx-auto mb-4 shadow-xl shadow-emerald-600/20">
+          <i class="ph-fill ph-shield-check text-3xl"></i>
+        </div>
+        <h1 class="font-display font-bold text-xl tracking-tight">Open the official CampusFlow app</h1>
+        <p class="text-sm text-zinc-500 leading-relaxed mt-2">${unauth
+          ? "This copy of CampusFlow is not running on the official product domain, so it is disabled. Use the secure hosted app, then choose <b>Install app</b> in Chrome for offline use."
+          : "This downloaded HTML copy is not an application package and cannot run from your files. Use the secure hosted app, then choose <b>Install app</b> in Chrome for offline use."}</p>
+        <a class="btn btn-primary w-full mt-5" href="https://campusflow.cc/">
+          <i class="ph ph-arrow-square-out"></i>Open campusflow.cc
+        </a>
+        <p class="text-[11px] text-zinc-400 mt-4">For access or sales information: <span data-site="phone">${esc(SiteCfg.phone())}</span></p>
+      </div>
+    </div>`;
+  hydrateSiteSlots();
+}
+if (location.protocol==="file:"){ /* handled at boot below */ }
+
+/* connection awareness — vital on intermittent rural networks */
+window.addEventListener("online", ()=>{ toast("success","Back online","Syncing your changes now.");
+  if (Sync.active){ Sync._lastSig=null; Sync.pushNow(); } });
+window.addEventListener("offline", ()=>{ Sync.setStatus("offline");
+  toast("info","No internet","Keep working — everything saves on this device and uploads later."); });
+SiteCfg.attach();
+if (location.protocol==="file:"){
+  showHostedOnly();
+} else if (!authorizedOrigin()){
+  showHostedOnly();
+} else if (FB.ready){
+  FB.auth.onAuthStateChanged(user=>{
+    if (user){
+      const sess=Session;
+      /* Every cached session is keyed by UID. Never trust email to reauthorise after a
+        profile check failed or an account was replaced. */
+      if(LOGIN_V2_ENABLED()){
+        Splash.setStep("Checking your school records…");
+        resolveSessionOnce(user,{source:"observer"});
+      } else if(isSuperAdminUser(user)&&sess.role!=="super"){
+        Splash.setStep("Verifying platform owner…");resolveSessionLegacy(user);
+      } else if (sess.role && sess.uid===user.uid){
+        if (sess.role==="super"){ adminSubscribe(); if(sess.schoolId)bootSchool(sess.schoolId);else{showApp();Store.requestRender();} }
+        else if(sess.schoolId)bootSchool(sess.schoolId);
+        resolveSessionLegacy(user).catch(()=>{});
+      } else { Splash.setStep("Checking your school records…"); resolveSessionLegacy(user); }
+    }
+    else { showLogin(); }
+  }, error=>{
+    showLogin("Firebase Authentication could not start: "+(AUTH_ERRORS[error?.code]||error?.message||"unknown error")+". Check the connection and retry.");
+  });
+  setTimeout(()=>{ if (!FB.auth.currentUser && $("#app").hidden && $("#login-root").hidden) showLogin(); }, 6000);
+} else {
+  showLogin("Could not reach Firebase. Check your connection, then reload the page.");
+}
+/* Boot watchdog: if nothing revealed a screen within 8s (CDN blocked, cold mobile tab),
+   give the user a working path instead of an infinite wait. */
+setTimeout(()=>{
+  if($("#app").hidden && $("#login-root").hidden){
+    Splash.done();
+    $("#login-root").hidden=false;
+    if(!$("#login-root").innerHTML) showLogin("Could not reach the school records. Check your connection, then reload this page.");
+  }
+},8000);
