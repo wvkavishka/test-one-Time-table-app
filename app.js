@@ -2455,6 +2455,8 @@ const CREATIVE_SPECS={
   linkedin:{ w:1200,h:627,title:"Professional banner ad",size:"1200 × 627",file:"campusflow-professional-ad.png" },
   reliefSpot:{ w:1080,h:1080,title:"Relief in one tap",size:"1080 × 1080",file:"campusflow-relief.png" },
   offlineSpot:{ w:1080,h:1080,title:"Works without internet",size:"1080 × 1080",file:"campusflow-offline.png" },
+  fingerprintSpot:{ w:1080,h:1080,title:"Fingerprint attendance",size:"1080 × 1080",file:"campusflow-fingerprint.png" },
+  findSpot:{ w:1080,h:1080,title:"Find anything, instantly",size:"1080 × 1080",file:"campusflow-find.png" },
   langSpot:{ w:1080,h:1080,title:"Sinhala · Tamil · English",size:"1080 × 1080",file:"campusflow-languages.png" },
   trialStory:{ w:1080,h:1920,title:"Free trial story",size:"1080 × 1920",file:"campusflow-trial-story.png" },
   printSpot:{ w:1080,h:1350,title:"Print every class plan",size:"1080 × 1350",file:"campusflow-print.png" },
@@ -2805,6 +2807,24 @@ CV_R.offlineSpot=(c,w,h)=>{ cvBg(c,w,h,false); const cx=w/2,cy=390;
   cvText(c,"Works without internet.",w/2,640,920,88,100,2,"#0b1f1c","head","center");
   cvText(c,"Changes save on the device and sync when the connection returns.",w/2,820,860,36,50,3,"#475569","body","center");
   cvPill(c,250,930,580,88,"Call "+CV_PH(),32); cvFooter(c,w,h,"Sinhala · Tamil · English",false); };
+CV_R.fingerprintSpot=(c,w,h)=>{ cvBg(c,w,h); cvLogo(c,80,76,90);
+  cvText(c,"Fingerprint attendance",80,250,920,84,96,2,"#ecfdf5");
+  cvText(c,"Teachers clock in with a fingerprint or face. Missing teachers show up live.",80,420,900,40,54,3,"#a7d9c7");
+  const cx=w/2, cy=760;
+  c.fillStyle="#10b981"; c.beginPath(); c.arc(cx,cy,170,0,Math.PI*2); c.fill();
+  c.strokeStyle="#ffffff"; c.lineWidth=20; c.lineCap="round";
+  [50,95,140].forEach(r=>{ c.beginPath(); c.arc(cx,cy,r,Math.PI*1.15,Math.PI*1.85); c.stroke(); });
+  cvPill(c,250,1150,580,88,"Call "+CV_PH(),32);
+  cvFooter(c,w,h,"Sinhala · Tamil · English"); };
+CV_R.findSpot=(c,w,h)=>{ cvBg(c,w,h); cvLogo(c,80,76,90);
+  cvText(c,"Find anything, instantly.",80,250,920,84,96,2,"#ecfdf5");
+  cvText(c,"Teachers, classes, lessons, attendance and linked sheets in one search box. Answers cite their source.",80,420,900,40,54,3,"#a7d9c7");
+  c.fillStyle="#ffffff"; c.beginPath(); c.roundRect? c.roundRect(90,600,900,120,60) : c.rect(90,600,900,120); c.fill();
+  cvText(c,"Who is free period 3?",150,636,820,44,50,1,"#0b1f1c","body");
+  c.fillStyle="#d1fae5"; c.beginPath(); c.roundRect? c.roundRect(90,780,900,200,36) : c.rect(90,780,900,200); c.fill();
+  cvText(c,"Kamala Silva is free period 3 on Wednesday [1]",130,820,840,36,46,2,"#0b1f1c","body");
+  cvPill(c,250,1150,580,88,"Call "+CV_PH(),32);
+  cvFooter(c,w,h,"Free "+CV_DAYS()+"-day trial · Sinhala · Tamil · English"); };
 CV_R.langSpot=(c,w,h)=>{ cvBg(c,w,h); cvLogo(c,80,76,90);
   cvText(c,"Sinhala · Tamil · English",80,250,920,84,96,2,"#ecfdf5");
   const rows=[["සිංහල","#059669"],["தமிழ்","#0f766e"],["English","#10b981"]];
@@ -3350,7 +3370,7 @@ function renderMarketingCanvases(){
 const MKT = { platform:"instagram", tone:"parent", variant:0 };
 const MKT_PLATFORMS = {
   instagram:{ label:"Instagram", icon:"ph-instagram-logo", bio:150, caption:2200, tags:30, tagRec:"5–10 tags work best",
-    creatives:["square","story","reliefSpot","trialStory","langSpot","voucher"], sizes:"Feed 1080×1080 or 1080×1350 · Story & Reel 1080×1920", bioNote:"Bio limit 150 characters" },
+    creatives:["square","story","reliefSpot","fingerprintSpot","findSpot","trialStory","langSpot","voucher"], sizes:"Feed 1080×1080 or 1080×1350 · Story & Reel 1080×1920", bioNote:"Bio limit 150 characters" },
   facebook:{ label:"Facebook", icon:"ph-facebook-logo", bio:null, caption:null, tags:5, tagRec:"2–3 tags is enough",
     creatives:["facebook","cover","siteBanner","parentNotice","beforeAfter"], sizes:"Link post 1200×628 · Page cover 1640×856", bioNote:"Page 'About' text" },
   whatsapp:{ label:"WhatsApp", icon:"ph-whatsapp-logo", bio:139, caption:null, tags:0, tagRec:"Hashtags don't work on WhatsApp",

@@ -13,7 +13,7 @@ const dom=new JSDOM(html,{runScripts:'outside-only',url:'http://localhost/',pret
     w.requestAnimationFrame=cb=>setTimeout(()=>cb(Date.now()),0);
     w.IntersectionObserver=function(){ return {observe(){},unobserve(){},disconnect(){}}; };
     w.ResizeObserver=function(){ return {observe(){},unobserve(){},disconnect(){}}; };
-    w.HTMLCanvasElement.prototype.getContext=()=>null; w.scrollTo=()=>{}; w.HTMLElement.prototype.scrollIntoView=function(){};
+    w.HTMLCanvasElement.prototype.getContext=()=>null; w.scrollTo=()=>{}; w.Path2D=function(){ return new Proxy({}, {get:(t,k)=>(k in t?t[k]:(()=>{})), set:(t,k,v)=>{t[k]=v;return true;}}); }; w.HTMLElement.prototype.scrollIntoView=function(){};
     Object.defineProperty(w.navigator,'serviceWorker',{value:{register:()=>Promise.resolve({}),addEventListener(){},ready:Promise.resolve({})},configurable:true});
     w.__warn=[]; w.__err=[];
     w.console.warn=(...a)=>{ w.__warn.push(a.map(x=>String(x&&x.message||x)).join(' ')); };
@@ -51,6 +51,7 @@ const probe=`
   flush(){ Store.flush(); },
   refresh(){ refresh(); },
   evalIn(x){ return eval(x); },
+  draw(name, ctx){ CV_R[name](ctx,1080,1080); return "ok"; },
   go(route){ Store.raw.ui.route=route; refresh(); },
   viewHtml(){ return document.getElementById("view")?.innerHTML||""; },
   allowed(){ return allowedRoutes(); }
@@ -67,6 +68,19 @@ const failedScreen=html=>/This screen could not open/.test(html);
 (async()=>{
   await sleep(50);
   T.seed();
+
+  // 0b) promotional creatives draw without errors (recording stand-in for a canvas context)
+  const fakeCtx = new Proxy({}, {
+    get(t,k){ if(k in t) return t[k];
+      if(k==="measureText") return ()=>({width:10});
+      if(k==="createLinearGradient"||k==="createRadialGradient") return ()=>({addColorStop(){}});
+      return (t[k]=function(){ return undefined; }); },
+    set(t,k,v){ t[k]=v; return true; }
+  });
+  for(const name of ["fingerprintSpot","findSpot","offlineSpot","langSpot"]){
+    let res; try{ res = T.draw(name, fakeCtx); }catch(e){ res = "threw: "+e.message; }
+    check("creative draws: "+name, res==="ok", res);
+  }
 
   // 0) public landing page (what clients see before signing in)
   try{ T.evalIn("showLogin()"); }catch(e){ check("landing page renders", false, e.message); }
