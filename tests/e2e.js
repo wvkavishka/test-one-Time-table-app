@@ -364,6 +364,43 @@ const failedScreen=html=>/This screen could not open/.test(html);
     w.localStorage.removeItem("find.sources."+sid);
   }
 
+
+  // 8f) Attendance: principal manages staff records; admins only read; one tap = one action.
+  {
+    const realToday = w.ATT.todayForSchool, realMe = w.ATT.todayForMe, realCreds = w.ATT.listCredentials, realBio = w.ATT.hasBiometric;
+    const realClock = w.ATT.clockManual;
+    const day = { byMember: { u1: { events: { e1: { at: Date.now()-3600000, kind: "in", method: "fingerprint" } }, last: {} } } };
+    w.ATT.todayForSchool = async () => ({ day, members: {
+      u1: { name: "Nimal Perera", role: "teacher", active: true },
+      u2: { name: "Kamala Silva", role: "teacher", active: true },
+      u3: { name: "Old Teacher", role: "teacher", active: false } } });
+    w.ATT.todayForMe = async () => null;
+    w.ATT.listCredentials = async () => ({});
+    w.ATT.hasBiometric = () => false;
+    let clocks = 0; w.ATT.clockManual = async () => { clocks++; return {ok:true}; };
+    try {
+      T.setRole("principal"); T.go("attendance"); await sleep(60);
+      check("principal sees the staff attendance table", /Nimal Perera/.test(T.viewHtml()) && !/Old Teacher/.test(T.viewHtml()));
+      check("principal gets In / Out / Undo controls per person", doc.querySelectorAll('[data-action="att-manage"]').length === 6);
+      check("Out is disabled for someone not signed in", !!doc.querySelector('[data-action="att-manage"][data-op="out"][data-uid="u2"][disabled]'));
+      check("Undo is disabled when there is nothing to undo", !!doc.querySelector('[data-action="att-manage"][data-op="undo"][data-uid="u2"][disabled]'));
+      check("Undo is enabled where a record exists", !doc.querySelector('[data-action="att-manage"][data-op="undo"][data-uid="u1"]').disabled);
+      // the screen is opened several times: one tap must still clock once
+      T.go("dashboard"); await sleep(20); T.go("attendance"); await sleep(60); T.go("dashboard"); await sleep(20); T.go("attendance"); await sleep(60);
+      const btn = doc.querySelector('[data-action="att-clock"][data-kind="in"]');
+      if (btn) { click(btn); await sleep(60); }
+      check("one tap clocks in exactly once (no stacked handlers)", clocks === 1, "clocks=" + clocks);
+      // admins read the table but cannot change records
+      T.setRole("admin"); await T.evalIn("renderAttendance()"); await sleep(80);
+      check("admin can read the table", /Nimal Perera/.test(T.viewHtml()));
+      check("admin gets no manage controls", doc.querySelectorAll('[data-action="att-manage"]').length === 0);
+    } finally {
+      w.ATT.todayForSchool = realToday; w.ATT.todayForMe = realMe; w.ATT.listCredentials = realCreds;
+      w.ATT.hasBiometric = realBio; w.ATT.clockManual = realClock;
+      T.setRole("principal");
+    }
+  }
+
   // 9) errors overall
   const uncaught=w.__err.filter(x=>/uncaught|TypeError|ReferenceError/.test(x));
   check("no uncaught JS errors during the whole run", uncaught.length===0, uncaught.slice(0,3).join(" | "));

@@ -5018,8 +5018,75 @@ function attStatusPill(s){
   return `<span class="chip !text-[10px] bg-rose-50 text-rose-600 border border-rose-200"><i class="ph-fill ph-clock"></i>${esc(t("att.statusaway"))}</span>`;
 }
 
+/* Attendance actions. They live in the global click dispatcher (the `actions` map), not in a
+   listener re-added on every render: those listeners stacked up, so one tap could run a
+   clock-in several times. attHooks is set by renderAttendance for the open screen. */
+let attHooks = null;
+function attErrText(e){
+  const m = String((e && (e.message || e.code)) || "");
+  if (/permission/i.test(m)) return "Your account is not allowed to read today's attendance. The principal can check this account's role in Team.";
+  return backendMessage(e) || m || "unknown error";
+}
+async function attSafe(fn){
+  try { await fn(); }
+  catch(e){ toast("error","Attendance",backendMessage(e)); }
+}
+const ATT_ACTIONS = {
+  "att-clock": el => attSafe(async()=>{
+    const kind = el.dataset.kind;
+    el.disabled = true; const old = el.innerHTML; el.innerHTML = `<span class="spinner"></span>${esc(t("att.attaching"))}`;
+    try{
+      if(ATT.hasBiometric()){ await ATT.clockWithFinger(kind); toast("success", kind==="in"?"Signed in with your fingerprint.":"Signed out.",""); }
+      else { await ATT.clockManual(kind); toast("success", kind==="in"?"Signed in.":"Signed out.",""); }
+    } finally { el.disabled = false; el.innerHTML = old; }
+    await attHooks?.repaint();
+  }),
+  "att-manual": el => attSafe(async()=>{
+    await ATT.clockManual(el.dataset.kind); toast("info","Manual sign-in recorded.",""); await attHooks?.repaint();
+  }),
+  "att-add-bio": el => attSafe(async()=>{
+    const label = prompt("Label for this device (e.g. My phone, Office laptop)","My phone");
+    if(!label) return;
+    el.disabled = true; const old = el.innerHTML; el.innerHTML = `<span class="spinner"></span>${esc(t("att.attaching"))}`;
+    try{ await ATT.registerFinger({label}); toast("success","Fingerprint saved. Future clock-ins are one tap.",""); }
+    finally { el.disabled = false; el.innerHTML = old; }
+    await attHooks?.repaint();
+  }),
+  "att-remove-bio": el => attSafe(async()=>{
+    if(!confirm(t("att.confirmremove"))) return;
+    await ATT.removeCredential(el.dataset.cid); await attHooks?.repaint();
+  }),
+  "att-add-device": () => attHooks?.addDevice(),
+  "att-revoke-device": el => attSafe(async()=>{
+    if(!confirm("Revoke this attendance device? It can no longer send clock-ins.")) return;
+    await callBackend("deviceKeyRevoke",{schoolId:Session.schoolId,deviceId:el.dataset.id});
+    toast("info","Device revoked.",""); await attHooks?.repaint();
+  }),
+  "att-print-today": () => attHooks?.print("today"),
+  "att-print-recent": () => attSafe(()=>attHooks?.print("recent")),
+  /* Principal fixes today's record for one person: sign in, sign out, or undo the last entry. */
+  "att-manage": el => attSafe(async()=>{
+    const op = el.dataset.op, uid = el.dataset.uid;
+    let note = "";
+    if(op === "undo"){
+      if(!confirm("Undo the most recent attendance record for this person today?")) return;
+    } else {
+      const n = prompt(op==="in" ? "Reason for signing them in manually (optional)" : "Reason for signing them out manually (optional)", "");
+      if(n === null) return;
+      note = n.trim();
+    }
+    el.disabled = true;
+    try{
+      await callBackend("attendanceManual",{schoolId:Session.schoolId,uid,op,note},30000);
+      toast("success", op==="undo" ? "Record undone." : "Saved.", op==="undo" ? "" : "Recorded as a manual entry.");
+    } finally { el.disabled = false; }
+    await attHooks?.repaint();
+  })
+};
+let attRenderSeq = 0;
 async function renderAttendance(){
   const view=$("#view");
+  const myRender = ++attRenderSeq;   /* a slow older render must never paint over a newer one */
   view.innerHTML=`<div class="space-y-4 view-in">
     <div class="flex items-end justify-between gap-3 flex-wrap">
       <div><div class="text-[11px] font-bold uppercase tracking-[.1em] text-violet-600">Biometric attendance</div>
@@ -5033,7 +5100,7 @@ async function renderAttendance(){
   </div>`;
   try{ await ensureAttendance(); }catch(e){ view.querySelector("#att-body").innerHTML=`<div class="card p-6 text-rose-700">${esc(e.message||String(e))}</div>`; return; }
 
-  const canManage = isPrincipal() || Session.schoolRole==="admin" || isSuper();
+  const canManage = isPrincipal() || isSuper();   /* same rule as the server (assertSchoolManager) */
     const mayReadDay = canReadDayAttendance();
   async function paint(){
     const mine = await ATT.todayForMe().catch(()=>null);   /* offline: show "not in yet" rather than failing the screen */
@@ -5074,17 +5141,17 @@ async function renderAttendance(){
       </div>`;
 
     let schoolHtml="";
-    if(canManage && mayReadDay){
+    if(mayReadDay){
       /* A failed read (offline, or rules changed) must not blank the whole screen: the
          device card below still has to render so the principal can fix the setup. */
-      const data = await ATT.todayForSchool().catch(e=>({ day:null, members:{}, loadErr: backendMessage(e)||e?.message||"unknown error" }));
+      const data = await ATT.todayForSchool().catch(e=>({ day:null, members:{}, loadErr: attErrText(e) }));
       const day = data.day;
       const members = data.members;
-      const rows = Object.entries(members).filter(([uid,m])=>m && m.active && (m.role==="teacher"||m.role==="staff"||m.role==="admin"))
+      const rows = Object.entries(members).filter(([uid,m])=>m && m.active && (m.role==="teacher"||m.role==="staff"||m.role==="admin"||m.role==="principal"))
         .map(([uid,m])=>{
           const me = day?.byMember?.[uid];
           const s = ATT.latestStatus(me);
-          return { uid, m, s };
+          return { uid, m, s, me };
         }).sort((a,b)=>{
           const o={in:0,out:1,away:2};
           if(o[a.s.status]!==o[b.s.status]) return o[a.s.status]-o[b.s.status];
@@ -5107,7 +5174,7 @@ async function renderAttendance(){
           <table class="w-full text-[13px]">
             <thead class="bg-zinc-50 text-[11px] uppercase tracking-wider text-zinc-500"><tr>
               <th class="text-left p-3">Name</th><th class="text-left p-3">Role</th><th class="text-left p-3">Status</th>
-              <th class="text-left p-3">In</th><th class="text-left p-3">Out</th><th class="text-left p-3">Device</th>
+              <th class="text-left p-3">In</th><th class="text-left p-3">Out</th><th class="text-left p-3">Device</th>${canManage?'<th class="text-left p-3">Manage</th>':""}
             </tr></thead>
             <tbody>
               ${rows.map(r=>`<tr class="border-t border-zinc-100 hover:bg-zinc-50/60">
@@ -5116,7 +5183,12 @@ async function renderAttendance(){
                 <td class="p-3">${attStatusPill(r.s.status)}</td>
                 <td class="p-3 tabular-nums">${r.s.inAt?ATT.fmtClock(r.s.inAt):"—"}</td>
                 <td class="p-3 tabular-nums">${r.s.outAt?ATT.fmtClock(r.s.outAt):"—"}</td>
-                <td class="p-3">${r.s.method?attMethodChip(r.s.method):'<span class="text-zinc-300 text-[10px]">—</span>'}</td>
+                <td class="p-3">${r.s.method?attMethodChip(r.s.method):'<span class="text-zinc-300 text-[10px]">—</span>'}${r.s.note?`<div class="text-[10px] text-zinc-500 mt-0.5">${esc(r.s.note)}</div>`:""}</td>
+                ${canManage?`<td class="p-3"><div class="flex gap-1 whitespace-nowrap">
+                  <button class="btn btn-ghost !h-7 !px-2 !text-[11px]" data-action="att-manage" data-op="in" data-uid="${esc(r.uid)}" ${r.s.status==="in"?"disabled":""}>In</button>
+                  <button class="btn btn-ghost !h-7 !px-2 !text-[11px]" data-action="att-manage" data-op="out" data-uid="${esc(r.uid)}" ${r.s.status!=="in"?"disabled":""}>Out</button>
+                  <button class="btn btn-ghost !h-7 !px-2 !text-[11px] text-rose-600" data-action="att-manage" data-op="undo" data-uid="${esc(r.uid)}" ${r.me?.events?"":"disabled"} title="Undo the last record"><i class="ph ph-arrow-counter-clockwise"></i></button>
+                </div></td>`:""}
               </tr>`).join("")}
             </tbody>
           </table>
@@ -5127,53 +5199,11 @@ async function renderAttendance(){
       if(data.loadErr) schoolHtml = `<div class="lg:col-span-2 rounded-xl border border-rose-200 bg-rose-50 p-3 text-[12px] text-rose-800">Today's attendance could not load: ${esc(data.loadErr)}</div>` + schoolHtml;
     } else schoolHtml=`<div class="lg:col-span-2"></div>`;
 
+    if(myRender !== attRenderSeq) return;
     view.querySelector("#att-body").innerHTML = mineHtml + schoolHtml;
   }
 
-  view.addEventListener("click", attHandler, { once:true });
-  async function attHandler(ev){
-    const b=ev.target.closest("[data-action]");
-    view.addEventListener("click",attHandler,{once:true});
-    if(!b) return;
-    const act=b.dataset.action;
-    try{
-      if(act==="att-clock"){
-        const kind=b.dataset.kind;
-        b.disabled=true; const old=b.innerHTML; b.innerHTML=`<span class="spinner"></span>${esc(t("att.attaching"))}`;
-        try{
-          if(ATT.hasBiometric()){
-            await ATT.clockWithFinger(kind);
-            toast("success",kind==="in"?"Signed in with your fingerprint.":"Signed out.","");
-          } else {
-            await ATT.clockManual(kind);
-            toast("success",kind==="in"?"Signed in.":"Signed out.","");
-          }
-        }finally{ b.disabled=false; b.innerHTML=old; }
-        await paint();
-      } else if(act==="att-manual"){
-        await ATT.clockManual(b.dataset.kind); toast("info","Manual sign-in recorded.",""); await paint();
-      } else if(act==="att-add-bio"){
-        const label = prompt("Label for this device (e.g. My phone, Office laptop)","My phone");
-        if(!label) return;
-        b.disabled=true; const old=b.innerHTML; b.innerHTML=`<span class="spinner"></span>${esc(t("att.attaching"))}`;
-        try{ await ATT.registerFinger({label}); toast("success","Fingerprint saved. Future clock-ins are one tap.",""); await paint(); }
-        finally{ b.disabled=false; b.innerHTML=old; }
-      } else if(act==="att-remove-bio"){
-        if(!confirm(t("att.confirmremove"))) return;
-        await ATT.removeCredential(b.dataset.cid); await paint();
-      } else if(act==="att-add-device"){
-        openAddDevice();
-      } else if(act==="att-revoke-device"){
-        if(!confirm("Revoke this attendance device? It can no longer send clock-ins.")) return;
-        await callBackend("deviceKeyRevoke",{schoolId:Session.schoolId,deviceId:b.dataset.id});
-        toast("info","Device revoked.",""); await paint();
-      } else if(act==="att-print-today"){
-        printSheet("today");
-      } else if(act==="att-print-recent"){
-        await printSheet("recent");
-      }
-    }catch(e){ toast("error","Attendance",backendMessage(e)); }
-  }
+  attHooks = { repaint: paint, addDevice: openAddDevice, print: printSheet };
 
   async function renderAttendanceDevices(){
     if(!canManage) return "";
@@ -7424,6 +7454,7 @@ const actions={
     },0);
   }
 };
+Object.assign(actions, ATT_ACTIONS);
 actions["reset-admin-pw"]=actions["reset-member-pw"];
 
 /* =================================================================================

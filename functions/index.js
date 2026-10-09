@@ -87,7 +87,7 @@ async function assertSchoolManager(auth, schoolId) {
   ]);
   const user = userSnap.val();
   const profile = profileSnap.val();
-  if (!user || user.active !== true || user.schoolId !== schoolId || user.role !== "principal") {
+  if (!user || user.active === false || user.schoolId !== schoolId || user.role !== "principal") {
     throw new HttpsError("permission-denied", "Only this school's principal can manage accounts.");
   }
   if (profile?.status === "disabled" || (profile?.status === "trial" && profile.trialEnds && profile.trialEnds < Date.now())) {
@@ -316,16 +316,29 @@ function bufToB64(b){
 function randBuf(n){ return crypto.randomBytes(n); }
 
 async function assertSchoolMember(auth, schoolId){
-  const mgr = await assertSchoolManager(auth, schoolId);
-  // School managers (principal / admin / platform) pass through; we still need
-  // to be able to verify *any* teacher calling bio endpoints. Re-check that the
-  // caller is an active member regardless of role.
-  const snap = await getDatabase().ref(`schools/${schoolId}/members/${auth.uid}`).get();
-  const m = snap.val();
-  if(!m || m.active !== true){
-    throw new HttpsError("permission-denied","You are not an active member of this school.");
+  // Any active staff member of the school (teacher, staff, admin or principal).
+  // This used to call assertSchoolManager, which only lets the principal through, so
+  // teachers could not clock in or use Find sheets.
+  requireId(schoolId, "School");
+  const db = getDatabase();
+  if (await isPlatformAdmin(auth)) {
+    const exists = await db.ref(`schools/${schoolId}/profile`).get();
+    if (!exists.exists()) throw new HttpsError("not-found", "That school no longer exists.");
+    return { owner: true, member: { name: "Platform admin", role: "admin", active: true } };
   }
-  return { member:m, ...mgr };
+  const [memSnap, profileSnap] = await Promise.all([
+    db.ref(`schools/${schoolId}/members/${auth.uid}`).get(),
+    db.ref(`schools/${schoolId}/profile`).get()
+  ]);
+  const member = memSnap.val();
+  const profile = profileSnap.val();
+  if (!member || member.active !== true) {
+    throw new HttpsError("permission-denied", "You are not an active member of this school.");
+  }
+  if (profile?.status === "disabled" || (profile?.status === "trial" && profile.trialEnds && profile.trialEnds < Date.now())) {
+    throw new HttpsError("failed-precondition", "School access is currently paused or expired.");
+  }
+  return { owner: false, member, profile };
 }
 
 async function consumeChallenge(db, schoolId, uid, requestId, kind){
@@ -647,6 +660,52 @@ exports.clockManual = onCall({ region: REGION, enforceAppCheck: APP_CHECK_ENFORC
   const db = getDatabase();
   const res = await recordClock(db, schoolId, caller.uid, kind, "manual", "", member.name+" signed in without fingerprint");
   return { ok:true, ...res, memberName: member.name };
+});
+
+/* ---- Principal manages today's attendance ----
+   op "in" / "out": record a sign-in or sign-out the person could not make (forgot, device
+   failed). op "undo": remove the most recent record for that person today. Only the
+   principal (or the platform admin) may do this; every change is marked "manual". */
+exports.attendanceManual = onCall({ region: REGION, enforceAppCheck: APP_CHECK_ENFORCED, timeoutSeconds: 30, memory: "256MiB" }, async request => {
+  const caller = requireSignedIn(request);
+  const data = request.data || {};
+  const schoolId = clean(data.schoolId, 80);
+  const uid = clean(data.uid, 128);
+  const op = clean(data.op, 10);
+  const note = clean(data.note, 120);
+  if (!["in", "out", "undo"].includes(op)) throw new HttpsError("invalid-argument", "Choose in, out or undo.");
+  if (!uid) throw new HttpsError("invalid-argument", "Choose a staff member.");
+  const mgr = await assertSchoolManager(caller, schoolId);
+  const db = getDatabase();
+  const member = (await db.ref(`schools/${schoolId}/members/${uid}`).get()).val();
+  if (!member || member.active !== true) throw new HttpsError("not-found", "That person is not an active member of this school.");
+
+  const date = schoolDayKey(new Date());
+  const base = `schools/${schoolId}/attendance/${date}/byMember/${uid}`;
+  const events = Object.entries((await db.ref(`${base}/events`).get()).val() || {})
+    .sort((a, b) => (a[1].at || 0) - (b[1].at || 0));
+
+  if (op === "undo") {
+    if (!events.length) throw new HttpsError("failed-precondition", "There is nothing to undo for this person today.");
+    const [lastKey] = events[events.length - 1];
+    await db.ref(`${base}/events/${lastKey}`).remove();
+    const prev = events.length > 1 ? events[events.length - 2][1] : null;
+    if (prev) await db.ref(`${base}/last`).set({ ...prev });
+    else await db.ref(`${base}/last`).remove();
+    return { ok: true, undone: true, date };
+  }
+
+  let inOpen = false;
+  for (const [, e] of events) {
+    if (e.kind === "in") inOpen = true;
+    else if (e.kind === "out") inOpen = false;
+  }
+  if (op === "in" && inOpen) throw new HttpsError("failed-precondition", "This person is already signed in.");
+  if (op === "out" && !inOpen) throw new HttpsError("failed-precondition", "This person is not signed in.");
+
+  const by = mgr.owner ? "Platform admin" : (mgr.user?.name || "Principal");
+  const res = await recordClock(db, schoolId, uid, op, "manual", "Set by " + by, note ? "Principal: " + note : "Set by principal");
+  return { ok: true, date: res.date, memberName: member.name || "" };
 });
 
 /* ---- USB / external attendance-machine push (a simple API key per school) ----
