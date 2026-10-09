@@ -6,10 +6,8 @@
 
 const ATT = (()=>{
   const sid = ()=>Session.schoolId;
-  const todayKey = (d=new Date())=>{
-    const x=new Date(d); x.setHours(0,0,0,0);
-    return x.toISOString().slice(0,10);
-  };
+  /* Same school-day rule as app.js schoolDayKey (Sri Lanka time). */
+  const todayKey = (d=new Date())=> schoolDayKey(d);
   const fmtClock = ts=>{
     if(!ts) return "";
     const d=new Date(ts); return d.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"});
@@ -17,7 +15,7 @@ const ATT = (()=>{
   const fmtWhen = ts=>{
     if(!ts) return "—";
     const d=new Date(ts); const today=todayKey();
-    const key=d.toISOString().slice(0,10);
+    const key=schoolDayKey(d);
     if(key===today) return fmtClock(ts);
     return d.toLocaleDateString()+" "+fmtClock(ts);
   };
@@ -135,7 +133,7 @@ const ATT = (()=>{
     if(!mayReadDay()) return [];
     const out=[]; const base=new Date(); base.setHours(0,0,0,0);
     const refs=[];
-    for(let i=0;i<days;i++){ const d=new Date(base); d.setDate(base.getDate()-i); const k=d.toISOString().slice(0,10); refs.push(FB.db.ref(`schools/${sid()}/attendance/${k}/byMember`).once("value").then(s=>({key:k,v:s.val()||{}}))); }
+    for(let i=0;i<days;i++){ const k=schoolDayKey(new Date(Date.now()-i*86400000)); refs.push(FB.db.ref(`schools/${sid()}/attendance/${k}/byMember`).once("value").then(s=>({key:k,v:s.val()||{}}))); }
     const all=await Promise.all(refs);
     return all;
   }

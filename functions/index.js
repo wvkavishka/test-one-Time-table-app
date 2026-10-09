@@ -10,6 +10,9 @@ const { getDatabase } = require("firebase-admin/database");
 initializeApp({ databaseURL: "https://mom-school-time-table-default-rtdb.firebaseio.com" });
 
 const REGION = "asia-south1";
+/* App Check enforcement for the callable functions. Off until the web app has its site key
+   and App Check is registered in the console; then deploy with ENFORCE_APP_CHECK=true. */
+const APP_CHECK_ENFORCED = process.env.ENFORCE_APP_CHECK === "true";
 const SUPER_UID = "FI059sTQ5hXFSAYEqKefDyk3kBw2";
 const ROLES = new Set(["admin", "teacher", "staff"]);
 
@@ -93,7 +96,7 @@ async function assertSchoolManager(auth, schoolId) {
   return { owner: false, user, profile };
 }
 
-exports.provisionSchool = onCall({ region: REGION, timeoutSeconds: 60, memory: "256MiB" }, async request => {
+exports.provisionSchool = onCall({ region: REGION, enforceAppCheck: APP_CHECK_ENFORCED, timeoutSeconds: 60, memory: "256MiB" }, async request => {
   const caller = requireSignedIn(request);
   if (!(await isPlatformAdmin(caller))) throw new HttpsError("permission-denied", "Only a platform admin can create schools.");
 
@@ -142,7 +145,7 @@ exports.provisionSchool = onCall({ region: REGION, timeoutSeconds: 60, memory: "
   }
 });
 
-exports.provisionMember = onCall({ region: REGION, timeoutSeconds: 60, memory: "256MiB" }, async request => {
+exports.provisionMember = onCall({ region: REGION, enforceAppCheck: APP_CHECK_ENFORCED, timeoutSeconds: 60, memory: "256MiB" }, async request => {
   const caller = requireSignedIn(request);
   const data = request.data || {};
   const schoolId = clean(data.schoolId, 80);
@@ -181,7 +184,7 @@ exports.provisionMember = onCall({ region: REGION, timeoutSeconds: 60, memory: "
   }
 });
 
-exports.replaceMemberLogin = onCall({ region: REGION, timeoutSeconds: 60, memory: "256MiB" }, async request => {
+exports.replaceMemberLogin = onCall({ region: REGION, enforceAppCheck: APP_CHECK_ENFORCED, timeoutSeconds: 60, memory: "256MiB" }, async request => {
   const caller = requireSignedIn(request);
   const data = request.data || {};
   const schoolId = clean(data.schoolId, 80);
@@ -240,7 +243,7 @@ exports.replaceMemberLogin = onCall({ region: REGION, timeoutSeconds: 60, memory
   return { uid: user.uid, email };
 });
 
-exports.removeMemberAccount = onCall({ region: REGION, timeoutSeconds: 60, memory: "256MiB" }, async request => {
+exports.removeMemberAccount = onCall({ region: REGION, enforceAppCheck: APP_CHECK_ENFORCED, timeoutSeconds: 60, memory: "256MiB" }, async request => {
   const caller = requireSignedIn(request);
   const schoolId = clean(request.data?.schoolId, 80);
   const memberUid = requireId(clean(request.data?.memberUid, 128), "Member");
@@ -262,7 +265,7 @@ exports.removeMemberAccount = onCall({ region: REGION, timeoutSeconds: 60, memor
   return { removed: true };
 });
 
-exports.deleteSchoolAccount = onCall({ region: REGION, timeoutSeconds: 120, memory: "256MiB" }, async request => {
+exports.deleteSchoolAccount = onCall({ region: REGION, enforceAppCheck: APP_CHECK_ENFORCED, timeoutSeconds: 120, memory: "256MiB" }, async request => {
   const caller = requireSignedIn(request);
   if (!(await isPlatformAdmin(caller))) throw new HttpsError("permission-denied", "Only a platform admin can delete a school.");
   const schoolId = requireId(clean(request.data?.schoolId, 80), "School");
@@ -489,7 +492,7 @@ function parseAttestationObject(b64){
   return { fmt, authData, credId, pub, aaguid };
 }
 
-exports.bioRegisterStart = onCall({ region: REGION, timeoutSeconds: 30, memory: "256MiB" }, async request => {
+exports.bioRegisterStart = onCall({ region: REGION, enforceAppCheck: APP_CHECK_ENFORCED, timeoutSeconds: 30, memory: "256MiB" }, async request => {
   const caller = requireSignedIn(request);
   const schoolId = clean(request.data?.schoolId, 80);
   const label = clean(request.data?.label, 80) || "My phone";
@@ -521,7 +524,7 @@ exports.bioRegisterStart = onCall({ region: REGION, timeoutSeconds: 30, memory: 
   };
 });
 
-exports.bioRegisterFinish = onCall({ region: REGION, timeoutSeconds: 30, memory: "256MiB" }, async request => {
+exports.bioRegisterFinish = onCall({ region: REGION, enforceAppCheck: APP_CHECK_ENFORCED, timeoutSeconds: 30, memory: "256MiB" }, async request => {
   const caller = requireSignedIn(request);
   const schoolId = clean(request.data?.schoolId, 80);
   const requestId = clean(request.data?.requestId, 128);
@@ -555,7 +558,7 @@ exports.bioRegisterFinish = onCall({ region: REGION, timeoutSeconds: 30, memory:
   return { ok:true, credId, label };
 });
 
-exports.bioAuthStart = onCall({ region: REGION, timeoutSeconds: 30, memory: "256MiB" }, async request => {
+exports.bioAuthStart = onCall({ region: REGION, enforceAppCheck: APP_CHECK_ENFORCED, timeoutSeconds: 30, memory: "256MiB" }, async request => {
   const caller = requireSignedIn(request);
   const schoolId = clean(request.data?.schoolId, 80);
   await assertSchoolMember(caller, schoolId);
@@ -582,10 +585,13 @@ exports.bioAuthStart = onCall({ region: REGION, timeoutSeconds: 30, memory: "256
   };
 });
 
+/* The school day in Sri Lanka time, the same rule the app uses for every attendance date. */
+function schoolDayKey(d=new Date()){
+  return new Intl.DateTimeFormat("en-CA",{timeZone:"Asia/Colombo",year:"numeric",month:"2-digit",day:"2-digit"}).format(d);
+}
 async function recordClock(db, schoolId, uid, kind, method, deviceLabel, note){
   if(kind!=="in"&&kind!=="out") throw new HttpsError("invalid-argument","Kind must be in or out.");
-  const key = new Date(); key.setHours(0,0,0,0);
-  const date = key.toISOString().slice(0,10);
+  const date = schoolDayKey(new Date());
   const now = Date.now();
   const ref = db.ref(`schools/${schoolId}/attendance/${date}/byMember/${uid}/events`).push();
   const evt = { at: now, kind, method, deviceLabel: deviceLabel||"", note: note||"", via: ref.key };
@@ -595,7 +601,7 @@ async function recordClock(db, schoolId, uid, kind, method, deviceLabel, note){
   return { date, event: evt };
 }
 
-exports.bioClock = onCall({ region: REGION, timeoutSeconds: 30, memory: "256MiB" }, async request => {
+exports.bioClock = onCall({ region: REGION, enforceAppCheck: APP_CHECK_ENFORCED, timeoutSeconds: 30, memory: "256MiB" }, async request => {
   const caller = requireSignedIn(request);
   const schoolId = clean(request.data?.schoolId, 80);
   const kind = clean(request.data?.kind, 8) === "out" ? "out" : "in";
@@ -623,7 +629,7 @@ exports.bioClock = onCall({ region: REGION, timeoutSeconds: 30, memory: "256MiB"
   return { ok:true, ...res, memberName: member.name };
 });
 
-exports.bioRemove = onCall({ region: REGION, timeoutSeconds: 30, memory: "256MiB" }, async request => {
+exports.bioRemove = onCall({ region: REGION, enforceAppCheck: APP_CHECK_ENFORCED, timeoutSeconds: 30, memory: "256MiB" }, async request => {
   const caller = requireSignedIn(request);
   const schoolId = clean(request.data?.schoolId, 80);
   const credId = clean(request.data?.credId, 200);
@@ -633,7 +639,7 @@ exports.bioRemove = onCall({ region: REGION, timeoutSeconds: 30, memory: "256MiB
   return { ok:true };
 });
 
-exports.clockManual = onCall({ region: REGION, timeoutSeconds: 30, memory: "256MiB" }, async request => {
+exports.clockManual = onCall({ region: REGION, enforceAppCheck: APP_CHECK_ENFORCED, timeoutSeconds: 30, memory: "256MiB" }, async request => {
   const caller = requireSignedIn(request);
   const schoolId = clean(request.data?.schoolId, 80);
   const kind = clean(request.data?.kind, 8) === "out" ? "out" : "in";
@@ -658,16 +664,29 @@ exports.attendancePush = onRequest({ region: REGION, timeoutSeconds: 30, memory:
     const key = String(req.headers.authorization||"").replace(/^Bearer\s+/i,"").trim();
     if(!key || !/^[A-Za-z0-9_-]{16,200}$/.test(key)) return res.status(401).json({error:"missing device key"});
     const db = getDatabase();
-    // Look up the key -> { schoolId, label, active }
-    const keySnap = await db.ref("deviceKeys").orderByChild("key").equalTo(key).limitToFirst(1).get();
+    // Keys are stored only as a SHA-256 hash, so a leaked database cannot be used to clock in.
+    const keyHash = sha256Hex(key);
     let found=null;
-    keySnap.forEach(s=>{ found={ ...s.val(), deviceId:s.key }; });   /* s.val() holds the secret in .key: keep the id separate */
+    const hashSnap = await db.ref("deviceKeys").orderByChild("keyHash").equalTo(keyHash).limitToFirst(1).get();
+    hashSnap.forEach(s=>{ found={ ...s.val(), deviceId:s.key }; });
+    if(!found){
+      // Legacy devices created before hashing stored the key in plain text: match, then convert.
+      const legacy = await db.ref("deviceKeys").orderByChild("key").equalTo(key).limitToFirst(1).get();
+      legacy.forEach(s=>{ found={ ...s.val(), deviceId:s.key }; });
+      if(found){ await db.ref(`deviceKeys/${found.deviceId}`).update({ keyHash, key: null }); }
+    }
     if(!found||!found.active) return res.status(401).json({error:"invalid device key"});
+
+    // Rate limit: at most 60 pushes per device per minute (a stolen key cannot flood the school).
+    const bucket = Math.floor(Date.now()/60000);
+    const rateRef = db.ref(`deviceKeys/${found.deviceId}/rate`);
+    const rate = await rateRef.transaction(cur => (cur && cur.bucket===bucket) ? { bucket, count: cur.count+1 } : { bucket, count: 1 });
+    if(rate.snapshot.val()?.count > 60) return res.status(429).json({error:"too many clock-ins from this device, slow down"});
     const schoolId=found.schoolId;
     const body = req.body && typeof req.body==="object" ? req.body : {};
     const staffId = clean(body.staffId,128);
     const kind = clean(body.kind,8)==="out"?"out":"in";
-    const at = Number(body.at);
+    const deviceAt = Number(body.at);
     if(!staffId) return res.status(400).json({error:"staffId is required"});
     const membersSnap = await db.ref(`schools/${schoolId}/members`).get();
     const members = membersSnap.val()||{};
@@ -679,11 +698,12 @@ exports.attendancePush = onRequest({ region: REGION, timeoutSeconds: 30, memory:
       if(m.email && m.email.toLowerCase()===staffId.toLowerCase()){ matched=m; matchedUid=uid; break; }
     }
     if(!matched) return res.status(404).json({error:"staff not found on this device's school"});
-    const dateKey = new Date(isFinite(at)?at:Date.now()); dateKey.setHours(0,0,0,0);
-    const date=dateKey.toISOString().slice(0,10);
-    const nowMs=isFinite(at)?at:Date.now();
+    /* The clock-in time is the server's clock, never the device's: a device cannot backdate itself. */
+    const nowMs = Date.now();
+    const date = schoolDayKey(new Date(nowMs));
+    const deviceClockOk = isFinite(deviceAt) && Math.abs(deviceAt-nowMs) <= 10*60*1000;
     const evRef=db.ref(`schools/${schoolId}/attendance/${date}/byMember/${matchedUid}/events`).push();
-    const evt={ at:nowMs, kind, method:"device", deviceLabel:found.label||"Attendance device", note:clean(body.note,200), via:evRef.key };
+    const evt={ at:nowMs, kind, method:"device", deviceLabel:found.label||"Attendance device", note:clean(body.note,200), via:evRef.key, deviceClockOk };
     await evRef.set(evt);
     await db.ref(`schools/${schoolId}/attendance/${date}/byMember/${matchedUid}/last`).set({...evt});
     /* Let the principal see when this device last sent a clock-in (shown as "last seen"). */
@@ -695,9 +715,10 @@ exports.attendancePush = onRequest({ region: REGION, timeoutSeconds: 30, memory:
   }
 });
 
+function sha256Hex(v){ return crypto.createHash("sha256").update(String(v)).digest("hex"); }
 function genDeviceKey(){ return "cfsk_" + bufToB64(crypto.randomBytes(24)); }
 
-exports.deviceKeyCreate = onCall({ region: REGION, timeoutSeconds: 20, memory: "256MiB" }, async request => {
+exports.deviceKeyCreate = onCall({ region: REGION, enforceAppCheck: APP_CHECK_ENFORCED, timeoutSeconds: 20, memory: "256MiB" }, async request => {
   const caller = requireSignedIn(request);
   const schoolId = clean(request.data?.schoolId, 80);
   const label = clean(request.data?.label, 80) || "Reception scanner";
@@ -706,12 +727,12 @@ exports.deviceKeyCreate = onCall({ region: REGION, timeoutSeconds: 20, memory: "
   const key = genDeviceKey();
   const pushRef = db.ref("deviceKeys").push();
   const rec = { schoolId, label, active:true, createdAt: Date.now(), createdBy: caller.uid, lastSeenAt:null };
-  // The key secret is stored separately; principals see metadata but never the secret again.
-  await pushRef.set({ ...rec, key });
+  // Only the SHA-256 of the key is stored. The key itself is shown once and cannot be recovered.
+  await pushRef.set({ ...rec, keyHash: sha256Hex(key) });
   return { deviceId: pushRef.key, key, label };
 });
 
-exports.deviceKeyRevoke = onCall({ region: REGION, timeoutSeconds: 20, memory: "256MiB" }, async request => {
+exports.deviceKeyRevoke = onCall({ region: REGION, enforceAppCheck: APP_CHECK_ENFORCED, timeoutSeconds: 20, memory: "256MiB" }, async request => {
   const caller = requireSignedIn(request);
   const schoolId = clean(request.data?.schoolId, 80);
   const deviceId = requireId(clean(request.data?.deviceId, 128), "Device");
@@ -724,7 +745,7 @@ exports.deviceKeyRevoke = onCall({ region: REGION, timeoutSeconds: 20, memory: "
   return { ok:true };
 });
 
-exports.deviceKeyList = onCall({ region: REGION, timeoutSeconds: 20, memory: "256MiB" }, async request => {
+exports.deviceKeyList = onCall({ region: REGION, enforceAppCheck: APP_CHECK_ENFORCED, timeoutSeconds: 20, memory: "256MiB" }, async request => {
   const caller = requireSignedIn(request);
   const schoolId = clean(request.data?.schoolId, 80);
   await assertSchoolManager(caller, schoolId);

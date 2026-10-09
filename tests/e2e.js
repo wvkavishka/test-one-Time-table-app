@@ -234,6 +234,45 @@ const failedScreen=html=>/This screen could not open/.test(html);
     check("teacher: canViewUsers is false", T.evalIn("canViewUsers()") === false);
   }
 
+  // 8a1) Dates: one school-day rule (Sri Lanka time). Fixed instants, so this is the same on any machine.
+  {
+    check("school day: 00:15 Colombo on 9 Oct is 9 Oct", T.evalIn('schoolDayKey(new Date("2026-10-08T18:45:00Z"))') === "2026-10-09");
+    check("school day: 23:45 Colombo on 8 Oct is 8 Oct", T.evalIn('schoolDayKey(new Date("2026-10-08T18:15:00Z"))') === "2026-10-08");
+    check("school day: 14:00 Colombo on 9 Oct is 9 Oct (was 8 Oct before the fix)", T.evalIn('schoolDayKey(new Date("2026-10-09T08:30:00Z"))') === "2026-10-09");
+    check("attendance uses the same school day", T.evalIn('ATT.todayKey(new Date("2026-10-09T08:30:00Z"))') === "2026-10-09");
+  }
+
+  // 8a0) Contact number is fixed: a value saved in the database never changes it.
+  {
+    T.evalIn('SiteCfg.data={phone:"+94111222333",whatsapp:"94111222333"}');
+    check("saved phone in the database is ignored", T.evalIn("SiteCfg.phone()") === "072 399 3300" && T.evalIn("SiteCfg.waNumber()") === "94723993300");
+    T.evalIn("SiteCfg.data=null");
+  }
+
+  // 8a00) Database rules, checked from the file: clients cannot write clock-ins; a principal
+  // cannot change another principal's record.
+  {
+    const clean = read('database.rules.json').replace(/\/\*[\s\S]*?\*\//g, '');
+    const rules = JSON.parse(clean).rules;
+    const byMember = rules.schools['$schoolId'].attendance['$date'].byMember['$uid'];
+    check("rules: clients cannot write clock-ins (byMember is read-only)", byMember['.write'] === false);
+    check("rules: clients can still read their own clock-ins", /auth\.uid === \$uid/.test(byMember['.read']));
+    const memberWrite = rules.schools['$schoolId'].members['$memberUid']['.write'];
+    check("rules: a principal cannot overwrite another principal", /!data\.exists\(\) \|\| data\.child\('role'\)\.val\(\) !== 'principal'/.test(memberWrite));
+  }
+
+  // 8a2) A PDF with no text layer (a scan) must explain itself, never show an empty review.
+  {
+    const bytes2 = fs.readFileSync(path.join(__dirname, 'fixtures', 'scanned-no-text.pdf'));
+    w.__scanFile2 = new w.File([bytes2], 'scan.pdf', { type: 'application/pdf' });
+    w.__scanFile2.arrayBuffer = async () => bytes2.buffer.slice(bytes2.byteOffset, bytes2.byteOffset + bytes2.byteLength);
+    await T.evalIn('scanRunDoc(window.__scanFile2, "pdf")');
+    const st2 = T.evalIn('({err:Scan.error||"", step:Scan.step, raw:Scan.rawText||""})');
+    check("scanned PDF with no text: a clear message is shown", /picture|no text|scan/i.test(st2.err), st2.err.slice(0,160));
+    check("scanned PDF with no text: not a silent empty review", st2.err !== "" || st2.step === "capture", JSON.stringify(st2).slice(0,160));
+    T.evalIn('Scan.doc=null; Scan.rawText=""; Scan.grid=null; Scan.error=""');
+  }
+
   // 8b2) Public contact number: 072 399 3300 everywhere; stored old numbers never win.
   {
     check("site phone shows 072 399 3300", T.evalIn("SiteCfg.phone()") === "072 399 3300", T.evalIn("SiteCfg.phone()"));

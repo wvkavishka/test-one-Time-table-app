@@ -25,9 +25,16 @@ const firebaseConfig = {
   appId: "1:167617265914:web:9dffed3f72298a15d80943",
   measurementId: "G-76940M54L3"
 };
+/* App Check proves that requests come from this web app, not from a script.
+   Set this to the reCAPTCHA v3 site key from Firebase console > App Check (it is a public value).
+   Until it is set, App Check stays off and the app works exactly as before. Steps are in AUDIT.md. */
+const APP_CHECK_SITE_KEY = "";
 let FB = { ready:false, auth:null, db:null, functions:null };
 try {
   firebase.initializeApp(firebaseConfig);
+  if (APP_CHECK_SITE_KEY && firebase.appCheck) {
+    firebase.appCheck().activate(APP_CHECK_SITE_KEY, true);
+  }
   FB.auth = firebase.auth();
   FB.db = firebase.database();
   FB.ready = true;
@@ -48,6 +55,9 @@ const toHHMM = m => String(Math.floor(m/60)).padStart(2,"0")+":"+String(m%60).pa
 const bell = p => toHHMM(BELL_START + p*BELL_STEP);
 const bellEnd = p => toHHMM(BELL_START + p*BELL_STEP + 45);
 const initials = name => (name||"").trim().split(/\s+/).slice(0,2).map(w=>w[0]).join("").toUpperCase() || "??";
+/* The school day, in Sri Lanka time (UTC+5:30, no daylight saving). Attendance, relief and
+   absences all use this, and the server uses the same rule, so the dates always agree. */
+const schoolDayKey = (d=new Date()) => new Intl.DateTimeFormat("en-CA",{timeZone:"Asia/Colombo",year:"numeric",month:"2-digit",day:"2-digit"}).format(d);
 const localISO = (d=new Date()) => { const o=d.getTimezoneOffset(); return new Date(d.getTime()-o*60000).toISOString().slice(0,10); };
 const fmtDateLong = iso => new Date(iso+"T00:00:00").toLocaleDateString("en-GB",{weekday:"long",day:"numeric",month:"long",year:"numeric"});
 const timeGreet = () => { const h=new Date().getHours(); return h<12?"Good morning":h<17?"Good afternoon":"Good evening"; };
@@ -257,6 +267,9 @@ const intlDigits = v => { let d=String(v||"").replace(/\D/g,""); if(d.startsWith
 const SiteCfg = {
   data: safeStore.jsonGet("cf.siteConfig",null),
   val(k){
+    /* The public phone and WhatsApp number are fixed in the code: a value saved in the
+       database never changes them (the settings form shows them read-only). */
+    if (k==="phone"||k==="whatsapp") return SITE_DEFAULTS[k];
     const v=this.data?.[k];
     if (v===undefined||v===null||v==="") return SITE_DEFAULTS[k];
     /* Retired school number: an old saved value must never override the current default. */
@@ -586,7 +599,7 @@ function reliefAutoAbsent(iso, attDay){
   const byMember = attDay.byMember||{};
   const dayIdx = dayIndexFor(iso);
   if(dayIdx<0) return { autoIds:[], forcedPresent:new Set(), forcedAbsent:new Set() };
-  const now = new Date(); const todayKey = now.toISOString().slice(0,10);
+  const now = new Date(); const todayKey = schoolDayKey(now);
   if(iso !== todayKey) return { autoIds:[], forcedPresent:new Set(), forcedAbsent:new Set() }; // auto only runs for today
   const minutesNow = now.getHours()*60 + now.getMinutes();
   const autoIds=[];
@@ -1899,7 +1912,7 @@ let _reliefAttRef=null, _reliefAttDay=null;
 function reliefStopListen(){ if(_reliefAttRef){ _reliefAttRef.off("value"); _reliefAttRef=null; } _reliefAttDay=null; }
 async function reliefSubscribeToday(iso){
   if(!Session.schoolId || !FB.ready){ reliefStopListen(); return null; }
-  const now=new Date(); now.setHours(0,0,0,0); const today=now.toISOString().slice(0,10);
+  const today=schoolDayKey();
   /* The database only lets principals, admins and team viewers read the whole day.
      Anyone else would get permission_denied, so they never subscribe to it. */
   if(iso!==today || !canReadDayAttendance()){ reliefStopListen(); return null; }
@@ -1959,7 +1972,7 @@ function renderRelief(){
   const uncovered=affected.filter(s=>!abs.relief[s.classId+"|"+s.p+"|"+s.li]).length;
   const waText=buildWhatsApp(iso);
   const waHref="https://wa.me/?text="+encodeURIComponent(waText);
-  const now=new Date(); now.setHours(0,0,0,0); const todayKey=now.toISOString().slice(0,10);
+  const todayKey=schoolDayKey();
   const isToday = iso===todayKey;
   const autoCount=[...autoSet].filter(id=>slotsOfTeacherOn(id,dayIdx).length).length;
   const manualCount=manualSet.size;
@@ -2563,9 +2576,9 @@ function openSiteEditor(){
       <div class="space-y-4 mt-5">
         <div class="grid sm:grid-cols-2 gap-3">
           <div><label class="label">Call number (public)</label>
-            <input class="field font-mono" id="se-phone" value="${esc(d("phone")||SiteCfg.val("phone"))}" placeholder="072 399 3300"></div>
+            <input class="field font-mono" id="se-phone" readonly title="Fixed contact number" value="${esc(SiteCfg.val("phone"))}" placeholder="072 399 3300"></div>
           <div><label class="label">WhatsApp number (with country code, digits only)</label>
-            <input class="field font-mono" id="se-whatsapp" value="${esc(d("whatsapp")||SiteCfg.waNumber())}" placeholder="94723993300"></div>
+            <input class="field font-mono" id="se-whatsapp" readonly title="Fixed contact number" value="${esc(SiteCfg.waNumber())}" placeholder="94723993300"></div>
         </div>
         <div><label class="label">WhatsApp prefilled message</label>
           <input class="field" id="se-wamsg" value="${esc(d("waMsg")||SiteCfg.val("waMsg"))}"></div>
@@ -5278,7 +5291,7 @@ function findListenAttendance(){
   if(_findAttUnsub) return;
   state._attendance = state._attendance || {};
   const today = new Date(); today.setHours(0,0,0,0);
-  const keys=[]; for(let i=0;i<14;i++){ const d=new Date(today); d.setDate(today.getDate()-i); keys.push(d.toISOString().slice(0,10)); }
+  const keys=[]; for(let i=0;i<14;i++){ keys.push(schoolDayKey(new Date(Date.now()-i*86400000))); }
   const refs = keys.map(k=>FB.db.ref(`schools/${Session.schoolId}/attendance/${k}`));
   const onVal = snap=>{ if(window.Find){ Find.refresh(); if(Store.raw.ui.route==="find" && !document.getElementById("find-q")?.matches(":focus")) renderFindResults(); } };
   refs.forEach(r=>r.on("value", snap=>{ state._attendance[snap.key]=snap.val()||null; onVal(); }));
@@ -8306,8 +8319,6 @@ async function handleForm(form){
       if(title&&text) features.push({title,text});
     }
     const payload={
-      phone:      $("#se-phone",form).value.trim().slice(0,30)||undefined,
-      whatsapp:   $("#se-whatsapp",form).value.replace(/\D/g,"").slice(0,16)||undefined,
       waMsg:      $("#se-wamsg",form).value.trim().slice(0,200)||undefined,
       heroTitle:  $("#se-title",form).value.trim().slice(0,140)||undefined,
       heroSubtitle:$("#se-sub",form).value.trim().slice(0,320)||undefined,
