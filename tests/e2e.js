@@ -68,6 +68,13 @@ const failedScreen=html=>/This screen could not open/.test(html);
   await sleep(50);
   T.seed();
 
+  // 0) public landing page (what clients see before signing in)
+  try{ T.evalIn("showLogin()"); }catch(e){ check("landing page renders", false, e.message); }
+  const landingText=(doc.getElementById("login-root")?.textContent||"").replace(/\s+/g," ");
+  for(const phrase of ["Fingerprint attendance","Find anything, instantly","Your school's look","Relief in one tap","Works without internet","Sinhala","Auto-generated timetables","The principal controls access"]){
+    check("landing shows: "+phrase, landingText.includes(phrase));
+  }
+
   // 1) every route, every role
   const summary={};
   for(const role of ["principal","admin","teacher","staff"]){

@@ -5778,7 +5778,7 @@ function showLogin(errBanner=""){
         <div class="lp-wrap">
           <div class="lp-reveal"><div class="lp-kicker">Features</div>
           <h2 class="lp-h2">Everything a school day needs, in one place.</h2>
-          <p class="lp-lead">Built with how Sri Lankan schools already run: term timetables, relief for absent teachers, and printed class plans.</p></div>
+          <p class="lp-lead">Fingerprint attendance, one search box for the whole school, your own colours and logo, relief for absent teachers and printed class plans, in one app that works offline.</p></div>
           <div class="lp-feat">
             <article class="lp-tile big lp-reveal">
               <div class="lp-ico"><i class="ph-fill ph-calendar-check"></i></div>
@@ -5786,15 +5786,33 @@ function showLogin(errBanner=""){
               <p>Clash-free schedules built from your teachers and subjects. Conflicts are flagged before they happen, not on the morning of.</p>
               <div class="lp-viz"><div class="lp-grid7" style="grid-template-columns:44px repeat(5,1fr)">
                 <div></div><div>Mon</div><div>Tue</div><div>Wed</div><div>Thu</div><div>Fri</div>
-                <div style="align-self:center">P1</div><div class="c" style="background:#059669">Maths</div><div class="c" style="background:#0f766e">Sci</div><div class="c" style="background:#059669">Maths</div><div class="c" style="background:#10b981">Sinh</div><div class="c" style="background:#0f766e">Sci</div>
+                <div style="align-self:center">P1</div><div class="c" style="background:#059669">Maths</div><div class="c" style="background:#0f766e">Sci</div><div class="c" style="background:#059669">Maths</div><div class="c" style="background:#0f766e">Sci</div><div class="c" style="background:#10b981">Sinh</div>
                 <div style="align-self:center">P2</div><div class="c" style="background:#10b981">Sinh</div><div class="c" style="background:#059669">Maths</div><div class="c" style="background:#0f766e">Sci</div><div class="c" style="background:#059669">Maths</div><div class="c" style="background:#10b981">Sinh</div>
               </div></div>
             </article>
             <article class="lp-tile lp-reveal">
+              <div class="lp-ico"><i class="ph-fill ph-fingerprint"></i></div>
+              <h3>Fingerprint attendance</h3>
+              <p>Teachers clock in with their phone's fingerprint or face. The browser never sees the fingerprint. Missing teachers show up on the dashboard live.</p>
+              <div class="lp-viz"><div class="lp-chips"><span>Nimal · in 07:42</span><span>Kamala · not yet</span></div></div>
+            </article>
+            <article class="lp-tile lp-reveal">
+              <div class="lp-ico"><i class="ph-fill ph-magnifying-glass"></i></div>
+              <h3>Find anything, instantly</h3>
+              <p>One search box for teachers, classes, lessons, attendance and your linked Google Sheets. Ask a question and get an answer that cites its source.</p>
+              <div class="lp-viz"><div class="lp-chips"><span>Who is free period 3?</span><span>Kamala Silva, Science</span></div></div>
+            </article>
+            <article class="lp-tile lp-reveal">
               <div class="lp-ico"><i class="ph-fill ph-user-switch"></i></div>
               <h3>Relief in one tap</h3>
-              <p>A teacher is absent. CampusFlow finds the best-matched free teacher for that subject and grade.</p>
+              <p>A teacher is absent. CampusFlow finds the best-matched free teacher for that subject and grade, and fills in absences from fingerprint data.</p>
               <div class="lp-viz"><div class="lp-chips"><span>Free this period ✓</span><span>Teaches this subject ✓</span></div></div>
+            </article>
+            <article class="lp-tile lp-reveal">
+              <div class="lp-ico"><i class="ph-fill ph-palette"></i></div>
+              <h3>Your school's look</h3>
+              <p>Your logo and colours appear for every teacher and staff member the moment they sign in. The principal can let admins change them.</p>
+              <div class="lp-viz"><div class="lp-chips"><span style="background:#059669;color:#fff">Green</span><span style="background:#4f46e5;color:#fff">Indigo</span><span style="background:#e11d48;color:#fff">Rose</span></div></div>
             </article>
             <article class="lp-tile lp-reveal">
               <div class="lp-ico"><i class="ph-fill ph-cloud-slash"></i></div>
@@ -5817,9 +5835,10 @@ function showLogin(errBanner=""){
             <article class="lp-dark lp-reveal lp-tile-dark" style="grid-column:auto">
               <div class="lp-ico"><i class="ph-fill ph-shield-check"></i></div>
               <h3>The principal controls access</h3>
-              <p>Set who can edit, who only views, and what each staff role can change.</p>
+              <p>Set who can edit, who only views, who can change the school's look, and what each staff role can change.</p>
               <div class="lp-toggle">Edit timetable <i></i></div>
               <div class="lp-toggle">View team directory <i></i></div>
+              <div class="lp-toggle">Change school look <i></i></div>
               <div class="lp-toggle">Change grades <i class="off"></i></div>
             </article>
           </div>
