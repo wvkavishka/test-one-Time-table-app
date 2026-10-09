@@ -4036,13 +4036,78 @@ const scanMatchSubject = txt => scanBestMatch(txt,state.subjects,s=>[s.name,s.co
 const scanMatchTeacher = txt => scanBestMatch(txt,state.teachers,t=>[t.name,t.code,initials(t.name)]);
 
 /* ---------- OCR engines ---------- */
-async function scanOcrLocal(canvas,onProgress){
-  const worker=await ensureOcrWorker(Scan.langs||"eng");
+async function scanOcrLocal(canvas,onProgress,langs){
+  const worker=await ensureOcrWorker(langs||Scan.langs||"eng");
   if(onProgress) worker._onProgress=onProgress;
   const res=await worker.recognize(canvas);
   const data=res?.data||{};
-  return { text:data.text||"", conf:(data.confidence||0)/100, words:ocrWords(data) };
+  return { text:data.text||"", conf:(data.confidence||0)/100, words:ocrWords(data), langs:langs||Scan.langs||"eng" };
 }
+const SCAN_LANG_LABEL={"eng":"English","eng+sin":"English + Sinhala","eng+tam":"English + Tamil","eng+sin+tam":"English + Sinhala + Tamil"};
+const scanLangLabel=id=>SCAN_LANG_LABEL[id]||id;
+/* A Sinhala scan handed to the English engine reads as an empty page — and the
+   person watching has no way to know why. So: try what they chose, and if that
+   produces nothing useful, try every pack once before admitting defeat. The
+   retry is skipped on a device that is already slow — there, one honest pass
+   and a clear message beat two slow ones. */
+/* Which of two readings of the same page is the better one? More lessons is
+   usually more, but a reading that leaves a whole DAY empty is worse for a
+   school than one that fills every day and misses a few cells — those are the
+   days someone would have to type in from scratch. So a clear margin in lessons
+   wins, otherwise the reading that covers more days does. */
+function scanReadingScore(res){
+  if(!res) return {lessons:0,days:0,conf:0,chars:0};
+  /* Candidates arrive in two shapes: OCR passes decorated by scanLessonsIn
+     (_lessons/_grid) and PDF page candidates that carry matched/grid. Both must
+     be scored the same way, or every candidate looks like zero lessons and the
+     best-reading comparison silently degrades into "highest confidence". */
+  const lessons=res._lessons!=null?res._lessons:(res.matched||0);
+  let days=0;
+  const grid=res._grid||res.grid;
+  if(grid&&grid.length){
+    const cols=grid[0]?grid[0].length:0;
+    for(let d=0;d<cols;d++) if(grid.some(row=>row[d]&&row[d].subjectId)) days++;
+  }
+  return {lessons,days,conf:res.conf||0,chars:res.chars||0};
+}
+function scanBetterReading(a,b){
+  const A=scanReadingScore(a), B=scanReadingScore(b);
+  if(!a) return b;
+  if(!b) return a;
+  if(A.lessons>B.lessons*1.25) return a;
+  if(B.lessons>A.lessons*1.25) return b;
+  if(A.days!==B.days) return A.days>B.days?a:b;
+  if(A.lessons!==B.lessons) return A.lessons>B.lessons?a:b;
+  return A.conf>=B.conf?a:b;
+}
+async function scanOcrSmart(canvas,onProgress){
+  const chosen=Scan.langs||"eng";
+  const passes=[chosen];
+  /* The retry is decided by the RESULT, not by how fast the device is: a page
+     that produced nothing at all is worth one more pass even on a slow phone —
+     that is the difference between "it worked" and "it read nothing". A page
+     that already yielded lessons never pays for a second pass. */
+  if(chosen!=="eng+sin+tam"&&Scan.engine!=="ai") passes.push("eng+sin+tam");
+  let best=null;
+  for(let i=0;i<passes.length;i++){
+    const langs=passes[i];
+    if(i) { Scan.status="Nothing matched with "+scanLangLabel(passes[0])+" — trying every language pack…"; Scan.progress=Math.min(88,Scan.progress||30); Store.requestRender(); }
+    let res;
+    try{ res=await scanOcrLocal(canvas,onProgress,langs); }
+    catch(err){ if(i) continue; throw err; }
+    res._lessons=res._lessons||0;
+    if(Scan.mode==="timetable") scanLessonsIn(res);
+    best=scanBetterReading(res,best);
+    if((best._lessons||0)>=4) break;      /* it is reading real lessons: enough */
+  }
+  if(best&&best.langs&&best.langs!==chosen){ Scan.langsUsed=best.langs; Scan.langsAuto=true; }
+  else if(best) { Scan.langsUsed=best.langs||chosen; Scan.langsAuto=false; }
+  return best;
+}
+/* CamScanner, Adobe Scan, Genius Scan and friends leave a grey frame, a spine
+   shadow and a watermark on the page. Cropping to the ink before any repair
+   gives the geometry real edges to work with — the border otherwise votes
+   itself in as a row and a column. */
 /* Gemini model identifier lives in configuration, not buried in request code. Google
    retires model versions on a schedule (2.0 Flash shut down June 2026), so the app asks
    the key holder to confirm the model name instead of promising one forever. */
@@ -4242,8 +4307,16 @@ async function scanPdfOcr(){
   if(!d||!d.pdfDoc) return null;
   if(!scanCapability().ocr)
     throw new Error("That PDF is a scan — it is a picture, and this device can't read pictures. Upload the timetable as Excel or CSV instead, or use a PDF where the text can be selected.");
-  const total=Math.min(3,d.numPages);
+  const total=Math.min(6,d.numPages);
   let best=null;
+  /* Which repairs worked on the first page — reused on the rest, and which
+     language pack actually read the page (so the others are not tried again). */
+  const pageWinners=[];
+  const perPage=[];
+  /* A CamScanner file, or an export from an old program, says nothing in its
+     text layer except its own watermark — the pages are then read as pictures,
+     with the layout recovered from positions exactly like a photo. Six pages
+     covers a stack of class sheets without turning a huge file into a wait. */
   for(let n=1;n<=total;n++){
     Scan.status=`That PDF is a scan — reading page ${n} of ${total} as a picture…`;
     Scan.progress=Math.min(78,40+n*(36/total)); Store.requestRender();
@@ -4257,33 +4330,46 @@ async function scanPdfOcr(){
          faint scan often yields more text and less truth. */
       const built=scanBuildVariants(page);
       Scan.prepDataUrl=built.preview.toDataURL("image/jpeg",0.7);
-      const tries=[{label:"original",canvas:page},built.variants[2],built.variants[1],built.variants[0]];
+      /* Page one is searched properly. Later pages reuse what won on page one —
+         the same scanner, the same light, the same sheet — so a stack of class
+         timetables costs seconds per page instead of minutes. */
+      const all=[{label:"original",canvas:page},built.variants[2],built.variants[1],built.variants[0]];
+      const tries=pageWinners.length
+        ? all.filter(v=>v&&pageWinners.includes(v.label)).concat(all.filter(v=>v&&!pageWinners.includes(v.label)).slice(0,1))
+        : all;
+      if(pageWinners.length&&!tries.length) { /* nothing left to try */ }
       for(const v of tries){
         if(!v||!v.canvas) continue;
-        Scan.status=`Reading page ${n} of ${total} as a picture (${v.label})…`;
+        Scan.status=total>1?`Reading page ${n} of ${total} as a picture (${v.label})…`:`Reading the scan as a picture (${v.label})…`;
         Store.requestRender();
-        const res=await scanOcrLocal(v.canvas,()=>{});
+        const res=await scanOcrSmart(v.canvas,()=>{});
         const w=Scanner.cleanOcrWords(res.words||[]).filter(x=>x.text);
         if(w.length<6) continue;
         const grid=Scanner.buildGridFromBoxes(w,{});
         const model=grid?Scanner.interpretGrid(grid,{daysPerWeek:state.settings.daysPerWeek}):null;
         const out=model&&model.recognised?Scanner.gridToTimetable(model,scanCtx()):null;
-        const cand={ kind:"ocr", page:n, words:w, text:res.text||"", grid, conf:res.conf,
+        const cand={ kind:"ocr", via:v.label, page:n, words:w, text:res.text||"", grid, conf:res.conf,
+          langs:res.langs||Scan.langs, script:Scanner.scriptOf(res.text||""),
           matched:out?out.report.matched:0, chars:w.reduce((a,x)=>a+x.text.length,0) };
-        if(!here||cand.matched>here.matched||(cand.matched===here.matched&&cand.chars>here.chars)) here=cand;
-        if(here.matched>=15) break;
+        here=Scan.mode==="timetable"?scanBetterReading(cand,here)
+          :(!here||cand.matched>here.matched||(cand.matched===here.matched&&cand.chars>here.chars)?cand:here);
+        if(here.matched>=15) { if(!pageWinners.includes(v.label)) pageWinners.push(v.label); break; }
       }
+      if(here&&!pageWinners.length) pageWinners.push(here.via||"original");
     }catch(err){ if(n===1) throw err; continue; }
     if(!here) continue;
+    perPage.push(here);
     if(!best||here.matched>best.matched||(here.matched===best.matched&&here.chars>best.chars)) best=here;
   }
+  if(best&&best.langs){ Scan.langsUsed=best.langs; Scan.langsAuto=best.langs!==(Scan.langs||"eng"); }
+  if(best) best.pages=perPage;
   return best;
 }
 /* The grid currently selected in the review step (a sheet or a PDF page). */
 function scanPickedGrid(){
   const d=Scan.doc; if(!d) return null;
   if(d.kind==="sheet") return (d.sheets[d.sheetIndex||0]||d.sheets[0]||{}).grid||null;
-  if(d.kind==="pdf"){ const p=d.pages.find(x=>x.page===d.page)||d.pages[0]; return p?p.grid:null; }
+  if(d.kind==="pdf"){ const p=d.pages.find(x=>x.page===d.page)||d.pages[0]; return p?(p.grid||null):null; }
   if(d.kind==="ocr") return d.grid||null;
   return null;
 }
@@ -4318,6 +4404,87 @@ function scanBlankGrid(){
 }
 /* Re-read the loaded document through the chosen mode. Used on import and also
    when the user switches sheet or page in the review step. */
+/* The OCR result becomes the same shape as a text-layer PDF: one entry per page,
+   each with the page's own grid, words and text. That way the page picker, the
+   per-page class detection and the "import all" button all work on a stack of
+   scans exactly as they do on a stack of sheets. */
+function scanDocFromOcr(ocr, base){
+  const pages=(ocr.pages&&ocr.pages.length?ocr.pages:[ocr]).map(p=>({
+    page:p.page, words:p.words, text:p.text, grid:p.grid,
+    matched:p.matched||0, conf:p.conf, langs:p.langs, script:p.script, via:p.via,
+    chars:(p.words||[]).reduce((a,w)=>a+w.text.length,0)
+  }));
+  return {
+    kind:"pdf", scanned:true, name:base&&base.name, numPages:base&&base.numPages,
+    pages, page:(ocr.page||pages[0]&&pages[0].page||1),
+    grid:ocr.grid, words:ocr.words, text:ocr.text
+  };
+}
+/* A page usually says which class it belongs to: "Grade 6A", "Class: 9C",
+   "ශ්‍රේණිය 8", "தரம் 7 · பிரிவு B". Reading that off saves the person from
+   importing a stack of scans one page at a time. */
+const SCAN_CLASS_RE=[
+  /* A number is required. "Class Timetable" is the NAME of a document, not a
+     class, and the first version of this happily read a whole file as "Class T". */
+  /grade\s*([0-9]{1,2})\s*[-–]?\s*([A-Za-z])?/i,
+  /(?:class|form|std|standard|section)\s*[:.\-]?\s*([0-9]{1,2})\s*[-–]?\s*([A-Za-z])?/i,
+  /([0-9]{1,2})\s*[-–]\s*([A-Z])\b/,                                 /* "10 - B" */
+  /ශ්‍රේණිය\s*([0-9]{1,2})/u,
+  /පන්තිය\s*([0-9]{1,2})/u,
+  /(?:தரம்|வகுப்பு)\s*([0-9]{1,2})/u
+];
+function scanClassLabel(text){
+  const t=Scanner.squash(text||"");
+  if(!t) return "";
+  for(const re of SCAN_CLASS_RE){
+    const m=t.match(re);
+    if(m) return Scanner.squash(m[0]).replace(/^class\s*[:.\-]?/i,"Class ").slice(0,40);
+  }
+  return "";
+}
+/* Which existing class does this label mean? "Grade 10B", "10B" and "10 B" are
+   the same class; if none matches, the page gets a new class named by its label. */
+function scanClassFor(label){
+  const want=scanNorm(label); if(!want) return null;
+  /* "Grade 6A" and "Grade 8A" are one character apart, so a plain similarity
+     check happily merges two different grades. Whatever else differs, the number
+     must be the same number. */
+  const numOf=t=>((String(t||"").match(/[0-9]{1,2}/)||[""])[0]);
+  const wantNum=numOf(label);
+  let best=null,score=0;
+  state.classes.forEach(c=>{
+    if(wantNum&&numOf(c.name)&&numOf(c.name)!==wantNum) return;
+    const keys=[c.name,scanNorm(c.name).replace(/^grade/,""),(c.name.match(/[0-9]+\s*[A-Za-z]?/)||[""])[0]];
+    keys.filter(Boolean).forEach(k=>{ const sc=scanSimilar(label,k); if(sc>score){score=sc;best=c;} });
+  });
+  return score>=.72?best:null;
+}
+function scanPageText(page){
+  if(!page) return "";
+  if(page.boxes&&page.boxes.length) return page.boxes.map(b=>b.text).join(" ");
+  if(page.words&&page.words.length) return page.words.map(w=>w.text).join(" ");
+  return page.text||"";
+}
+/* Read every page that holds a timetable and work out its class, so a file of
+   class sheets can be imported in one go. */
+function scanAnalysePages(){
+  const d=Scan.doc; if(!d) return;
+  const pages=d.kind==="pdf"?d.pages:(d.kind==="ocr"?[d]:[]);
+  d.analysis=(pages||[]).map((p,i)=>{
+    const text=scanPageText(p).slice(0,600);
+    const grid=p.grid||null;
+    const model=grid?Scanner.interpretGrid(grid,{daysPerWeek:state.settings.daysPerWeek}):null;
+    const out=model&&model.recognised?Scanner.gridToTimetable(model,scanCtx()):null;
+    if(out){ p.out=out; p.grid=grid; }
+    const label=scanClassLabel(text)||scanClassLabel(d.name||"")||"";
+    const cls=label?scanClassFor(label):null;
+    return { page:p.page||i+1, label, classId:cls?cls.id:null, className:cls?cls.name:(label||""),
+      matched:out?out.report.matched:0, filled:p.grid?(p.grid.cells||[]).reduce((a,r)=>a+r.filter(c=>c&&c.trim()).length,0):0,
+      needsOcr:!!p.needsOcr };
+  });
+  d.classPages=d.analysis.filter(a=>a.matched>0||a.filled>=4);
+  d.multi=d.classPages.length>1;
+}
 function scanConvert(){
   Scan.rows=[]; Scan.grid=null; Scan.report=null;
   if(Scan.mode==="teachers"){ Scan.rawText=scanDocLines()||""; Scan.rows=scanParseTeachers(Scan.rawText); return; }
@@ -4359,28 +4526,73 @@ async function scanRun(file){
 }
 async function scanRunDoc(file,kind){
   Scan.busy=true; Scan.error=""; Scan.progress=3; Scan.step="processing";
+  Scan.langsUsed=""; Scan.langsAuto=false; Scan.docNote="";
   Scan.doc=null; Scan.docName=file.name||"file"; Scan.page=1; Scan.sheetIndex=0;
   Scan.rows=[]; Scan.grid=null; Scan.report=null; Scan.rawText=""; Scan.prepDataUrl="";
   Scan.status=kind==="sheet"?"Reading the spreadsheet…":"Reading the PDF…";
   Store.requestRender();
   try{
     Scan.doc=await scanLoadDoc(file,kind);
-    if(kind==="pdf"&&Scan.doc.needsOcr){
-      const ocr=await scanPdfOcr();
-      if(ocr){
-        Scan.doc.kind="ocr"; Scan.doc.page=ocr.page; Scan.doc.grid=ocr.grid;
-        Scan.doc.words=ocr.words; Scan.doc.text=ocr.text; Scan.confidence=ocr.conf;
-        Scan.usedEngine="ocr";
-      } else {
-        Scan.usedEngine="text";
-        throw new Error("That PDF has no text in it and nothing readable could be found on its pages. Try a clearer scan or upload pictures of the timetable instead.");
+    const cap=scanCapability();
+    if(kind!=="pdf") Scan.usedEngine=kind==="sheet"?"sheet":"text";
+    else if(!Scan.doc.needsOcr) Scan.usedEngine="text";
+    else {
+      /* ---------------------------------------------------------------
+         Reading a PDF is a decision, not a single path. Its own text is exact
+         when the file is well made, but plenty of school PDFs come from programs
+         that cannot store Sinhala or Tamil properly: the letters are missing and
+         the layer looks readable while producing nonsense. So the text read is
+         tried, checked against what it actually achieved, and only then — if it
+         fell short and this device can read pictures — are the pages read as
+         images. Whichever understanding is better is the one kept.
+         --------------------------------------------------------------- */
+      const textDoc=Scan.doc;
+      const noLayer=(textDoc.pages||[]).every(p=>p.chars<24);
+      if(!textDoc.needsOcr){
+        Scan.status="Working out the layout…"; Scan.progress=82; Store.requestRender();
+        scanAnalysePages(); scanConvert();
       }
-    } else {
-      Scan.usedEngine=kind==="sheet"?"sheet":"text";
+      const textMatched=(Scan.report&&Scan.report.matched)||0;
+      const textCells=(Scan.report&&Scan.report.cells||[]).length||0;
+      const poorRead=textDoc.needsOcr||(textCells>=6&&textMatched<textCells*0.65);
+      if(textDoc.needsOcr||poorRead){
+        if(!cap.ocr){
+          if(textDoc.needsOcr) throw new Error("That PDF is a picture (it has no text layer) and this device can't read pictures. Upload the timetable as Excel or CSV instead, or use a PDF whose text can be selected.");
+          Scan.docNote="This PDF's text is damaged — the program that made it left letters out — and this device cannot read pictures to make up for it. Upload the timetable as Excel or CSV for a full import.";
+        } else {
+          Scan.status=textDoc.damaged
+            ? "This PDF's letters are damaged — reading the pages as pictures instead…"
+            : (textDoc.needsOcr?"That PDF is a scan — reading its pages as pictures…":"Reading the pages as pictures to check the text…");
+          Scan.progress=40; Store.requestRender();
+          let ocr=null, ocrErr=null;
+          try{ ocr=await scanPdfOcr(); }catch(e){ ocrErr=e; }
+          if(ocr){
+            Scan.doc=scanDocFromOcr(ocr,textDoc);
+            Scan.doc.fromText=textDoc;
+            Scan.confidence=ocr.conf; Scan.usedEngine="ocr";
+            scanAnalysePages(); scanConvert();
+            const ocrMatched=(Scan.report&&Scan.report.matched)||0;
+            if(ocrMatched>textMatched||textDoc.needsOcr){
+              const readPages=(ocr.pages||[]).length;
+              Scan.docNote = noLayer
+                ? "This PDF has no text layer — it is a scan — so "+(readPages>1?readPages+" pages were read":"its page was read")+" as pictures ("+ocrMatched+" lesson(s) recognised)."
+                : "This PDF's own text is damaged: the program that made the file could not store all its letters"+(textCells?(", and only "+textMatched+" of "+textCells+" readable cells matched your subjects"):"")+". Its pages were read as pictures instead and gave "+ocrMatched+" lesson(s).";
+            } else {
+              Scan.doc=textDoc; scanAnalysePages(); scanConvert();
+              Scan.docNote="This PDF's text is damaged (the file itself is missing letters). Reading the pages as pictures did not do better, so the text version is shown — check the grid below, or upload the timetable as Excel or CSV.";
+              Scan.usedEngine="text";
+            }
+          } else {
+            if(textDoc.needsOcr) throw new Error("That PDF has no text in it and nothing readable could be found on its pages. "+(ocrErr&&ocrErr.message?ocrErr.message+" ":"" )+"Try a clearer scan, or upload the timetable as Excel or CSV.");
+            Scan.docNote="This PDF's text is damaged and its pages could not be read as pictures either ("+(ocrErr&&ocrErr.message||"no text found")+"). Upload the timetable as Excel or CSV for a full import.";
+            Scan.usedEngine="text";
+          }
+        }
+        Scan.status="Working out the layout…"; Scan.progress=88; Store.requestRender();
+        await new Promise(r=>setTimeout(r,16));
+        scanAnalysePages(); scanConvert();
+      }
     }
-    Scan.status="Working out the layout…"; Scan.progress=82; Store.requestRender();
-    await new Promise(r=>setTimeout(r,16));
-    scanConvert();
     Scan.progress=100; Scan.step=(Scan.mode==="text"&&!Scan.rawText.trim())?"capture":"review";
     Scan.status=""; Scan.stats=null;
   }catch(err){
@@ -4409,6 +4621,7 @@ function scanLessonsIn(res){
 async function scanRunPhoto(file){
   Scan.busy=true; Scan.error=""; Scan.progress=2; Scan.step="processing";
   Scan.doc=null; Scan.docName=file.name||"photo"; Scan.report=null;
+  Scan.langsUsed=""; Scan.langsAuto=false; Scan.docNote="";
   Scan.status="Reading the photo…"; Store.requestRender();
   try{
     const cap=scanCapability();
@@ -4439,7 +4652,7 @@ async function scanRunPhoto(file){
         Scan.status=`Reading attempt ${i+1} of ${built.variants.length} (${v.label})…`;
         Store.requestRender();
         let res;
-        try{ res=await scanOcrLocal(v.canvas,p=>{
+        try{ res=await scanOcrSmart(v.canvas,p=>{
           Scan.progress=Math.min(84,22+ (i/built.variants.length)*62 + p*(62/built.variants.length));
           Store.requestRender();
         }); }catch(err){ if(i===0&&built.variants.length===1) throw err; continue; }
@@ -4454,8 +4667,12 @@ async function scanRunPhoto(file){
           score=scanLessonsIn(res)*10 + score;
           bestScore=(best._lessons||0)*10 + bestScore;
         }
-        if(score>bestScore) best=res;
+        if(Scan.mode==="timetable"&&typeof Scanner!=="undefined") best=scanBetterReading(res,best);
+        else if(score>bestScore) best=res;
         if(res.conf>0.86 || (best._lessons||0)>=15) break;   /* already clean / complete */
+        /* If the first repair needed another language pack to read anything at
+           all, the other repairs will not change that. */
+        if(Scan.langsAuto&&i>=1) break;
       }
     }
     if(!best.text.trim()) throw new Error("Nothing readable was found. Try better light, hold straighter, or switch to the AI engine.");
@@ -4595,6 +4812,30 @@ function renderScanner(){
           ? "The number is how many filled cells that sheet has. The busiest sheet is chosen for you."
           : "Pick the page that holds the timetable."}</p>
       </div>`:"";
+    const multi=(src&&src.multi&&src.classPages&&src.classPages.length>1)?`
+      <div class="card p-4 mt-4 rise !border-emerald-200/70 bg-emerald-50/40">
+        <div class="flex items-start gap-3">
+          <i class="ph-fill ph-stack text-emerald-600 text-lg mt-0.5"></i>
+          <div class="flex-1 min-w-0">
+            <div class="text-[13px] font-extrabold text-emerald-900">This file holds ${src.classPages.length} timetables</div>
+            <p class="text-[11px] text-emerald-900/70 leading-relaxed mt-1">Each page was read on its own and the class name printed on the page was picked up. Untick anything you do not want, then import them all in one go — nothing is overwritten without being listed here.</p>
+            <div class="space-y-1.5 mt-2.5">
+              ${src.classPages.map(a=>`<label class="flex items-center gap-2.5 bg-white/70 border border-emerald-200/60 rounded-xl px-2.5 py-2 cursor-pointer">
+                <input type="checkbox" class="sr-only" data-change="scan-class-page" data-page="${a.page}" ${a.include===false?"":"checked"}>
+                <span class="switch !w-9 !h-5"></span>
+                <span class="text-[12px] font-bold text-zinc-700 flex-none">Page ${a.page}</span>
+                <span class="text-[12px] flex-1 min-w-0 truncate">${a.classId||a.label?`<span class="text-emerald-700 font-semibold">${esc(a.className||a.label)}</span>${a.classId?" <span class=\"text-[10px] text-zinc-400\">existing class</span>":` <span class="text-[10px] text-zinc-400">will be created</span>`}`:`<span class="text-zinc-400">no class name on the page</span>`}</span>
+                <span class="chip !text-[10px] flex-none">${a.matched||a.filled} lesson(s)</span>
+              </label>`).join("")}
+            </div>
+            <button class="btn btn-primary mt-3" data-action="scan-apply-all"><i class="ph ph-check"></i>Import all checked</button>
+          </div>
+        </div>
+      </div>`:"";
+
+    const docNote=Scan.docNote?`<div class="text-[11px] text-sky-900/80 bg-sky-50 border border-sky-200/70 rounded-xl p-3 mt-3 leading-relaxed flex items-start gap-2">
+      <i class="ph-fill ph-info text-sky-500 mt-0.5 flex-none"></i><span>${esc(Scan.docNote)}${Scan.langsUsed&&Scan.langsAuto?` <b>Read with the ${esc(scanLangLabel(Scan.langsUsed))} pack</b> — that is what the page turned out to be written in.`:""}</span></div>`:"";
+
     const found=Scan.report&&Scan.mode==="timetable"?(Scan.report.noTimetable
       ? `<div class="text-[11px] text-amber-800 bg-amber-50 border border-amber-200/70 rounded-xl p-3 mt-3 leading-relaxed flex items-start gap-2">
           <i class="ph-fill ph-warning text-amber-500 mt-0.5 flex-none"></i>
@@ -4622,7 +4863,7 @@ function renderScanner(){
         </div></div>`;
     } else if(Scan.mode==="timetable"){
       const days=state.settings.daysPerWeek, periods=state.settings.periodsPerDay;
-      body=head+`
+      body=head+multi+`
       <div class="card p-4 mt-4">
         <label class="label">Import into which class?</label>
         <select class="field w-full sm:!w-auto sm:!min-w-[220px]" data-change="scan-class">
@@ -4630,6 +4871,7 @@ function renderScanner(){
         </select>
         <p class="text-[11px] text-amber-700 bg-amber-50 border border-amber-200/70 rounded-xl p-2.5 mt-3 leading-relaxed">
           Importing <b>replaces that class's whole week</b>. Undo (Ctrl+Z) restores it.</p>
+        ${docNote}
         ${found}
       </div>
       <div class="card overflow-hidden mt-4">
@@ -4773,7 +5015,7 @@ function renderScanner(){
           ${[["eng","English"],["eng+sin","English + සිංහල"],["eng+tam","English + தமிழ்"],["eng+sin+tam","All three"]]
             .map(([id,lbl])=>`<button class="btn ${Scan.langs===id?"btn-soft":"btn-ghost"} !min-h-[38px] !h-9 !px-3 !text-[12px]" data-action="scan-lang" data-lang="${id}">${lbl}</button>`).join("")}
         </div>
-        <p class="text-[11px] text-zinc-400 mt-2 leading-relaxed">Extra languages make reading slower. The packs are stored on this device, so this still works offline.</p>
+        <p class="text-[11px] text-zinc-400 mt-2 leading-relaxed">Extra languages make reading slower. Leave this on English and the app will quietly try the other packs itself if a page turns out to be Sinhala or Tamil — the packs are stored on this device, so even that works offline.</p>
       </div>`:""}
     </div>
 
@@ -6563,6 +6805,52 @@ const actions={
     Scan.prepDataUrl=""; Scan.error=""; Scan.progress=0; Scan.doc=null; Scan.docName="";
     Scan.report=null; Scan.page=1; Scan.sheetIndex=0; Scan.stats=null; Store.requestRender(); },
   "scan-apply": ()=>scanApply(),
+  "scan-class-page": el=>{
+    const page=+el.dataset.page, d=Scan.doc;
+    if(!d||!d.classPages) return;
+    const a=d.classPages.find(x=>x.page===page); if(a) a.include=el.checked;
+  },
+  "scan-apply-all": ()=>{
+    if(!needEdit()) return;
+    const d=Scan.doc; if(!d||!d.classPages||!d.classPages.length) return;
+    const chosen=d.classPages.filter(a=>a.include!==false);
+    if(!chosen.length){ toast("info","Nothing selected","Tick at least one page to import."); return; }
+    let created=0, filled=0, classes=0, locked=0;
+    chosen.forEach(a=>{
+      const page=d.kind==="pdf"?(d.pages||[]).find(p=>p.page===a.page):d;
+      if(!page||!page.out) return;
+      let cid=a.classId;
+      if(cid&&classLocked(cid)){ locked++; return; }
+      if(!cid){
+        const name=a.label||((d.name||"Scan").replace(/\.[a-z0-9]+$/i,"")+" — page "+a.page);
+        const fresh={id:uid("c"),name,color:PALETTE[state.classes.length%PALETTE.length]};
+        state.classes=[...state.classes,fresh]; cid=fresh.id; created++;
+      }
+      /* A scan comes back as period × day; the app stores day × period. */
+      const out=page.out, grid=out.grid;
+      const needDays=Math.max(state.settings.daysPerWeek,grid[0]?grid[0].length:0);
+      const needPeriods=Math.max(state.settings.periodsPerDay,grid.length);
+      if(needDays>state.settings.daysPerWeek||needPeriods>state.settings.periodsPerDay){
+        state.settings=Object.assign({},state.settings,{daysPerWeek:needDays,periodsPerDay:needPeriods});
+      }
+      const g=blankGrid();
+      grid.forEach((row,p)=>row.forEach((cell,dd)=>{
+        if(!cell||!cell.subjectId) return;
+        if(dd<state.settings.daysPerWeek&&p<state.settings.periodsPerDay){
+          g[dd][p]=[{subjectId:cell.subjectId,teacherId:cell.teacherId||null}];
+        }
+      }));
+      state.timetable[cid]=g;
+      filled+=out.report.matched; classes++;
+    });
+    if(!classes){ toast("error","Nothing was imported",locked?"Those classes are locked.":"No readable timetable was found on the selected pages."); return; }
+    toast("success","Timetables imported",
+      classes+" class timetable(s) written — "+filled+" lesson(s)"+
+      (created?", "+created+" new class(es) created":"")+(locked?", "+locked+" locked class(es) skipped":"")+".");
+    Scan.step="capture"; Scan.doc=null; Scan.grid=null; Scan.report=null; Scan.docNote="";
+    Store.requestRender();
+  },
+
   "scan-all": el=>{ const on=el.dataset.on==="1"; Scan.rows.forEach(r=>r.include=on); Store.requestRender(); },
   "scan-copy": async ()=>{
     try{ await navigator.clipboard.writeText(Scan.rawText); toast("success","Copied","The text is on your clipboard."); }

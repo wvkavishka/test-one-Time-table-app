@@ -40,10 +40,48 @@
 
   /* ------------------------------------------------------------------ text */
   const str = v => (v == null ? "" : String(v));
-  /* Zero-width joiners and bidi marks are invisible but break Sinhala/Tamil
-     comparisons, so they are stripped before any matching happens. */
-  const stripInvisible = s => s.replace(/[\u200b-\u200f\u202a-\u202e\ufeff]/g, "");
+  /* Characters that are invisible, or that a PDF hands back when its font has no
+     proper Unicode mapping: NUL, other C0 controls, the replacement character,
+     soft hyphen, and the bidi/zero-width marks. Zero-width joiner and
+     non-joiner are deliberately KEPT — Sinhala and Tamil need them to render
+     ("ප්‍රනාන්දු"), so they are removed only when comparing, never when showing.
+     Applied on the way in (squash) and on the way out (matchKey), so a text
+     layer full of NULs still reads and still displays as something sensible. */
+  const BROKEN = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\ufffd\u00ad]/g;
+  const INVISIBLE = /[\u200b\u200e\u200f\u202a-\u202e\u2060\ufeff]/g;
+  const stripInvisible = s => str(s).replace(BROKEN, "").replace(INVISIBLE, "");
   const squash = v => stripInvisible(str(v)).normalize("NFKC").replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
+  /* A comparison key that survives what OCR and old PDF fonts do to text:
+     joiner marks dropped, NFKC-normalised, whitespace collapsed. */
+  const matchKey = v => squash(v).replace(/[\u200c\u200d]/g, "");
+  /* The same key with every separator removed — PDF text layers love to split a
+     word into pieces ("සඳු" + "දා"), so the tight key is how those come back
+     together for matching. */
+  const tightKey = v => matchKey(v).replace(/[\s.·:;,\-–—_/|'"]+/g, "");
+  /* Scanner watermarks are printed ON the page, so they arrive as real words
+     ("Scanned by CamScanner"). They must never become lessons. */
+  const WATERMARK = /(?:scanned\s*by\s*)?cam\s*scanner|adobe\s*scan|microsoft\s*lens|genius\s*scan|scanbot|doc\s*scan|scan\s*pro\b/i;
+  const BRANDS = ["camscanner", "adobescan", "microsoftlens", "geniusscan", "scanbot", "docscan"];
+  /* OCR does not spell "CamScanner" reliably — it comes back as "Carmcanner",
+     "CamScarmer", "CarnScanner". So the test is on letters only, and a near
+     miss of a known scanner brand still counts as a watermark. */
+  function isWatermarkText(text) {
+    const t = squash(text);
+    if (!t) return false;
+    if (WATERMARK.test(t)) return true;
+    if (/scanned\s*by/i.test(t)) return true;
+    const letters = t.toLowerCase().replace(/[^a-z]/g, "");
+    if (letters.length < 6) return false;
+    for (const b of BRANDS) {
+      if (letters === b) return true;
+      if (Math.abs(letters.length - b.length) <= 3 && editDistance(letters, b) <= 2) return true;
+    }
+    return false;
+  }
+  const stripWatermarks = v => {
+    const t = squash(str(v).replace(WATERMARK, " "));
+    return isWatermarkText(t) ? "" : t;
+  };
   const isBlank = v => squash(v).length === 0;
   const collapse = v => str(v).replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
 
@@ -53,6 +91,26 @@
     const m = a.length >> 1;
     return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
   };
+
+  /* Which writing system is this text in? Used to choose an OCR language pack
+     (and to tell the user why a page needed one) without asking them first. */
+  const SCRIPT_RANGES = [
+    ["sinhala", /[\u0d80-\u0dff]/g],
+    ["tamil", /[\u0b80-\u0bff]/g],
+    ["devanagari", /[\u0900-\u097f]/g],
+    ["arabic", /[\u0600-\u06ff]/g]
+  ];
+  function scriptOf(text) {
+    const t = str(text);
+    let best = "", hits = 0;
+    for (const [name, re] of SCRIPT_RANGES) {
+      const n = (t.match(re) || []).length;
+      if (n > hits) { hits = n; best = name; }
+    }
+    const latin = (t.match(/[A-Za-z]/g) || []).length;
+    if (!best) return latin > 2 ? "latin" : "";
+    return latin > hits * 2 ? "latin" : best;
+  }
 
   /* --------------------------------------------------------------- days */
   const DAY_EN = [
@@ -79,12 +137,17 @@
      ("Mon 8:00", "Monday Period 1"), so a prefix/contains match is allowed —
      but only for the day words themselves, never for the whole cell. */
   function dayIndexFromText(text) {
-    const t = stripInvisible(squash(text)).toLowerCase();
+    const t = matchKey(text).toLowerCase();
     if (!t || t.length > 40) return -1;
+    const tight = tightKey(text).toLowerCase();
     for (let d = 0; d < DAY_OTHER.length; d++) {
       for (const w of DAY_OTHER[d]) {
-        const wl = stripInvisible(w).toLowerCase();
+        const wl = matchKey(w).toLowerCase();
+        const wt = tightKey(w).toLowerCase();
+        /* Loose: the day name leads the cell ("මඟුල් සඳුදා", "Mon 8:00"). Tight:
+           the same name with the spaces a broken text layer inserted removed. */
         if (t === wl || t.indexOf(wl) === 0) return d;
+        if (wt && tight && (tight === wt || tight.indexOf(wt) === 0)) return d;
       }
     }
     const tokens = t.split(/[^a-z]+/).filter(Boolean);
@@ -95,7 +158,40 @@
     for (let d = 0; d < DAY_EN.length; d++) {
       for (const w of DAY_EN[d]) if (w.length > 3 && t.indexOf(w) === 0) return d;
     }
+    /* Last resort: a heading the FILE mangled. Old PDF writers drop the letters
+       they cannot map — "බ්‍රහස්පතින්දා" comes back as "බහස්පතින්දා" — so a close
+       spelling still means that day. Only accepted when the best match is clearly
+       better than the runner-up, so "Mon" can never drift into "Thu". */
+    if (tight.length >= 4) {
+      const scored = [];
+      for (let d = 0; d < DAY_OTHER.length; d++) {
+        let best = 0;
+        for (const w of DAY_OTHER[d]) {
+          const wt = tightKey(w).toLowerCase();
+          if (!wt) continue;
+          const s = 1 - editDistance(tight, wt) / Math.max(tight.length, wt.length);
+          if (s > best) best = s;
+        }
+        scored.push({ d, s: best });
+      }
+      scored.sort((a, b) => b.s - a.s);
+      if (scored[0].s >= 0.75 && scored[0].s - (scored[1] ? scored[1].s : 0) >= 0.12) return scored[0].d;
+    }
     return -1;
+  }
+  /* Plain Levenshtein, used only for that last-resort day match. */
+  function editDistance(a, b) {
+    if (a === b) return 0;
+    if (!a.length) return b.length;
+    if (!b.length) return a.length;
+    let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+    for (let i = 1; i <= a.length; i++) {
+      const cur = [i];
+      for (let j = 1; j <= b.length; j++)
+        cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+      prev = cur;
+    }
+    return prev[b.length];
   }
 
   /* -------------------------------------------------------------- periods */
@@ -184,14 +280,24 @@
   const JUNK_ONLY = /^[|\-_–—−=+~:;.,'"’‘“”`^()[\]{}<>/\\*#!?\s\u00a0]+$/;
   const SINGLE_NOISE = /^[lIiJ|]$/;
   function cleanOcrWords(words) {
-    return (words || []).filter(w => {
+    const kept = (words || []).filter(w => {
       const t = squash(w && w.text);
       if (!t) return false;
+      if (isWatermarkText(t)) return false;
       if (JUNK_ONLY.test(t)) return false;
       if (t.length === 1 && SINGLE_NOISE.test(t) && (w.conf == null || w.conf < 0.8)) return false;
       if (t.length <= 2 && JUNK_ONLY.test(t.replace(/[0-9]/g, ""))) return false;
       return true;
     });
+    /* OCR splits the stamp across boxes as often as it mangles it, so once a
+       watermark is known to be on the page its leftovers ("scanned", "by",
+       "cam", "scanner") are dropped too — no timetable cell holds those words.
+       The stamp is looked for in the ORIGINAL list: the word that gave it away
+       has already been removed by the filter above. */
+    const stamped = (words || []).some(w => isWatermarkText(w && w.text));
+    return stamped
+      ? kept.filter(w => !/^(scanned|scan|cam|carm|scanner|camscanner|carmcanner|by)$/i.test(squash(w.text)))
+      : kept;
   }
 
   /* ==========================================================================
@@ -230,6 +336,34 @@
       const r = bandIndexOf(rowBands, (it.y0 + it.y1) / 2);
       if (r >= 0) perRow[r].push(it);
     }
+    /* Do the boxes overlap one another on a line? PDFs whose fonts lost their
+       width table report a width that does not cover the text, so a box appears
+       to start inside the one before it. When that is common, the only reliable
+       signal left is where each word BEGINS — a broken width cannot move a start
+       position. A page that reports sane widths is left exactly as it was. */
+    const overlapOf = list => {
+      let pairs = 0, bad = 0;
+      const byRow = new Map();
+      list.forEach(it => {
+        const k = Math.round((it.y0 + it.y1) / 2 / Math.max(2, lineH));
+        if (!byRow.has(k)) byRow.set(k, []);
+        byRow.get(k).push(it);
+      });
+      byRow.forEach(row => {
+        row.sort((a, b) => a.x0 - b.x0);
+        for (let i = 1; i < row.length; i++) {
+          const gap = row[i].x0 - row[i - 1].x1;
+          pairs++;
+          if (gap < -lineH * 0.12) bad++;
+        }
+      });
+      return pairs ? bad / pairs : 0;
+    };
+    const overlap = overlapOf(items);
+    const brokenWidths = overlap > 0.18;
+    /* Where a word sits, for column purposes. */
+    const anchorX = it => (brokenWidths ? it.x0 : (it.x0 + it.x1) / 2);
+
     const widest = perRow.reduce((m, list) => Math.max(m, list.length), 0);
     const minItems = Math.max(3, Math.ceil(widest * 0.5));
     let sample = perRow.filter(list => list.length >= minItems).flat();
@@ -247,7 +381,7 @@
       const d = dayIndexFromText(it.text);
       if (d === -1) continue;
       if (!daySpots.has(d)) daySpots.set(d, []);
-      daySpots.get(d).push((it.x0 + it.x1) / 2);
+      daySpots.get(d).push(anchorX(it));
     }
     /* One x per day, however many times the day is written on the page. */
     const dayCenters = Array.from(daySpots.entries())
@@ -261,13 +395,36 @@
       let cols = dayCenters.map(x => ({ d: x.d, c: x.c }));
       if (cols.length >= 2) {
         const pitch = (cols[cols.length - 1].c - cols[0].c) / (cols.length - 1);
-        const rightmost = Math.max.apply(null, items.map(i => (i.x0 + i.x1) / 2));
+        const rightmost = Math.max.apply(null, items.map(i => anchorX(i)));
+        const leftmost = Math.min.apply(null, items.map(i => anchorX(i)));
         let guard = 0;
         while (pitch > 1 && rightmost > cols[cols.length - 1].c + pitch * 0.5 && guard++ < 3) {
           const next = cols[cols.length - 1];
           const d = next.d == null ? null : next.d + 1;
           if (d == null || d > 6) break;
           cols.push({ d, c: next.c + pitch });
+        }
+        /* The same reasoning on the left. A shaded or creased edge often loses
+           the first heading — "Monday" is the one nearest the spine — and the
+           whole week then shifts a day early or loses Monday's lessons. If the
+           first day read is not Monday and there is room for another column at
+           the same spacing, that column is Monday; what remains further left is
+           the period column, which is found separately below. */
+        guard = 0;
+        /* ...but only on evidence. The space left of the first day read normally
+           holds the PERIOD column, so adding a day there without proof would
+           push the period numbers into Monday and shift the whole week. Proof is
+           text that cannot be a period label — a subject or a teacher's name. */
+        const leftOf = cols[0].c - pitch * 0.5;
+        const leftItems = items.filter(it => anchorX(it) < leftOf);
+        const leftLooksLikeLessons = leftItems.some(it => {
+          const t = it.text;
+          if (periodInfoFromText(t)) return false;
+          return /[\p{L}]{3,}/u.test(t);
+        });
+        while (leftLooksLikeLessons && pitch > 1 && cols[0].d > 0 &&
+               cols[0].c - pitch > leftmost + pitch * 0.35 && guard++ < 3) {
+          cols.unshift({ d: cols[0].d - 1, c: cols[0].c - pitch });
         }
       }
       /* Each column owns the space half-way to its neighbours — never an open
@@ -279,7 +436,12 @@
         b: i === cols.length - 1 ? x.c + pitch / 2 : (x.c + cols[i + 1].c) / 2,
         center: x.c
       }));
-      if (items.some(it => (it.x0 + it.x1) / 2 < leftEdge - lineH * 0.5))
+      /* Is there anything to the LEFT of the first day heading? Period numbers,
+         times and "Period" labels live there. The test used to need half a line
+         of clearance, so a period column tucked close to Monday was swallowed by
+         Monday's band — and the lesson ended up in the same cell as its period
+         number. Any text left of the edge is enough. */
+      if (items.some(it => anchorX(it) < leftEdge - lineH * 0.15))
         bands.unshift({ a: -Infinity, b: leftEdge });      /* the Period/time column */
       cols.forEach((x, i) => { if (x.d != null && x.d >= 0) dayHints[i + (bands.length - cols.length)] = x.d; });
       colBands = bands;
@@ -289,7 +451,7 @@
        reading order (top to bottom, left to right). */
     const cells = Array.from({ length: rowBands.length }, () => Array.from({ length: colBands.length }, () => []));
     for (const it of items) {
-      const cx = (it.x0 + it.x1) / 2, cy = (it.y0 + it.y1) / 2;
+      const cx = anchorX(it), cy = (it.y0 + it.y1) / 2;
       const r = bandIndexOf(rowBands, cy);
       const c = bandIndexOf(colBands, cx);
       if (r < 0 || c < 0) continue;
@@ -313,7 +475,10 @@
       cells: text,
       rowBands, colBands, dayHints,
       rowCount: rowBands.length, colCount: colBands.length,
-      layout: "boxes"
+      layout: "boxes",
+      /* Surfaced so the app can say WHY a page needed care, and so tests can
+         assert the broken-width path runs. */
+      brokenWidths, overlap: +overlap.toFixed(3)
     };
   }
 
@@ -425,6 +590,22 @@
         for (let r = start; r < R; r++) {
           const p = periodInfoFromText(cells[r][best.col]);
           if (p) out.periodByRow[r] = p;
+        }
+        /* A single stray number can throw every row off: one page gave "4" for
+           the first row, and the whole week shifted down by three periods. When
+           most of the period column could not be read, the numbers that were
+           read are not trustworthy — the rows are numbered in order instead, and
+           the page says so. */
+        const named = Object.keys(out.periodByRow).filter(k => +k >= start).length;
+        const candidate = [];
+        for (let r = start; r < R; r++) {
+          const filled = Object.keys(out.dayByCol).filter(c => !isBlank(cells[r][+out.dayByCol[c]])).length;
+          if (filled >= 2) candidate.push(r);
+        }
+        if (candidate.length >= 2 && named > 0 && named < Math.ceil(candidate.length / 2)) {
+          out.periodByRow = {};
+          candidate.forEach((r, i) => { out.periodByRow[r] = { period: i + 1, time: null }; });
+          out.assumed = "periods-in-order";
         }
         /* A period number is easy to lose — "4" comes back as "a", or the cell is
            empty. A row below the last period that holds lessons in two or more
@@ -575,8 +756,15 @@
 
     const cellAt = (r, c) => (model.gridCells && model.gridCells[r] ? str(model.gridCells[r][c]) : "");
 
-    if (model.orientation === "days-cols") {
-      const rowList = Object.keys(model.periodByRow).map(Number).sort((a, b) => a - b);
+    /* Reading a week is a decision too. The period labels may have been read
+       perfectly, or a single stray number may have survived while the rest of
+       the column was lost — in which case the rows are simply the periods in
+       order. Both readings are built and the one that actually recognises more
+       lessons wins, so a page can never be made worse by trying. */
+    const placeDaysCols = periodMap => {
+      const g = Array.from({ length: periods }, () => Array.from({ length: days }, () => null));
+      const rep = { placed: 0, matched: 0, raw: 0, unmatched: [], cells: [] };
+      const rowList = Object.keys(periodMap).map(Number).sort((a, b) => a - b);
       rowList.forEach((r, i) => {
         const slot = i;                                   /* row order is the period order */
         if (slot >= periods) return;
@@ -590,13 +778,57 @@
           const parsed = parseCellText(text, ctx);
           const subjectId = parsed.subject ? parsed.subject.id : null;
           const teacherId = parsed.teacher ? parsed.teacher.id : null;
-          report.cells.push({ r, c, d, slot, text, parsed });
-          if (!subjectId && !teacherId) { report.unmatched.push(text); return; }
-          grid[slot][d] = { raw: text, subjectId, teacherId, room: parsed.room, score: parsed.score };
-          report.placed++;
-          if (subjectId) report.matched++;
+          rep.cells.push({ r, c, d, slot, text, parsed });
+          if (!subjectId && !teacherId) { rep.unmatched.push(text); return; }
+          g[slot][d] = { raw: text, subjectId, teacherId, room: parsed.room, score: parsed.score };
+          rep.placed++;
+          if (subjectId) rep.matched++;
         });
       });
+      return { grid: g, report: rep };
+    };
+
+    if (model.orientation === "days-cols") {
+      let chosen = placeDaysCols(model.periodByRow);
+      if (model.dayByCol && Object.keys(model.dayByCol).length >= 2 && model.gridCells) {
+        /* Rows that actually hold lessons, in page order. */
+        const lessonRows = [];
+        (model.gridCells || []).forEach((row, r) => {
+          let hits = 0;
+          Object.keys(model.dayByCol).forEach(dk => {
+            const c = model.dayByCol[dk];
+            if (model.periodCol !== null && c === model.periodCol) return;
+            const text = cellAt(r, c);
+            if (isBlank(text)) return;
+            const p = parseCellText(text, ctx);
+            if (p.subject || p.teacher) hits++;
+          });
+          if (hits >= 2) lessonRows.push(r);
+        });
+        if (lessonRows.length >= 2 && lessonRows.length <= periods) {
+          const map = {};
+          lessonRows.forEach((r, i) => { map[r] = { period: i + 1, time: null }; });
+          const alt = placeDaysCols(map);
+          /* Winning on matched lessons is the main test. When both readings
+             recognise exactly as many, the one that does not leave the week
+             with a hole in the first period is the better layout — that is what
+             a stray "4" pushed onto the top row used to cause. */
+          const firstSlot = res => {
+            for (let p = 0; p < res.grid.length; p++)
+              if (res.grid[p].some(c => c && (c.subjectId || c.teacherId))) return p;
+            return Infinity;
+          };
+          if (alt.report.matched > chosen.report.matched ||
+              (alt.report.matched === chosen.report.matched && firstSlot(alt) < firstSlot(chosen))) {
+            alt.report.assumed = "periods-in-order";
+            chosen = alt;
+          }
+        }
+      }
+      chosen.grid.forEach((row, p) => row.forEach((cell, d) => { grid[p][d] = cell; }));
+      report.placed = chosen.report.placed; report.matched = chosen.report.matched;
+      report.unmatched = chosen.report.unmatched; report.cells = chosen.report.cells;
+      if (chosen.report.assumed) report.assumed = chosen.report.assumed;
     } else if (model.orientation === "days-rows") {
       Object.keys(model.dayByRow).forEach(dk => {
         const d = +dk;
@@ -641,6 +873,76 @@
   }
 
   /* ------------------------------------------------------------- loaders */
+  /* Join the pieces of a word that a PDF split into separate text items. Two
+     boxes are the same word when they share a line and the gap between them is
+     a fraction of the letter height: pieces of one glyph run touch, a real space
+     is about a quarter of the height, and a column gutter is wider still — so
+     nothing that belongs apart can be merged by mistake. */
+  function mergeGlyphRuns(boxes) {
+    if (!boxes || boxes.length < 2) return boxes || [];
+    const list = boxes.slice().sort((a, b) => (a.y0 - b.y0) || (a.x0 - b.x0));
+
+    /* Work line by line, because how wide a "space" is depends on the line. */
+    const lines = [];
+    for (const b of list) {
+      const line = lines[lines.length - 1];
+      const h = Math.max(1, b.y1 - b.y0);
+      if (line && Math.abs(b.y0 - line.y0) < Math.max(line.h, h) * 0.5) {
+        line.items.push(b);
+        line.h = Math.max(line.h, h);
+        line.y0 = Math.min(line.y0, b.y0);
+      } else {
+        lines.push({ y0: b.y0, h, items: [b] });
+      }
+    }
+
+    const out = [];
+    for (const line of lines) {
+      const items = line.items;
+      /* Two populations of gaps on one line: the small ones are where the file
+         SPLIT A WORD ("සඳු" + "දා", "ගණි" + "තය" — old PDF writers emit complex
+         scripts this way), the large ones are the real spaces between cells. If
+         the line clearly has both, the small ones are joined. A line with evenly
+         spaced words has no second population and is left completely alone, so
+         ordinary OCR text and spreadsheets are never touched. */
+      const gaps = [];
+      for (let i = 1; i < items.length; i++) {
+        const g = items[i].x0 - items[i - 1].x1;
+        if (g > 0) gaps.push(g);
+      }
+      const sorted = gaps.slice().sort((a, b) => a - b);
+      const small = sorted.length ? sorted[Math.floor(sorted.length * 0.25)] : 0;
+      const big = sorted.length ? sorted[sorted.length - 1] : 0;
+      const twoPopulations = sorted.length >= 3 && small > 0 && big > small * 2.2;
+      const limit = twoPopulations
+        ? Math.min(Math.max(line.h * 0.14, small * 1.6), line.h * 0.8)
+        : line.h * 0.14;
+
+      let current = null;
+      for (const b of items) {
+        if (current) {
+          const h = Math.max(1, Math.min(b.y1 - b.y0, current.y1 - current.y0));
+          const sameLine = Math.abs(b.y0 - current.y0) < h * 0.35 && Math.abs(b.y1 - current.y1) < h * 0.45;
+          const gap = b.x0 - current.x1;
+          const pieces = (current._pieces || 1) + 1;
+          if (sameLine && gap > -h * 0.06 && gap < limit && pieces <= 4 && current.text.length + b.text.length <= 18) {
+            /* Touching pieces are one word; a small gap is a thin space. */
+            current.text = current.text + (gap < h * 0.05 ? "" : " ") + b.text;
+            current.x1 = Math.max(current.x1, b.x1);
+            current.y0 = Math.min(current.y0, b.y0);
+            current.y1 = Math.max(current.y1, b.y1);
+            current._pieces = pieces;
+            continue;
+          }
+        }
+        current = Object.assign({}, b);
+        out.push(current);
+      }
+    }
+    return out.sort((a, b) => (a.y0 - b.y0) || (a.x0 - b.x0));
+  }
+
+  /* ------------------------------------------------------------- loaders */
   function loadScript(src, test) {
     if (test && test()) return Promise.resolve();
     return new Promise((resolve, reject) => {
@@ -672,6 +974,8 @@
     }
     return pdfPromise;
   }
+
+  /* -------------------------------------------------------- spreadsheet */
 
   /* -------------------------------------------------------- spreadsheet */
   /* Reads every sheet so the caller (or the user) can choose. Formula results
@@ -709,8 +1013,17 @@
       const viewport = page.getViewport({ scale: 1 });
       const content = await page.getTextContent();
       const boxes = [];
+      let broken = 0, brokenItems = 0, words = 0;
       for (const item of content.items) {
-        const t = squash(item.str);
+        /* A NUL or replacement character means the font in the file has no
+           Unicode mapping — old generators do this, especially for Sinhala and
+           Tamil. Count both the characters and the WORDS they landed in: one bad
+           letter is a slip, but when a fifth of the words carry one the file
+           simply cannot store this script, and its text must not be trusted. */
+        const bad = ((item.str || "").match(/[\u0000\ufffd]/g) || []).length;
+        if (squash(item.str)) words++;
+        if (bad) { broken += bad; brokenItems++; }
+        const t = stripWatermarks(squash(item.str));
         if (!t) continue;
         const tr = item.transform;
         const x = tr[4], y = tr[5];
@@ -719,15 +1032,38 @@
         /* PDF y grows upwards; flip it so rows sort top-down like OCR output. */
         boxes.push({ text: t, x0: x, x1: x + w, y0: viewport.height - y - h, y1: viewport.height - y, conf: 1 });
       }
-      const grid = boxes.length >= 4 ? buildGridFromBoxes(boxes) : null;
+      /* Old generators, and complex-script fonts without a proper Unicode table,
+         hand back a word as several glyph runs: "ගණි" and "තය" instead of
+         "ගණිතය", "සඳු" and "දා" instead of "සඳුදා". Left alone, the geometry
+         sees two extra columns where the page has one word — so the pieces are
+         joined back together before any rows or columns are worked out. */
+      const merged = mergeGlyphRuns(boxes);
+      const grid = merged.length >= 4 ? buildGridFromBoxes(merged) : null;
       const chars = boxes.reduce((n, b) => n + b.text.length, 0);
-      pages.push({ page: p, boxes, grid, chars, needsOcr: chars < 24 });
+      const text = boxes.map(b => b.text).join(" ");
+      /* Damaged when an eighth of the letters had no Unicode meaning, or when
+         there is not enough text to be a timetable. Either way the page is read
+         as a picture instead of trusting what came out of the file. */
+      /* A file written properly has NO unmapped characters at all, so even a
+         few words carrying one means the text cannot be relied on for this
+         script — it will read as "විදාව" where the page says "විද්‍යාව". A single
+         stray glyph is still tolerated, a twelfth of the words is not. */
+      const damaged = chars > 0 && (broken / Math.max(1, chars + broken) > 0.03 ||
+        (brokenItems >= 3 && words >= 8 && brokenItems / words > 0.05));
+      pages.push({ page: p, boxes: merged, grid, chars, broken, brokenItems, words, damaged,
+        script: scriptOf(text), needsOcr: chars < 24 || damaged });
       if (onPage) onPage(p, doc.numPages, chars);
     }
     const usable = pages.filter(p => p.grid && !p.needsOcr);
+    const best = usable.sort((a, b) => b.chars - a.chars)[0] || null;
     return {
       kind: "pdf", numPages: doc.numPages, pages,
-      best: usable.sort((a, b) => b.chars - a.chars)[0] || null,
+      best,
+      /* Why a page is being read as a picture matters to the person waiting:
+         "no text at all" is normal for a scan, a damaged layer means their file
+         was written by a program that left the letters out. */
+      damaged: !best && pages.some(p => p.damaged && p.chars > 0),
+      script: pages.map(p => p.script).sort((a, b) => pages.filter(x => x.script === b).length - pages.filter(x => x.script === a).length)[0] || "",
       needsOcr: !usable.length,
       document: doc
     };
@@ -758,6 +1094,7 @@
   global.Scanner = {
     /* pure */
     squash, collapse, isBlank, median,
+    stripInvisible, matchKey, tightKey, stripWatermarks, scriptOf, mergeGlyphRuns,
     dayIndexFromText, periodInfoFromText, firstTime,
     bandClusters, mergeBands, bandIndexOf,
     buildGridFromBoxes, buildGridFromMatrix, interpretGrid,
