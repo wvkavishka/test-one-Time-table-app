@@ -234,6 +234,17 @@ const failedScreen=html=>/This screen could not open/.test(html);
     check("teacher: canViewUsers is false", T.evalIn("canViewUsers()") === false);
   }
 
+  // 8b2) Public contact number: 072 399 3300 everywhere; stored old numbers never win.
+  {
+    check("site phone shows 072 399 3300", T.evalIn("SiteCfg.phone()") === "072 399 3300", T.evalIn("SiteCfg.phone()"));
+    check("site call link is +94 723 993 300", T.evalIn("SiteCfg.tel()") === "tel:+94723993300", T.evalIn("SiteCfg.tel()"));
+    check("site WhatsApp link uses 94723993300", T.evalIn("SiteCfg.waLink()").startsWith("https://wa.me/94723993300?"), T.evalIn("SiteCfg.waLink()").slice(0,60));
+    T.evalIn('SiteCfg.data={phone:"+94722816456",whatsapp:"94722816456"}');
+    check("retired number saved in site settings is ignored", T.evalIn("SiteCfg.phone()") === "072 399 3300" && T.evalIn("SiteCfg.waNumber()") === "94723993300");
+    T.evalIn("SiteCfg.data=null");
+    check("creatives use the new number", T.evalIn("(typeof CV_R!=='undefined') && SiteCfg.phone()") === "072 399 3300");
+  }
+
   // 8c) Attendance devices (fingerprint machines). With the server offline or the functions
   // not deployed, the Attendance screen must still render and explain the device problem,
   // and the principal must see the full setup (URL, header, body) to configure a machine.

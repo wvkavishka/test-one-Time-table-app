@@ -231,8 +231,8 @@ const profileKey = uid => "cf.profile." + (uid || "none");
    writable only by the platform owner. Defaults below are what ships today, so behavior
    never changes until the owner edits something — every value has a graceful fallback. */
 const SITE_DEFAULTS = {
-  phone: "+94722816456",
-  whatsapp: "94722816456",
+  phone: "072 399 3300",
+  whatsapp: "94723993300",
   waMsg: "Hello CampusFlow — I'd like to book a demo for my school.",
   heroTitle: "School timetables, beautifully automated.",
   heroSubtitle: "Clash-free timetables, fingerprint attendance, instant relief cover, and one search box for your whole school — in your school's own colours, from any phone, even offline.",
@@ -250,20 +250,24 @@ const SITE_DEFAULTS = {
   ]
 };
 const PUBLIC_SITE_ENABLED = () => safeStore.get("cf.flag.publicSite","1")!=="0";
+/* Numbers that were once the public contact and must never override the current default. */
+const RETIRED_SCHOOL_NUMBERS = ["94773594701","0773594701","94722816456","0722816456"];
+/* Sri Lankan numbers: 07X… → 94 7X… (international form used by wa.me and tel:). */
+const intlDigits = v => { let d=String(v||"").replace(/\D/g,""); if(d.startsWith("0")) d="94"+d.slice(1); return d; };
 const SiteCfg = {
   data: safeStore.jsonGet("cf.siteConfig",null),
   val(k){
     const v=this.data?.[k];
     if (v===undefined||v===null||v==="") return SITE_DEFAULTS[k];
     /* Retired school number: an old saved value must never override the current default. */
-    if ((k==="phone"||k==="whatsapp") && ["94773594701","0773594701"].includes(String(v).replace(/\D/g,""))) return SITE_DEFAULTS[k];
+    if ((k==="phone"||k==="whatsapp") && RETIRED_SCHOOL_NUMBERS.includes(String(v).replace(/\D/g,""))) return SITE_DEFAULTS[k];
     return v;
   },
   features(){ const f=this.data?.features; return Array.isArray(f)&&f.length ? f.map((x,i)=>({...SITE_DEFAULTS.features[i%SITE_DEFAULTS.features.length],...x})) : SITE_DEFAULTS.features; },
   phone(){ return String(this.val("phone")).replace(/[^\d+\s().-]/g,"").trim() || SITE_DEFAULTS.phone; },
-  waNumber(){ return String(this.val("whatsapp")).replace(/\D/g,"") || SITE_DEFAULTS.whatsapp; },
+  waNumber(){ return intlDigits(this.val("whatsapp")) || SITE_DEFAULTS.whatsapp; },
   waLink(){ return "https://wa.me/"+this.waNumber()+"?text="+encodeURIComponent(this.val("waMsg")); },
-  tel(){ return "tel:"+String(this.phone()).replace(/[^\d+]/g,""); },
+  tel(){ return "tel:+"+intlDigits(this.phone()); },
   attach(){
     if(!FB.ready) return;
     FB.db.ref("site/config").on("value", snap=>{
@@ -2559,9 +2563,9 @@ function openSiteEditor(){
       <div class="space-y-4 mt-5">
         <div class="grid sm:grid-cols-2 gap-3">
           <div><label class="label">Call number (public)</label>
-            <input class="field font-mono" id="se-phone" value="${esc(d("phone")||SiteCfg.val("phone"))}" placeholder="+94722816456"></div>
+            <input class="field font-mono" id="se-phone" value="${esc(d("phone")||SiteCfg.val("phone"))}" placeholder="072 399 3300"></div>
           <div><label class="label">WhatsApp number (with country code, digits only)</label>
-            <input class="field font-mono" id="se-whatsapp" value="${esc(d("whatsapp")||SiteCfg.waNumber())}" placeholder="94722816456"></div>
+            <input class="field font-mono" id="se-whatsapp" value="${esc(d("whatsapp")||SiteCfg.waNumber())}" placeholder="94723993300"></div>
         </div>
         <div><label class="label">WhatsApp prefilled message</label>
           <input class="field" id="se-wamsg" value="${esc(d("waMsg")||SiteCfg.val("waMsg"))}"></div>
