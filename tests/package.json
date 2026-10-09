@@ -1,0 +1,7 @@
+{
+  "name": "campusflow-tests",
+  "private": true,
+  "description": "Headless checks for the CampusFlow web app (jsdom). Run: npm install && npm test",
+  "scripts": { "test": "node e2e.js" },
+  "devDependencies": { "jsdom": "^24.0.0" }
+}

@@ -14,7 +14,7 @@
       controlled reload at a point that cannot interrupt unsaved work. */
 const VERSION = "cf-shell-v41";
 const CRITICAL = ["./", "./index.html", "./app.css", "./styles/shell.css", "./app.js"];
-const OPTIONAL = ["./manifest.webmanifest", "./icon.svg", "./icon"];
+const OPTIONAL = ["./manifest.webmanifest", "./icon.svg"];
 const LIBS = [
   "https://www.gstatic.com/firebasejs/10.12.5/firebase-app-compat.js",
   "https://www.gstatic.com/firebasejs/10.12.5/firebase-auth-compat.js",
