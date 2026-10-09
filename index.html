@@ -477,8 +477,8 @@ const LOGIN_V2_ENABLED=()=>safeStore.get("cf.flag.loginV2","1")!=="0";
 const I18N={
   en:{ "app.tagline":"Your school, beautifully orchestrated",
     "route.admin":"Schools","route.dashboard":"Dashboard","route.timetable":"Timetable","route.relief":"Relief Center",
-    "route.team":"Team","route.database":"Database","route.print":"Print Center","route.attendance":"Attendance",
-    "tab.admin":"Schools","tab.dashboard":"Home","tab.timetable":"Timetable","tab.relief":"Relief","tab.team":"Team","tab.database":"Data","tab.print":"Print","tab.attendance":"Attendance",
+    "route.team":"Team","route.database":"Database","route.print":"Print Center","route.attendance":"Attendance","route.find":"Find",
+    "tab.admin":"Schools","tab.dashboard":"Home","tab.timetable":"Timetable","tab.relief":"Relief","tab.team":"Team","tab.database":"Data","tab.print":"Print","tab.attendance":"Attendance","tab.find":"Find",
     "role.principal":"Principal","role.admin":"Admin","role.teacher":"Teacher","role.staff":"Staff",
     "login.user":"Username or email","login.pass":"Password","login.signin":"Sign in","login.forgot":"Forgot?",
     "login.hint":"Accounts are issued by your school's principal.","login.signing":"Signing in…",
@@ -497,11 +497,22 @@ const I18N={
     "att.printsheet":"Print attendance sheet","att.printrecent":"Print last 14 days","att.summary":"Daily summary","att.method.fingerprint":"Fingerprint","att.method.manual":"Manual sign-in","att.method.device":"Scanner device",
     "att.registeredon":"Registered","att.lastused":"Last used","att.statusin":"Signed in","att.statusout":"Left","att.statusaway":"Not here yet",
     "att.confirmremove":"Remove this fingerprint? You can register it again from the same phone later.",
-    "att.attaching":"Talking to the fingerprint sensor…","att.wholetime":"Live clock-ins appear here as teachers tap in.","lang.name":"English" },
+    "att.attaching":"Talking to the fingerprint sensor…","att.wholetime":"Live clock-ins appear here as teachers tap in.",
+    "find.placeholder":"Search teachers, subjects, classes, attendance, or ask a question…",
+    "find.searching":"Searching…","find.results":"Results","find.nohits":"Nothing matches that yet. Try fewer words or add a sheet with more data.",
+    "find.askai":"Ask AI","find.aiworking":"Thinking…","find.aianswer":"Answer","find.sources":"Sources used",
+    "find.addsheet":"Add a public Google Sheet","find.addsheetdesc":"Paste a public Google Sheets URL and label it (e.g. 'Grade 10 marks', 'Library'). The app fetches the rows on this device only — they are not uploaded.",
+    "find.label":"Label","find.url":"Sheet URL (Anyone with the link → Viewer)","find.refresh":"Refresh","find.remove":"Remove",
+    "find.fetching":"Reading the sheet…","find.fetched":"rows loaded","find.fetcherr":"could not read",
+    "find.teacher":"Teacher","find.subject":"Subject","find.class":"Class","find.slot":"Lesson","find.attendance":"Attendance","find.member":"Account","find.sheet":"Sheet row",
+    "find.datasources":"Your extra data","find.nosources":"No sheets linked yet. Add a public Google Sheet link (marks, student lists, contacts, library) to make it searchable.",
+    "find.aikey":"AI answers use the same Google AI Studio key you added in the Scanner. Tap Ask AI after you type a question.",
+    "find.offline":"AI answers need internet — local results above still work.",
+    "lang.name":"English" },
   si:{ "app.tagline":"ඔබේ පාසල, පහසුවෙන් කළමනාකරණය",
     "route.admin":"පාසල්","route.dashboard":"උපකරණ පුවරුව","route.timetable":"කාල සටහන","route.relief":"ආදේශක මධ්‍යස්ථානය",
-    "route.team":"කාර්ය මණ්ඩලය","route.database":"දත්ත","route.print":"මුද්‍රණය","route.attendance":"පැමිණීම",
-    "tab.admin":"පාසල්","tab.dashboard":"මුල් පිටුව","tab.timetable":"කාල සටහන","tab.relief":"ආදේශක","tab.team":"කණ්ඩායම","tab.database":"දත්ත","tab.print":"මුද්‍රණය","tab.attendance":"පැමිණීම",
+    "route.team":"කාර්ය මණ්ඩලය","route.database":"දත්ත","route.print":"මුද්‍රණය","route.attendance":"පැමිණීම","route.find":"සොයන්න",
+    "tab.admin":"පාසල්","tab.dashboard":"මුල් පිටුව","tab.timetable":"කාල සටහන","tab.relief":"ආදේශක","tab.team":"කණ්ඩායම","tab.database":"දත්ත","tab.print":"මුද්‍රණය","tab.attendance":"පැමිණීම","tab.find":"සොයන්න",
     "role.principal":"විදුහල්පති","role.admin":"පරිපාලක","role.teacher":"ගුරුවරයා","role.staff":"කාර්ය මණ්ඩලය",
     "login.user":"පරිශීලක නාමය හෝ ඊමේල්","login.pass":"මුරපදය","login.signin":"ඇතුල් වන්න","login.forgot":"අමතකද?",
     "login.hint":"ගිණුම් ලබා දෙන්නේ ඔබේ පාසලේ විදුහල්පතිතුමා විසිනි.","login.signing":"ඇතුල් වෙමින්…",
@@ -522,11 +533,21 @@ const I18N={
     "att.registeredon":"ලියාපදිංචිය","att.lastused":"අවසාන භාවිතය","att.statusin":"පැමිණ සිටී","att.statusout":"පිටව ගියේය","att.statusaway":"තවම පැමිණ නැත",
     "att.confirmremove":"මෙම ඇඟිලි සලකුණ ඉවත් කරන්න ද? පසුව නැවත ලියාපදිංචි කළ හැකිය.",
     "att.attaching":"ඇඟිලි සලකුණු සංවේදකය ඇමතෙමින්…",
+    "find.placeholder":"ගුරුවරුන්, විෂයයන්, පන්ති, පැමිණීම් හොයන්න, නැතහොත් ප්‍රශ්නයක් අසන්න…",
+    "find.results":"ප්‍රතිඵල","find.nohits":"ඊට ගැළපෙන කිසිවක් තවම නැත. අඩු වචන භාවිතා කරන්න, නැතහොත් පොදු ෂීට් එකක් එක් කරන්න.",
+    "find.askai":"AI ගෙන් අසන්න","find.aiworking":"සිතමින්…","find.aianswer":"පිළිතුර","find.sources":"භාවිතා කළ මූලාශ්‍ර",
+    "find.addsheet":"පොදු Google ෂීට් එකක් එක් කරන්න","find.addsheetdesc":"පොදු ෂීට් සබැඳියක් අලවන්න (උදා: 'ශ්‍රේණි 10 ලකුණු', 'පුස්තකාලය'). මෙම උපාංගයේ පමණක් පේළි කියවේ — කිසිවක් උඩුගත නොවේ.",
+    "find.label":"නම","find.url":"ෂීට් සබැඳිය (Anyone with the link → Viewer)","find.refresh":"යාවත්කාලීන කරන්න","find.remove":"ඉවත් කරන්න",
+    "find.fetching":"ෂීට් එක කියවමින්…","find.fetched":"පේළි පූරණය විය","find.fetcherr":"කියවීමට නොහැකි විය",
+    "find.teacher":"ගුරුවරයා","find.subject":"විෂය","find.class":"පන්තිය","find.slot":"පාඩම","find.attendance":"පැමිණීම","find.member":"ගිණුම","find.sheet":"ෂීට් පේළිය",
+    "find.datasources":"ඔබේ අමතර දත්ත","find.nosources":"ෂීට් සබැඳි තවම නැත. ලකුණු, ශිෂ්‍ය ලැයිස්තු, සම්බන්ධතා වැනි පොදු ෂීට් සබැඳි එක් කරන්න.",
+    "find.aikey":"AI පිළිතුරු සඳහා Scanner තුළ එක් කළ Google AI Studio යතුරම භාවිතා වේ. ප්‍රශ්නයක් ලියා Ask AI ඔබන්න.",
+    "find.offline":"AI පිළිතුරුවලට අන්තර්ජාලය අවශ්‍යයි — දේශීය ප්‍රතිඵල ක්‍රියාත්මකයි.",
     "lang.name":"සිංහල" },
   ta:{ "app.tagline":"உங்கள் பாடசாலை, எளிதாக நிர்வகிக்கப்படுகிறது",
     "route.admin":"பாடசாலைகள்","route.dashboard":"முகப்பு","route.timetable":"நேரசூசி","route.relief":"மாற்று ஆசிரியர்",
-    "route.team":"பணியாளர்கள்","route.database":"தரவு","route.print":"அச்சிடு","route.attendance":"வருகை",
-    "tab.admin":"பாடசாலை","tab.dashboard":"முகப்பு","tab.timetable":"நேரசூசி","tab.relief":"மாற்று","tab.team":"குழு","tab.database":"தரவு","tab.print":"அச்சு","tab.attendance":"வருகை",
+    "route.team":"பணியாளர்கள்","route.database":"தரவு","route.print":"அச்சிடு","route.attendance":"வருகை","route.find":"தேடு",
+    "tab.admin":"பாடசாலை","tab.dashboard":"முகப்பு","tab.timetable":"நேரசூசி","tab.relief":"மாற்று","tab.team":"குழு","tab.database":"தரவு","tab.print":"அச்சு","tab.attendance":"வருகை","tab.find":"தேடு",
     "role.principal":"அதிபர்","role.admin":"நிர்வாகி","role.teacher":"ஆசிரியர்","role.staff":"பணியாளர்",
     "login.user":"பயனர்பெயர் அல்லது மின்னஞ்சல்","login.pass":"கடவுச்சொல்","login.signin":"உள்நுழை","login.forgot":"மறந்ததா?",
     "login.hint":"கணக்குகள் உங்கள் அதிபரால் வழங்கப்படும்.","login.signing":"உள்நுழைகிறது…",
@@ -547,6 +568,16 @@ const I18N={
     "att.registeredon":"பதிவு","att.lastused":"கடைசிப் பயன்பாடு","att.statusin":"உள்ளே","att.statusout":"வெளியேறினார்","att.statusaway":"இன்னும் வரவில்லை",
     "att.confirmremove":"இந்தக் கைரேகையை நீக்கவா? பின்னர் மீண்டும் பதிவு செய்யலாம்.",
     "att.attaching":"கைரேகை உணரியுடன் பேசுகிறது…",
+    "find.placeholder":"ஆசிரியர்கள், பாடங்கள், வகுப்புகள், வருகையைத் தேடுங்கள் அல்லது ஒரு கேள்வியைக் கேளுங்கள்…",
+    "find.results":"முடிவுகள்","find.nohits":"அதற்குப் பொருத்தமாக எதுவும் இல்லை. குறைவான சொற்களைப் பயன்படுத்தவும் அல்லது பொது ஷீட் ஒன்றைச் சேர்க்கவும்.",
+    "find.askai":"AI யிடம் கேள்","find.aiworking":"சிந்திக்கிறது…","find.aianswer":"பதில்","find.sources":"பயன்படுத்திய ஆதாரங்கள்",
+    "find.addsheet":"பொது Google ஷீட்டைச் சேர்","find.addsheetdesc":"பொது Google ஷீட் இணைப்பை ஒட்டி பெயரிடுங்கள் (எ.கா. 'தரம் 10 மதிப்பெண்கள்'). இந்தச் சாதனத்தில் மட்டும் வரிசைகள் படிக்கப்படும்.",
+    "find.label":"பெயர்","find.url":"ஷீட் இணைப்பு (Anyone with the link → Viewer)","find.refresh":"புதுப்பி","find.remove":"நீக்கு",
+    "find.fetching":"ஷீட்டைப் படிக்கிறது…","find.fetched":"வரிசைகள் ஏற்றப்பட்டன","find.fetcherr":"படிக்க முடியவில்லை",
+    "find.teacher":"ஆசிரியர்","find.subject":"பாடம்","find.class":"வகுப்பு","find.slot":"பாடம்","find.attendance":"வருகை","find.member":"கணக்கு","find.sheet":"ஷீட் வரிசை",
+    "find.datasources":"உங்கள் கூடுதல் தரவு","find.nosources":"இன்னும் ஷீட் இணைப்புகள் இல்லை. மதிப்பெண்கள், மாணவர் பட்டியல் போன்ற பொது ஷீட் இணைப்புகளைச் சேர்க்கவும்.",
+    "find.aikey":"AI பதில்களுக்கு Scanner-இல் சேர்த்த Google AI Studio சாவியே பயன்படுத்தப்படும்.",
+    "find.offline":"AI பதில்களுக்கு இணையம் தேவை — உள்ளூர் முடிவுகள் வேலை செய்யும்.",
     "lang.name":"தமிழ்" }
 };
 let LANG = safeStore.get("cf.lang","en") || "en";
@@ -5437,6 +5468,192 @@ async function renderAttendance(){
 }
 
 /* =================================================================================
+   FIND — universal search + AI answers
+   ================================================================================= */
+let findPromise=null;
+function ensureFind(){
+  if(window.Find) return Promise.resolve(Find);
+  if(findPromise) return findPromise;
+  findPromise=loadScriptOnce("vendor/find.js",()=>typeof window.Find!=="undefined").then(()=>Find);
+  return findPromise;
+}
+let _findAttUnsub=null;
+function findStopAttendance(){ if(_findAttUnsub){ _findAttUnsub(); _findAttUnsub=null; } }
+function findListenAttendance(){
+  if(!Session.schoolId||!FB.ready){ findStopAttendance(); return; }
+  if(_findAttUnsub) return;
+  state._attendance = state._attendance || {};
+  const today = new Date(); today.setHours(0,0,0,0);
+  const keys=[]; for(let i=0;i<14;i++){ const d=new Date(today); d.setDate(today.getDate()-i); keys.push(d.toISOString().slice(0,10)); }
+  const refs = keys.map(k=>FB.db.ref(`schools/${Session.schoolId}/attendance/${k}`));
+  const onVal = snap=>{ if(window.Find){ Find.refresh(); if(Store.raw.ui.route==="find" && !document.getElementById("find-q")?.matches(":focus")) renderFindResults(); } };
+  refs.forEach(r=>r.on("value", snap=>{ state._attendance[snap.key]=snap.val()||null; onVal(); }));
+  _findAttUnsub = ()=>refs.forEach(r=>r.off("value"));
+}
+function kindChip(kind){
+  const map={teacher:["ph-user","find.teacher","bg-emerald-50 text-emerald-700 border-emerald-200"],
+             subject:["ph-book-open","find.subject","bg-indigo-50 text-indigo-700 border-indigo-200"],
+             class:["ph-chalkboard-teacher","find.class","bg-sky-50 text-sky-700 border-sky-200"],
+             slot:["ph-clock","find.slot","bg-zinc-50 text-zinc-700 border-zinc-200"],
+             attendance:["ph-fingerprint","find.attendance","bg-violet-50 text-violet-700 border-violet-200"],
+             member:["ph-user-circle","find.member","bg-amber-50 text-amber-700 border-amber-200"],
+             sheet:["ph-file-spreadsheet","find.sheet","bg-rose-50 text-rose-700 border-rose-200"]};
+  const [ic,key,cls] = map[kind]||["ph-dot","?","bg-zinc-100 text-zinc-600"];
+  return `<span class="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-bold ${cls}"><i class="ph-fill ${ic}"></i>${esc(t(key))}</span>`;
+}
+function renderFindResults(){
+  const box=$("#find-results"); if(!box) return;
+  if(!window.Find){ box.innerHTML=`<div class="text-center py-6 text-zinc-400 text-sm"><span class="spinner"></span></div>`; return; }
+  const q=$("#find-q")?.value||"";
+  if(!q.trim()){ box.innerHTML = `<div class="text-center text-zinc-400 text-sm py-10"><i class="ph ph-magnifying-glass text-3xl block mb-2 text-zinc-300"></i>${esc(t("find.placeholder"))}</div>`; return; }
+  const hits = Find.search(q, 80);
+  if(!hits.length){ box.innerHTML = `<div class="card p-6 text-center text-zinc-500 text-sm"><i class="ph ph-warning-circle text-rose-400 text-2xl block mb-2"></i>${esc(t("find.nohits"))}</div>`; return; }
+  box.innerHTML = `<div class="text-[11px] font-bold uppercase tracking-wider text-zinc-400 mb-2">${esc(t("find.results"))} · ${hits.length}</div>
+    <div class="space-y-2">${hits.slice(0,40).map(h=>`
+      <button class="w-full text-left card p-3 hover:border-emerald-300 hover:bg-emerald-50/30 transition-colors" data-action="find-jump" data-kind="${esc(h.kind)}" data-id="${esc(h.id||"")}" data-source="${esc(h.sourceId||"")}">
+        <div class="flex items-center gap-2 mb-1">${kindChip(h.kind)}<span class="text-[10px] text-zinc-400 font-semibold">${esc(h.sourceLabel||"")}</span></div>
+        <div class="font-bold text-[14px] truncate">${esc(h.title||"")}</div>
+        <div class="text-[12px] text-zinc-500 line-clamp-2">${esc(h.body||"")}</div>
+      </button>`).join("")}</div>`;
+}
+async function renderFind(){
+  await ensureFind();
+  const view=$("#view");
+  const key=(Scan.aiKey||"").trim()||localStorage.getItem("cf.aiKey")||"";
+  view.innerHTML=`<div class="space-y-5 view-in">
+    <div><div class="text-[11px] font-bold uppercase tracking-[.1em] text-indigo-600">CampusFlow search</div>
+      <h2 class="font-display font-bold text-2xl sm:text-[28px] tracking-tight mt-0.5">${esc(t("route.find"))}</h2>
+      <p class="text-xs text-zinc-500 font-medium mt-1">Search teachers, classes, subjects, lessons, attendance and any linked Google Sheets — or ask a question in plain words.</p></div>
+    <div class="card p-4 sticky top-0 z-20 bg-white/90 backdrop-blur">
+      <div class="flex items-center gap-2">
+        <i class="ph ph-magnifying-glass text-zinc-400 text-xl pl-1"></i>
+        <input id="find-q" class="flex-1 !border-0 !ring-0 !bg-transparent !shadow-none !pl-0 text-[15px]" placeholder="${esc(t("find.placeholder"))}" autocomplete="off" autofocus>
+        <button class="btn btn-primary !h-10 !px-3" data-action="find-ai"><i class="ph-fill ph-sparkle"></i><span class="hidden sm:inline">${esc(t("find.askai"))}</span></button>
+      </div>
+      <div id="find-ai"></div>
+    </div>
+    <div class="grid lg:grid-cols-3 gap-4">
+      <div id="find-results" class="lg:col-span-2 space-y-2"></div>
+      <div class="space-y-4">
+        <div class="card p-4">
+          <h3 class="font-bold text-[14px] mb-1 flex items-center gap-2"><i class="ph-fill ph-database text-indigo-500"></i>${esc(t("find.datasources"))}</h3>
+          <p class="text-[11px] text-zinc-500 leading-relaxed">${esc(t("find.addsheetdesc"))}</p>
+          <button class="btn btn-ghost w-full mt-3 !text-[12px]" data-action="find-add-source"><i class="ph ph-plus"></i>${esc(t("find.addsheet"))}</button>
+          <div id="find-sources" class="mt-3 space-y-2"></div>
+        </div>
+        <div class="card p-4 bg-indigo-50/50 !border-indigo-200 text-[11px] text-indigo-900/80 leading-relaxed flex items-start gap-2">
+          <i class="ph-fill ph-sparkle text-indigo-500 mt-0.5 flex-none"></i>
+          <span>${esc(t("find.aikey"))}${key?"":" "+t("find.aikey-note"||"")}<br>${!navigator.onLine?"<b>"+t("find.offline")+"</b>":""}</span>
+        </div>
+      </div>
+    </div>
+  </div>`;
+  renderFindResults();
+  renderFindSources();
+  findListenAttendance();
+
+  const q=$("#find-q");
+  let tmr=null;
+  q.addEventListener("input",()=>{ clearTimeout(tmr); tmr=setTimeout(()=>{
+    $("#find-ai").innerHTML="";
+    renderFindResults();
+  },120); });
+  q.focus();
+
+  view.addEventListener("click",findHandler);
+  function findHandler(ev){
+    view.removeEventListener("click",findHandler);
+    const b=ev.target.closest("[data-action]");
+    view.addEventListener("click",findHandler);
+    if(!b) return;
+    const a=b.dataset.action;
+    if(a==="find-ai"){ doAi(); }
+    else if(a==="find-add-source"){ openAddSource(); }
+    else if(a==="find-refresh"){ refreshSource(b.dataset.id); }
+    else if(a==="find-remove"){ removeSourceUi(b.dataset.id); }
+    else if(a==="find-jump"){ jumpTo(b.dataset); }
+  }
+
+  async function doAi(){
+    const q=($("#find-q")?.value||"").trim(); if(!q) return;
+    const out=$("#find-ai");
+    out.innerHTML=`<div class="mt-3 rounded-xl bg-indigo-50 border border-indigo-200 p-3 text-[12px] text-indigo-800"><span class="spinner"></span>${esc(t("find.aiworking"))}</div>`;
+    try{
+      const r = await Find.ask(q);
+      out.innerHTML=`<div class="mt-3 space-y-2">
+        <div class="rounded-xl bg-gradient-to-br from-indigo-50 to-violet-50 border border-indigo-200 p-3 text-[13px] text-zinc-800 whitespace-pre-wrap leading-relaxed">${esc(r.answer)}</div>
+        ${r.hits&&r.hits.length?`<details class="rounded-xl bg-white border border-zinc-200 p-2.5 text-[11px]"><summary class="cursor-pointer font-bold text-zinc-600">${esc(t("find.sources"))} (${r.hits.length})</summary>
+          <div class="mt-2 space-y-1.5">${r.hits.map(h=>`<div class="flex items-start gap-2">${kindChip(h.kind)}<span class="truncate"><b>${esc(h.title)}</b> · <span class="text-zinc-500">${esc((h.body||"").slice(0,120))}</span></span></div>`).join("")}</div></details>`:""}
+      </div>`;
+    }catch(e){ out.innerHTML=`<div class="mt-3 rounded-xl bg-rose-50 border border-rose-200 p-3 text-[12px] text-rose-700">${esc(e.message||String(e))}</div>`; }
+  }
+
+  function openAddSource(){
+    Modal.open({
+      title:t("find.addsheet"),
+      body:`<div class="space-y-3">
+        <div><label class="label">${esc(t("find.label"))}</label><input class="field" id="find-src-label" placeholder="Grade 10 term marks"></div>
+        <div><label class="label">${esc(t("find.url"))}</label><input class="field font-mono !text-xs" id="find-src-url" placeholder="https://docs.google.com/spreadsheets/d/..."></div>
+        <p class="text-[11px] text-zinc-500 leading-relaxed">${esc(t("find.addsheetdesc"))}</p>
+      </div>`,
+      actions:[
+        {label:"Cancel",kind:"ghost",action:()=>Modal.close()},
+        {label:"Add & fetch",kind:"primary",action:async()=>{
+          const label=$("#find-src-label").value.trim(); const url=$("#find-src-url").value.trim();
+          if(!url){ toast("error","Missing link","Paste a public Google Sheets URL."); throw 0; }
+          Modal.close();
+          const src = Find.addSource(label||"Sheet",url);
+          renderFindSources();
+          await refreshSrcObj(src);
+        }}
+      ]
+    });
+  }
+  async function refreshSrcObj(src){
+    const card=document.querySelector(`[data-source-card="${src.id}"]`);
+    if(card) card.querySelector(".src-status").innerHTML=`<span class="spinner"></span> ${esc(t("find.fetching"))}`;
+    const updated = await Find.fetchSource(src);
+    Find.refresh();
+    renderFindSources();
+    renderFindResults();
+    if(updated.error) toast("error","Sheet error",updated.error);
+    else toast("success","Sheet loaded",((updated.rows?.length||1)-1)+" "+t("find.fetched"));
+  }
+  async function refreshSource(id){ const list=Find.sources(); const s=list.find(x=>x.id===id); if(s) await refreshSrcObj(s); }
+  async function removeSourceUi(id){ if(!confirm("Remove this sheet from Find?")) return; Find.removeSource(id); Find.refresh(); renderFindSources(); renderFindResults(); }
+
+  function renderFindSources(){
+    const wrap=$("#find-sources"); if(!wrap) return;
+    const list=Find.sources();
+    if(!list.length){ wrap.innerHTML=`<p class="text-[11px] text-zinc-500 rounded-xl bg-zinc-50 border border-dashed border-zinc-200 p-3 text-center">${esc(t("find.nosources"))}</p>`; return; }
+    wrap.innerHTML=list.map(s=>{
+      const n = s.rows?Math.max(0,s.rows.length-1):0;
+      return `<div class="rounded-xl border border-zinc-200 p-2.5 text-[12px]" data-source-card="${s.id}">
+        <div class="flex items-center gap-2"><i class="ph-fill ph-file-spreadsheet text-rose-500 text-base"></i>
+          <div class="flex-1 min-w-0"><div class="font-bold truncate">${esc(s.label)}</div>
+            <div class="text-[10px] text-zinc-500 font-mono truncate">${esc(s.url)}</div></div>
+          <button class="icon-btn !w-8 !h-8" data-action="find-refresh" data-id="${s.id}" title="${esc(t("find.refresh"))}"><i class="ph ph-arrows-clockwise"></i></button>
+          <button class="icon-btn !w-8 !h-8 text-rose-500" data-action="find-remove" data-id="${s.id}" title="${esc(t("find.remove"))}"><i class="ph ph-trash"></i></button>
+        </div>
+        <div class="src-status text-[10px] mt-1 ${s.error?"text-rose-500":"text-zinc-500"}">${s.error?esc(t("find.fetcherr"))+" — "+esc(s.error):(n?n+" "+t("find.fetched")+(s.fetchedAt?" · "+new Date(s.fetchedAt).toLocaleString():""):"—")}</div>
+      </div>`;
+    }).join("");
+  }
+}
+
+function jumpTo(info){
+  const k=info.kind, id=info.id, src=info.source;
+  if(k==="teacher"||k==="member"){ Store.raw.ui.dbTab="teachers"; Store.raw.ui.route="database"; }
+  else if(k==="subject"){ Store.raw.ui.dbTab="subjects"; Store.raw.ui.route="database"; }
+  else if(k==="class"){ Store.raw.ui.route="timetable"; Store.raw.ui.activeClassId=id; }
+  else if(k==="slot"){ const [cid,ds,ps,lis]=id.split("|"); Store.raw.ui.route="timetable"; Store.raw.ui.activeClassId=cid; setTimeout(()=>openCellViewer(cid,+ds,+ps),150); return; }
+  else if(k==="attendance"){ Store.raw.ui.route="attendance"; }
+  else if(k==="sheet"){ toast("info","From sheet: "+src,"Open your linked sheet in the right panel."); return; }
+  else Store.raw.ui.route="dashboard";
+  Store.flush(); Store.requestRender(); Modal.close();
+}
+
+/* =================================================================================
    CHROME / NAV / REFRESH
    ================================================================================= */
 const ROUTES={
@@ -5449,26 +5666,28 @@ const ROUTES={
   print:    { title:"Print Center",  icon:"ph-printer",        tab:"Print"    },
   scanner:  { title:"Scanner",       icon:"ph-scan",           tab:"Scan"     },
   attendance:{ title:"Attendance",   icon:"ph-fingerprint",    tab:"Attendance" },
+  find:     { title:"Find",          icon:"ph-magnifying-glass", tab:"Find"   },
   marketing:{ title:"Marketing Studio", icon:"ph-megaphone",  tab:"Promote"  }
 };
 function allowedRoutes(){
   if (isSuper()) return Session.schoolId ? Object.keys(ROUTES) : ["admin","marketing"];
-  const r=["dashboard","timetable","relief","database","print","attendance"];
+  const r=["dashboard","timetable","relief","database","print","attendance","find"];
   if (canViewUsers()) r.splice(3,0,"team");
   if (canEdit()) r.splice(r.indexOf("database")+1,0,"scanner");
   return r;
 }
 function navModel(){
   const r=allowedRoutes();
-  if (isSuper() && Session.schoolId) return { side:["admin",...r.filter(x=>x!=="admin")], tabs:["admin","dashboard","timetable","attendance","marketing","database"] };
+  if (isSuper() && Session.schoolId) return { side:["admin",...r.filter(x=>x!=="admin")], tabs:["admin","dashboard","timetable","attendance","find","marketing","database"] };
   if (isSuper()) return { side:["admin","marketing"], tabs:["admin","marketing"] };
   const tabs=(()=>{
     const base=["dashboard","timetable","relief"];
     if(r.includes("scanner")&&r.includes("team")) base.push("scanner");
     else if(r.includes("scanner")) base.push("scanner");
-    base.push("attendance");
+    base.push("attendance","find");
     if(r.includes("team")) base.push("team");
     base.push("database");
+    if(base.length>6) return base.slice(0,5).concat(["database"]); // tab bar real estate
     return base;
   })();
   return { side:r, tabs };
@@ -5536,7 +5755,7 @@ function refresh(){
     viewDirty=true;
   } else {
     viewDirty=false;
-    const renderer=({admin:renderAdmin, marketing:renderMarketing, dashboard:renderDashboard, timetable:renderTimetable, database:renderDatabase, relief:renderRelief, team:renderTeam, print:renderPrintCenter, scanner:renderScanner, attendance:renderAttendance})[Store.raw.ui.route];
+    const renderer=({admin:renderAdmin, marketing:renderMarketing, dashboard:renderDashboard, timetable:renderTimetable, database:renderDatabase, relief:renderRelief, team:renderTeam, print:renderPrintCenter, scanner:renderScanner, attendance:renderAttendance, find:renderFind})[Store.raw.ui.route];
     try{
       if(renderer) renderer();
       else throw new Error("No renderer for route "+Store.raw.ui.route);
@@ -6231,7 +6450,7 @@ async function signOut(silent=false){
   }
   const unsynced=!!(Sync.pending||Sync.localDirty);
   try { if (FB.ready && FB.auth.currentUser) await FB.auth.signOut(); } catch(_){ /* sign-out is best effort; local state is cleared anyway */ }
-  Sync.detach(); Team.detach(); Admin.detach(); reliefStopListen(); Admin.schools={}; Admin.allUsers={};
+  Sync.detach(); Team.detach(); Admin.detach(); reliefStopListen(); findStopAttendance(); Admin.schools={}; Admin.allUsers={};
   Session.role=null; Session.schoolRole=null; Session.schoolId=null; Session.email=null; Session.uid=null; saveSession();
   /* Shared computers: an explicit sign-out removes this school's offline copy, unless changes
      are still waiting to upload (keeping those is the lesser harm). */
@@ -6805,10 +7024,11 @@ const actions={
       Store.flush();
       if(Sync.active&&(Sync.pending||Sync.localDirty)) Sync.pushNow();
       Session.schoolId=null; saveSession(); Sync.detach(); Team.detach();
-      reliefStopListen();
+      reliefStopListen(); findStopAttendance();
       if(isSuper()&&!Admin._sRef) adminSubscribe();
     }
     if (r!=="relief") reliefStopListen();
+    if (r!=="find") findStopAttendance();
     Store.raw.ui.route=r; Store.flush(); Store.requestRender(); Modal.close(); },
   "goto-database": el=>{ if(el?.dataset?.tab) Store.raw.ui.dbTab=el.dataset.tab; Store.raw.ui.route="database"; Store.flush(); Store.requestRender(); },
   "toast-close": el=>{ const t=el.closest(".toast"); t?.classList.add("leaving"); setTimeout(()=>t?.remove(),220); },
