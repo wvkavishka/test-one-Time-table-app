@@ -46,8 +46,9 @@
          min-height:44px; padding:0 1rem; border-radius:.8rem; border:1px solid transparent; cursor:pointer;
          transition: all .2s cubic-bezier(.4,0,.2,1); user-select:none; white-space:nowrap; }
   .btn:active { transform: scale(.965); }
-  .btn-primary { background:#059669; color:#fff; box-shadow: 0 1px 2px rgba(5,150,105,.25), inset 0 1px 0 rgba(255,255,255,.12); }
-  .btn-primary:hover { background:#047857; }
+  :root{ --brand:#059669; }
+  .btn-primary { background:var(--brand,#059669); color:#fff; box-shadow: 0 1px 2px rgba(5,150,105,.25), inset 0 1px 0 rgba(255,255,255,.12); }
+  .btn-primary:hover { background:var(--brand,#059669); filter:brightness(.92); }
   .btn-ghost { background:#fff; border-color:#e4e4e7; color:#3f3f46; }
   .btn-ghost:hover { background:#f4f4f5; border-color:#d4d4d8; }
   .btn-danger { background:#e11d48; color:#fff; }
@@ -607,17 +608,18 @@ const SITE_DEFAULTS = {
   whatsapp: "94722816456",
   waMsg: "Hello CampusFlow — I'd like to book a demo for my school.",
   heroTitle: "School timetables, beautifully automated.",
-  heroSubtitle: "Generate clash-free schedules, cover absent teachers instantly, and print every class plan — from any phone, even offline.",
+  heroSubtitle: "Clash-free timetables, fingerprint attendance, instant relief cover, and one search box for your whole school — in your school's own colours, from any phone, even offline.",
   trialDays: 14,
   planName: "School",
   planPrice: "Custom pricing",
   features: [
     { title: "Auto-generated timetables", text: "Clash-free schedules built from your teachers and subjects — in seconds, not days." },
-    { title: "Relief in one tap", text: "A teacher is absent. CampusFlow finds the best-matched free teacher instantly." },
-    { title: "Works fully offline", text: "Every change saves on the device and syncs later. No internet? No problem." },
-    { title: "Print everything", text: "Class, teacher, master and roster timetables — high-contrast, official, A4/A3." },
-    { title: "Sinhala · Tamil · English", text: "Built for Sri Lankan schools with a trilingual interface and local conventions." },
-    { title: "Scan your wall charts", text: "Photograph an existing timetable and import it. No re-typing required." }
+    { title: "Fingerprint attendance", text: "Teachers clock in with their phone's fingerprint. Missing teachers appear on the dashboard live." },
+    { title: "Find anything, instantly", text: "One search box for teachers, classes, lessons, attendance and your linked sheets. Ask \"who is free period 3?\" and get a sourced answer." },
+    { title: "Your school's look", text: "Your logo and colours show for every teacher and staff member the moment they sign in. Principals can give admins permission to change them." },
+    { title: "Relief in one tap", text: "A teacher is absent. CampusFlow finds the best-matched free teacher instantly, and auto-fills absences from fingerprint data." },
+    { title: "Offline · Sinhala · Tamil · English", text: "Every change saves on the device and syncs later. Built for Sri Lankan schools with a trilingual interface." },
+    { title: "Print everything", text: "Class, teacher, master and roster timetables — high-contrast, official, A4/A3." }
   ]
 };
 const PUBLIC_SITE_ENABLED = () => safeStore.get("cf.flag.publicSite","1")!=="0";
@@ -763,6 +765,16 @@ const canEdit = () => isSuper() || isPrincipal() || App.me?.permissions?.editWor
 const canViewUsers = () => isSuper() || isPrincipal() || App.me?.permissions?.viewUsers === true;
 const canManageUsers = () => isSuper() || isPrincipal();
 const canEditSettings = () => isSuper() || isPrincipal();
+/* Look & colours: principal always; any admin the principal grants editBranding. */
+const canEditBranding = () => canEditSettings() || App.me?.permissions?.editBranding === true;
+const needBranding = () => { if (canEditBranding()) return true; toast("error","Not allowed","Only the principal, or admins given 'Change school look', can do this."); return false; };
+const BRAND_PRESETS = ["#059669","#4f46e5","#0ea5e9","#e11d48","#f59e0b","#7c3aed","#0f172a","#db2777"];
+function applyBrand(){
+  const c = (Store.raw?.settings?.brand)||"";
+  const hex = /^#[0-9a-f]{6}$/i.test(c) ? c : "#059669";
+  document.documentElement.style.setProperty("--brand", hex);
+  const meta=document.querySelector('meta[name="theme-color"]'); if(meta) meta.content=hex;
+}
 
 /* ================= DATA UTILITIES ================= */
 const T = id => state.teachers.find(t=>t.id===id);
@@ -1030,8 +1042,10 @@ const Sync = {
       const access=schoolAccessState(m);
       if(!isSuper()&&access.blocked){ Session.accessBlocked=true; showSchoolBlocked(m,access); return; }
       if(Session.accessBlocked){ Session.accessBlocked=false; showApp(); Store.requestRender(); }
-      Sync._profileCache={name:m.name||"", logo:m.logo||""};
+      Sync._profileCache={name:m.name||"", logo:m.logo||"", brand:m.brand||""};
       const r=Store.raw;
+      if ((m.brand||"")!==(r.settings.brand||"")){ r.settings.brand=m.brand||""; Store.flush(); Store.requestRender(); }
+      applyBrand();
       if ((m.name && m.name!==r.settings.schoolName) || ((m.logo||"")!==r.settings.logo)){
         if (m.name) r.settings.schoolName=m.name;
         r.settings.logo=m.logo||"";
@@ -1062,6 +1076,15 @@ const Sync = {
       curriculum:r.curriculum||[], timetable:r.timetable, absences:r.absences };
     const sig=JSON.stringify(body);
     const nm=r.settings.schoolName||"", lg=r.settings.logo||"";
+    const brandNow=r.settings.brand||"";
+    if (Sync._profileReady && canEditBranding() && !canEditSettings() && lg!==(Sync._profileCache.logo||"")){
+      FB.db.ref("schools/"+sid+"/profile/logo").set(lg)
+        .then(()=>{ if(Sync.schoolId===sid) Sync._profileCache.logo=lg; }).catch(()=>{});
+    }
+    if (Sync._profileReady && canEditBranding() && brandNow!==(Sync._profileCache.brand||"")){
+      FB.db.ref("schools/"+sid+"/profile/brand").set(brandNow||null)
+        .then(()=>{ if(Sync.schoolId===sid) Sync._profileCache.brand=brandNow; }).catch(()=>{});
+    }
     if (Sync._profileReady && canEditSettings() && (nm!==Sync._profileCache.name || lg!==Sync._profileCache.logo)){
       FB.db.ref("schools/"+sid+"/profile").update({name:nm,logo:lg})
         .then(()=>{ if(Sync.schoolId===sid) Sync._profileCache={name:nm,logo:lg}; })
@@ -1823,6 +1846,7 @@ function renderDatabase(){
   let tab=state.ui.dbTab;
   const tabs=[["teachers","ph-chalkboard-teacher",t("db.teachers")],["subjects","ph-books",t("db.subjects")],["classes","ph-student",t("db.classes")],["curriculum","ph-list-checks",t("db.curriculum")]];
   if (canEditSettings()) tabs.push(["settings","ph-gear-six","Settings"]);
+  else if (canEditBranding()) tabs.push(["branding","ph-palette","Look & colours"]);
   if (!tabs.some(t=>t[0]===tab)){ tab="teachers"; Store.raw.ui.dbTab="teachers"; }
   const edit=canEdit();
   let body="";
@@ -2011,6 +2035,40 @@ function renderDatabase(){
         <b>Auto</b> divides the remaining weekly slots fairly. Choose an exact frequency only when your Ministry/school plan requires it. Fix a teacher only when that person must teach this subject in this class.</p>`:""}`;
   }
 
+  if (tab==="branding" && canEditBranding()){
+    const s=state.settings, cur=(s.brand&&/^#[0-9a-f]{6}$/i.test(s.brand))?s.brand:"#059669";
+    body=`
+    <div class="grid lg:grid-cols-2 gap-4 items-start">
+      <div class="card p-5 space-y-4">
+        <h3 class="font-display font-bold text-[15px] tracking-tight flex items-center gap-2"><i class="ph-fill ph-palette text-emerald-500"></i>School look</h3>
+        <p class="text-[12px] text-zinc-500 leading-relaxed">The logo and colour you choose here appear for every teacher and staff member of ${esc(s.schoolName||"your school")} as soon as they sign in.</p>
+        <div class="flex items-center gap-4">
+          ${brandMark("w-16 h-16 rounded-2xl text-3xl","text-3xl")}
+          <div class="flex flex-col gap-2">
+            <button class="btn btn-ghost !min-h-[40px]" data-action="logo-trigger"><i class="ph ph-image-square"></i>${s.logo?"Change logo":"Upload logo"}</button>
+            ${s.logo?`<button class="text-[11px] font-bold text-rose-500 hover:text-rose-600 text-left min-h-[28px]" data-action="logo-remove">Remove logo</button>`:""}
+          </div>
+        </div>
+        <div>
+          <label class="label">Brand colour</label>
+          <div class="flex flex-wrap gap-2 mt-1">
+            ${BRAND_PRESETS.map(c=>`<button data-action="brand-pick" data-c="${c}" title="${c}" class="w-9 h-9 rounded-xl border-2 ${c.toLowerCase()===cur.toLowerCase()?"border-zinc-900 scale-110":"border-white ring-1 ring-zinc-200"} transition" style="background:${c}"></button>`).join("")}
+            <label class="w-9 h-9 rounded-xl border border-dashed border-zinc-300 grid place-items-center cursor-pointer overflow-hidden" title="Custom colour"><i class="ph ph-eyedropper text-zinc-500"></i><input type="color" class="sr-only" value="${cur}" data-change="brand-custom"></label>
+          </div>
+          <button class="text-[11px] font-bold text-zinc-500 hover:text-zinc-800 mt-2" data-action="brand-pick" data-c="">Reset to default green</button>
+        </div>
+      </div>
+      <div class="card p-5 space-y-3">
+        <h3 class="font-display font-bold text-[15px] tracking-tight">Preview</h3>
+        <div class="rounded-2xl p-5 text-white" style="background:linear-gradient(135deg,${cur},${cur}cc)">
+          <div class="text-[11px] font-bold uppercase tracking-[.14em] opacity-80">${esc(s.schoolName||"Your school")}</div>
+          <div class="font-display font-bold text-xl mt-1">Good morning, team</div>
+          <button class="mt-3 px-3 py-2 rounded-xl bg-white font-bold text-[12px]" style="color:${cur}">Open timetable</button>
+        </div>
+        <p class="text-[11px] text-zinc-400 leading-relaxed flex items-start gap-1.5"><i class="ph-fill ph-cloud-check text-emerald-500 mt-0.5"></i>Saved to the school profile and synced to every device.</p>
+      </div>
+    </div>`;
+  }
   if (tab==="settings" && canEditSettings()){
     const s=state.settings;
     body=`
@@ -2119,6 +2177,7 @@ function memberRows(manage){
           <div class="flex flex-wrap gap-1.5 mt-2">
             ${m.permissions?.editWorkspace?`<span class="chip !text-[10px]"><i class="ph-fill ph-pencil-line text-emerald-500"></i>Can edit workspace</span>`:""}
             ${m.permissions?.viewUsers?`<span class="chip !text-[10px]"><i class="ph-fill ph-address-book text-sky-500"></i>Can view team</span>`:""}
+            ${m.permissions?.editBranding?`<span class="chip !text-[10px]"><i class="ph-fill ph-palette text-fuchsia-500"></i>Can change look</span>`:""}
             ${linkedT?`<span class="chip !text-[10px]" style="background:${linkedT.color}12;color:${linkedT.color};border-color:${linkedT.color}30"><i class="ph-fill ph-link"></i>${esc(linkedT.code||linkedT.name)}</span>`:""}
             ${!m.permissions?.editWorkspace && !m.permissions?.viewUsers && m.role!=="principal"?`<span class="chip !text-[10px]"><i class="ph-fill ph-lock-simple text-zinc-400"></i>View-only</span>`:""}
           </div>
@@ -4289,36 +4348,6 @@ const defaultGeminiModel = () => localStorage.getItem("cf.geminiModel") || "gemi
    one), we quietly try the next one before surfacing an error. All four are
    currently free-tier on Google AI Studio. */
 const FREE_GEMINI_MODELS = ["gemini-2.0-flash","gemini-2.5-flash","gemini-2.0-flash-lite","gemini-2.5-flash-lite"];
-async function callGemini(promptText, opts){
-  let key = (opts?.key || (typeof Scan!=="undefined" && Scan.aiKey) || localStorage.getItem("cf.aiKey") || "").trim();
-  if(!key) throw new Error("Add your Google AI Studio key first (free from aistudio.google.com). Paste it on this screen.");
-  if(!navigator.onLine) throw new Error("AI answers need internet. Local search still works.");
-  const preferred = defaultGeminiModel();
-  const order = [preferred, ...FREE_GEMINI_MODELS.filter(m=>m!==preferred)];
-  let lastErr = null;
-  for(const model of order){
-    try{
-      const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models/"+model+":generateContent",{
-        method:"POST", headers:{"Content-Type":"application/json","x-goog-api-key":key},
-        body: JSON.stringify({ contents:[{ parts:[{text:promptText}] }],
-          generationConfig:{ temperature:opts?.temperature ?? 0.2, maxOutputTokens:opts?.maxTokens ?? 1024 } })
-      });
-      if(r.ok){
-        const j = await r.json();
-        const text = j?.candidates?.[0]?.content?.parts?.map(p=>p.text||"").join("\n")||"";
-        if(text.trim()) return { text, model };
-        lastErr = new Error("Empty response.");
-        continue;
-      }
-      const detail = await r.text().catch(()=>"");
-      if(r.status===400 && /API key/i.test(detail)) throw new Error("That AI key was rejected. Get a free key from aistudio.google.com and paste it below.");
-      if(r.status===429){ lastErr = new Error("Google is rate-limiting the free tier right now — wait a minute or pick a lighter model in Scanner settings."); continue; }
-      if(r.status===404){ lastErr = new Error("Model "+model+" not available on your key, trying the next free model…"); continue; }
-      lastErr = new Error("AI error "+r.status+" from "+model);
-    }catch(e){ lastErr = e; if(String(e.message||"").includes("API key")) throw e; }
-  }
-  throw lastErr || new Error("No free model answered.");
-}
 async function scanOcrAI(canvas,mode){
   const key=Scan.aiKey.trim();
   if(!key) throw new Error("Add your free Google AI Studio key below or in Scanner → Settings first.");
@@ -4330,8 +4359,7 @@ async function scanOcrAI(canvas,mode){
     : mode==="teachers"
     ? "This is a school teacher list, possibly handwritten. Return one line per teacher as: Name - Subject, Subject. If subjects are not shown, return just the name. No commentary."
     : "Transcribe all readable text exactly, preserving line breaks. No commentary.";
-  // Image-in + free-model fallback uses our shared callGemini but we need a direct
-  // fetch because callGemini is text-only; iterate the same free model list.
+  // Scanner's optional AI OCR engine (user-supplied key). Iterates the free model list.
   const order = [defaultGeminiModel(), ...FREE_GEMINI_MODELS.filter(m=>m!==defaultGeminiModel())];
   let lastErr=null;
   for(const model of order){
@@ -5515,6 +5543,13 @@ async function renderAttendance(){
    FIND — universal search + AI answers
    ================================================================================= */
 let findPromise=null;
+let assistantPromise=null;
+function ensureAssistant(){
+  if(window.Assistant) return Promise.resolve(Assistant);
+  if(assistantPromise) return assistantPromise;
+  assistantPromise=loadScriptOnce("vendor/assistant.js",()=>typeof window.Assistant!=="undefined").then(()=>Assistant);
+  return assistantPromise;
+}
 function ensureFind(){
   if(window.Find) return Promise.resolve(Find);
   if(findPromise) return findPromise;
@@ -5561,36 +5596,28 @@ function renderFindResults(){
       </button>`).join("")}</div>`;
 }
 async function renderFind(){
-  await ensureFind();
+  await Promise.all([ensureFind(), ensureAssistant()]);
   const view=$("#view");
-  const key=(Scan.aiKey||"").trim()||localStorage.getItem("cf.aiKey")||"";
+  const online=navigator.onLine;
   view.innerHTML=`<div class="space-y-5 view-in">
-    <div><div class="text-[11px] font-bold uppercase tracking-[.1em] text-indigo-600">CampusFlow search</div>
-      <h2 class="font-display font-bold text-2xl sm:text-[28px] tracking-tight mt-0.5">${esc(t("route.find"))}</h2>
-      <p class="text-xs text-zinc-500 font-medium mt-1">Search teachers, classes, subjects, lessons, attendance and any linked Google Sheets — or ask a question in plain words.</p></div>
-      <div class="card p-4 sticky top-0 z-20 bg-white/90 backdrop-blur">
-        <div class="flex items-center gap-2">
-          <i class="ph ph-magnifying-glass text-zinc-400 text-xl pl-1"></i>
-          <input id="find-q" class="flex-1 !border-0 !ring-0 !bg-transparent !shadow-none !pl-0 text-[15px]" placeholder="${esc(t("find.placeholder"))}" autocomplete="off" autofocus>
-          <button class="btn btn-primary !h-10 !px-3" data-action="find-ai"><i class="ph-fill ph-sparkle"></i><span class="hidden sm:inline">${esc(t("find.askai"))}</span></button>
+    <div class="relative overflow-hidden rounded-3xl p-5 sm:p-7 text-white shadow-xl" style="background:linear-gradient(135deg,var(--brand,#4f46e5),#7c3aed 60%,#db2777)">
+      <div class="absolute -right-10 -top-10 w-44 h-44 rounded-full bg-white/10 blur-2xl"></div>
+      <div class="relative">
+        <div class="text-[11px] font-bold uppercase tracking-[.14em] opacity-80">CampusFlow Find</div>
+        <h2 class="font-display font-bold text-2xl sm:text-[30px] tracking-tight mt-1">Ask anything about your school</h2>
+        <p class="text-[13px] opacity-90 mt-1 max-w-xl">Teachers, classes, lessons, attendance and linked sheets, in one place. Works offline with your saved data.</p>
+        <div class="mt-4 flex items-center gap-2 bg-white rounded-2xl p-2 shadow-lg text-zinc-800">
+          <i class="ph ph-magnifying-glass text-zinc-400 text-xl pl-2"></i>
+          <input id="find-q" class="flex-1 !border-0 !ring-0 !bg-transparent !shadow-none !pl-0 text-[15px] font-medium" placeholder="${esc(t("find.placeholder"))}" autocomplete="off" autofocus>
+          <button class="btn btn-primary !h-10 !px-4 !rounded-xl" data-action="find-go"><i class="ph-bold ph-arrow-right"></i></button>
         </div>
-        <div id="find-ai"></div>
-        <details class="mt-2 text-[11px] text-zinc-500 ${((Scan.aiKey||"").trim()||localStorage.getItem("cf.aiKey"))?"":"open"}">
-          <summary class="cursor-pointer select-none flex items-center gap-1.5 py-1"><i class="ph-fill ${((Scan.aiKey||"").trim()||localStorage.getItem("cf.aiKey"))?"ph-check-circle text-emerald-500":"ph-key text-indigo-500"}"></i>
-            ${((Scan.aiKey||"").trim()||localStorage.getItem("cf.aiKey"))
-              ? `<span class="font-semibold text-emerald-700">AI key saved on this device (using free <span class="font-mono">${esc(defaultGeminiModel())}</span>) — click to change</span>`
-              : `<span class="font-semibold text-indigo-700">Paste a free Google AI Studio key to enable AI answers</span>`}
-          </summary>
-          <div class="mt-2 space-y-2">
-            <p class="leading-relaxed">Get a free key from <a class="text-indigo-600 underline" href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a>, paste it here. It stays only on this device (never uploaded, never synced), and the app tries the best free models in order. <b>No billing, no account after the key.</b></p>
-            <div class="flex gap-2">
-              <input id="find-key" class="field font-mono !text-xs flex-1" type="password" placeholder="AIza…" value="${esc((Scan.aiKey||"").trim()||localStorage.getItem("cf.aiKey")||"")}" autocomplete="off">
-              <button class="btn btn-ghost !h-10 !px-3" data-action="find-key-save"><i class="ph ph-check"></i>Save</button>
-              <button class="btn btn-ghost !h-10 !px-3 text-rose-500" data-action="find-key-clear" title="Remove key from this device"><i class="ph ph-trash"></i></button>
-            </div>
-          </div>
-        </details>
+        <div class="mt-3 flex flex-wrap gap-1.5 text-[11px]">
+          ${["Who is free period 3 Wednesday?","Who teaches Maths?","Where is Grade 10A on Monday?","Who is in today?"].map(s=>`<button class="px-2.5 py-1 rounded-full bg-white/15 hover:bg-white/25 font-semibold" data-action="find-example" data-q="${esc(s)}">${esc(s)}</button>`).join("")}
+        </div>
+        ${online?"":`<div class="mt-3 inline-flex items-center gap-1.5 text-[11px] font-bold bg-amber-300/90 text-amber-950 px-2.5 py-1 rounded-full"><i class="ph-fill ph-wifi-slash"></i>Offline: searching saved data. Sheet refresh needs internet.</div>`}
       </div>
+    </div>
+    <div id="find-ai"></div>
     <div class="grid lg:grid-cols-3 gap-4">
       <div id="find-results" class="lg:col-span-2 space-y-2"></div>
       <div class="space-y-4">
@@ -5600,9 +5627,9 @@ async function renderFind(){
           <button class="btn btn-ghost w-full mt-3 !text-[12px]" data-action="find-add-source"><i class="ph ph-plus"></i>${esc(t("find.addsheet"))}</button>
           <div id="find-sources" class="mt-3 space-y-2"></div>
         </div>
-        <div class="card p-4 bg-indigo-50/50 !border-indigo-200 text-[11px] text-indigo-900/80 leading-relaxed flex items-start gap-2">
-          <i class="ph-fill ph-sparkle text-indigo-500 mt-0.5 flex-none"></i>
-          <span>${esc(t("find.aikey"))}${key?"":" "+t("find.aikey-note"||"")}<br>${!navigator.onLine?"<b>"+t("find.offline")+"</b>":""}</span>
+        <div class="card p-4 text-[11px] text-zinc-500 leading-relaxed flex items-start gap-2">
+          <i class="ph-fill ph-shield-check text-emerald-500 mt-0.5 flex-none"></i>
+          <span>Answers come only from your school's own data on this device. Nothing is sent to any AI service, and there are no keys to set up.</span>
         </div>
       </div>
     </div>
@@ -5613,58 +5640,40 @@ async function renderFind(){
 
   const q=$("#find-q");
   let tmr=null;
-  q.addEventListener("input",()=>{ clearTimeout(tmr); tmr=setTimeout(()=>{
-    $("#find-ai").innerHTML="";
-    renderFindResults();
-  },120); });
+  q.addEventListener("input",()=>{ clearTimeout(tmr); tmr=setTimeout(()=>{ renderFindResults(); renderAnswer(q.value); },150); });
+  q.addEventListener("keydown",e=>{ if(e.key==="Enter"){ e.preventDefault(); renderAnswer(q.value,true); } });
   q.focus();
 
   view.addEventListener("click",findHandler);
   function findHandler(ev){
-    view.removeEventListener("click",findHandler);
     const b=ev.target.closest("[data-action]");
-    view.addEventListener("click",findHandler);
     if(!b) return;
     const a=b.dataset.action;
-    if(a==="find-ai"){ doAi(); }
-    else if(a==="find-key-save"){ saveKey(); }
-    else if(a==="find-key-clear"){ clearKey(); }
+    if(a==="find-go"){ renderAnswer(q.value,true); }
+    else if(a==="find-example"){ q.value=b.dataset.q; renderAnswer(q.value,true); renderFindResults(); }
     else if(a==="find-add-source"){ openAddSource(); }
     else if(a==="find-refresh"){ refreshSource(b.dataset.id); }
     else if(a==="find-remove"){ removeSourceUi(b.dataset.id); }
     else if(a==="find-jump"){ jumpTo(b.dataset); }
+    else if(a==="find-ask-chip"){ renderAnswer(b.dataset.q,true); }
   }
 
-  async function doAi(){
-    const q=($("#find-q")?.value||"").trim(); if(!q) return;
+  function renderAnswer(text,force){
     const out=$("#find-ai");
-    out.innerHTML=`<div class="mt-3 rounded-xl bg-indigo-50 border border-indigo-200 p-3 text-[12px] text-indigo-800"><span class="spinner"></span>${esc(t("find.aiworking"))}</div>`;
-    try{
-      const r = await Find.ask(q);
-      out.innerHTML=`<div class="mt-3 space-y-2">
-        <div class="rounded-xl bg-gradient-to-br from-indigo-50 to-violet-50 border border-indigo-200 p-3 text-[13px] text-zinc-800 whitespace-pre-wrap leading-relaxed">${esc(r.answer)}</div>
-        ${r.hits&&r.hits.length?`<details class="rounded-xl bg-white border border-zinc-200 p-2.5 text-[11px]"><summary class="cursor-pointer font-bold text-zinc-600">${esc(t("find.sources"))} (${r.hits.length})</summary>
-          <div class="mt-2 space-y-1.5">${r.hits.map(h=>`<div class="flex items-start gap-2">${kindChip(h.kind)}<span class="truncate"><b>${esc(h.title)}</b> · <span class="text-zinc-500">${esc((h.body||"").slice(0,120))}</span></span></div>`).join("")}</div></details>`:""}
-      </div>`;
-    }catch(e){ out.innerHTML=`<div class="mt-3 rounded-xl bg-rose-50 border border-rose-200 p-3 text-[12px] text-rose-700">${esc(e.message||String(e))}</div>`; }
-  }
-
-  function saveKey(){
-    const v=($("#find-key")?.value||"").trim();
-    if(!v.startsWith("AIza")){ toast("error","That doesn't look like a Google AI key","Keys start with AIza — get one free at aistudio.google.com/apikey"); return; }
-    Scan.aiKey=v;
-    try{ localStorage.setItem("cf.aiKey",v); }catch(_){}
-    if(document.getElementById("scan-remember-key")) document.getElementById("scan-remember-key").checked=true;
-    toast("success","Key saved on this device","Using free model "+defaultGeminiModel()+". Ask AI is now live.");
-    // re-render the summary line
-    const det=view.querySelector("details"); if(det){ det.open=false; det.querySelector("summary").innerHTML=`<i class="ph-fill ph-check-circle text-emerald-500"></i><span class="font-semibold text-emerald-700">AI key saved on this device (using free <span class="font-mono">${esc(defaultGeminiModel())}</span>) — click to change</span>`; }
-  }
-  function clearKey(){
-    Scan.aiKey="";
-    try{ localStorage.removeItem("cf.aiKey"); }catch(_){}
-    const k=$("#find-key"); if(k) k.value="";
-    toast("info","Key removed from this device","");
-    const det=view.querySelector("details"); if(det){ det.open=true; }
+    const qq=(text||"").trim();
+    if(!out) return;
+    if(!qq){ out.innerHTML=""; return; }
+    // Only show the answer card for questions/phrases of 2+ words, or when forced (Enter).
+    if(!force && qq.split(/\s+/).length<2 && !/\?$/.test(qq)){ out.innerHTML=""; return; }
+    let r;
+    try{ r = Assistant.answer(qq); }catch(e){ r={text:"Something went wrong reading your data. Try a simpler question.",sources:[]}; }
+    const lines=(r.text||"").split("\n").map(l=>`<div class="leading-relaxed">${esc(l)}</div>`).join("");
+    out.innerHTML=`<div class="card p-5 !border-indigo-200 bg-gradient-to-br from-white to-indigo-50/60 view-in">
+      <div class="flex items-center gap-2 mb-2"><span class="w-7 h-7 rounded-xl grid place-items-center text-white" style="background:linear-gradient(135deg,#4f46e5,#db2777)"><i class="ph-fill ph-sparkle text-[14px]"></i></span>
+        <span class="text-[12px] font-bold text-indigo-700">CampusFlow answer</span><span class="ml-auto text-[10px] text-zinc-400 font-semibold">${online?"":"offline · "}from your data</span></div>
+      <div class="text-[14px] text-zinc-800 space-y-1">${lines}</div>
+      ${r.sources&&r.sources.length?`<div class="mt-3 pt-3 border-t border-indigo-100 flex flex-wrap gap-1.5">${r.sources.slice(0,8).map(s=>`<button class="chip !text-[11px] hover:bg-white" data-action="find-jump" data-kind="${esc(s.kind||"")}" data-id="${esc(String(s.id||""))}" data-title="${esc(s.title||"")}">${kindChip(s.kind)} ${esc(s.title||"")}</button>`).join("")}</div>`:""}
+    </div>`;
   }
   function openAddSource(){
     Modal.open({
@@ -5720,13 +5729,14 @@ async function renderFind(){
 }
 
 function jumpTo(info){
-  const k=info.kind, id=info.id, src=info.source;
+  const k=info.kind, id=info.id, src=info.source||info.title;
   if(k==="teacher"||k==="member"){ Store.raw.ui.dbTab="teachers"; Store.raw.ui.route="database"; }
   else if(k==="subject"){ Store.raw.ui.dbTab="subjects"; Store.raw.ui.route="database"; }
   else if(k==="class"){ Store.raw.ui.route="timetable"; Store.raw.ui.activeClassId=id; }
   else if(k==="slot"){ const [cid,ds,ps,lis]=id.split("|"); Store.raw.ui.route="timetable"; Store.raw.ui.activeClassId=cid; setTimeout(()=>openCellViewer(cid,+ds,+ps),150); return; }
   else if(k==="attendance"){ Store.raw.ui.route="attendance"; }
-  else if(k==="sheet"){ toast("info","From sheet: "+src,"Open your linked sheet in the right panel."); return; }
+  else if(k==="database"){ Store.raw.ui.route="database"; if(id==="teachers"||id==="subjects") Store.raw.ui.dbTab=id; }
+  else if(k==="sheet"){ toast("info","From sheet: "+(src||info.title||""),"Open your linked sheet in the right panel."); return; }
   else Store.raw.ui.route="dashboard";
   Store.flush(); Store.requestRender(); Modal.close();
 }
@@ -5833,6 +5843,7 @@ function refresh(){
     viewDirty=true;
   } else {
     viewDirty=false;
+    applyBrand();
     const renderer=({admin:renderAdmin, marketing:renderMarketing, dashboard:renderDashboard, timetable:renderTimetable, database:renderDatabase, relief:renderRelief, team:renderTeam, print:renderPrintCenter, scanner:renderScanner, attendance:renderAttendance, find:renderFind})[Store.raw.ui.route];
     try{
       if(renderer) renderer();
@@ -7026,6 +7037,11 @@ function openMemberForm(muid){
               <span class="switch"></span>
               <span class="text-[13px] font-semibold flex-1">Can view team<span class="block text-[10px] font-medium text-zinc-400">See the member directory</span></span>
             </label>
+            <label class="flex items-center gap-3 p-2.5 rounded-xl border border-zinc-200/80 cursor-pointer min-h-[48px]">
+              <input type="checkbox" class="sr-only" data-change="member-perm" data-id="${muid}" data-perm="editBranding" ${m.permissions?.editBranding?"checked":""}>
+              <span class="switch"></span>
+              <span class="text-[13px] font-semibold flex-1">Can change school look<span class="block text-[10px] font-medium text-zinc-400">School colours &amp; logo for everyone</span></span>
+            </label>
           </div>
           <div><label class="label">Link timetable profile (optional)</label>
             <select class="field" data-change="member-teacher" data-id="${muid}">
@@ -7295,8 +7311,9 @@ const actions={
     toast("success","Workspace is empty","Sample and school scheduling data were removed locally and queued for cloud sync.");
   },
   "clear-all": ()=>actions["reset-workspace"](),
-  "logo-trigger": ()=>{ if(needSettings()) $("#logo-file").click(); },
-  "logo-remove": ()=>{ if(!needSettings()) return; state.settings.logo=""; toast("info","Logo removed","The default monogram is back."); },
+  "logo-trigger": ()=>{ if(needBranding()) $("#logo-file").click(); },
+  "brand-pick": el=>{ if(!needBranding()) return; const c=el?.dataset?.c||""; state.settings.brand=/^#[0-9a-f]{6}$/i.test(c)?c:""; applyBrand(); Store.flush(); Store.requestRender(); toast("success","Look updated","Every member will see this when they sign in."); },
+  "logo-remove": ()=>{ if(!needBranding()) return; state.settings.logo=""; toast("info","Logo removed","The default monogram is back."); },
 
   "relief-today": ()=>{ state.ui.reliefDate=localISO(); },
   "relief-auto": ()=>{
@@ -8456,8 +8473,9 @@ const changeHandlers={
           : "That file could not be read"+(err&&err.message?" — "+err.message:"")+".");
     }
   },
+  "brand-custom": el=>{ if(!needBranding()) return; const c=String(el.value||""); if(/^#[0-9a-f]{6}$/i.test(c)){ state.settings.brand=c; applyBrand(); Store.flush(); Store.requestRender(); } },
   "logo-file": el=>{
-    if(!canEditSettings()) return;
+    if(!canEditBranding()) return;
     const f=el.files?.[0]; el.value=""; if(!f) return;
     if(!f.type.startsWith("image/")){ toast("error","Not an image","Pick a PNG, JPG or SVG file."); return; }
     const rd=new FileReader();

@@ -32,8 +32,12 @@
             ".validate": "newData.isString() && newData.val().length > 0 && newData.val().length < 120"
           },
           "logo": {
-            ".write": "auth != null && (auth.uid === 'FI059sTQ5hXFSAYEqKefDyk3kBw2' || (auth.token.email === 'w.v.k.kalhara@gmail.com' && auth.token.email_verified === true) || root.child('users/' + auth.uid + '/role').val() === 'super' || root.child('users/' + auth.uid + '/role').val() === 'superadmin' || root.child('schools/' + $schoolId + '/members/' + auth.uid + '/role').val() === 'principal')",
+            ".write": "auth != null && (auth.uid === 'FI059sTQ5hXFSAYEqKefDyk3kBw2' || (auth.token.email === 'w.v.k.kalhara@gmail.com' && auth.token.email_verified === true) || root.child('users/' + auth.uid + '/role').val() === 'super' || root.child('users/' + auth.uid + '/role').val() === 'superadmin' || root.child('schools/' + $schoolId + '/members/' + auth.uid + '/role').val() === 'principal' || (root.child('schools/' + $schoolId + '/members/' + auth.uid + '/active').val() === true && root.child('schools/' + $schoolId + '/members/' + auth.uid + '/permissions/editBranding').val() === true))",
             ".validate": "newData.isString() && newData.val().length < 400000 && (newData.val() === '' || newData.val().beginsWith('data:image/png;base64,') || newData.val().beginsWith('data:image/jpeg;base64,') || newData.val().beginsWith('data:image/webp;base64,') || newData.val().beginsWith('data:image/gif;base64,'))"
+          },
+          "brand": {
+            ".write": "auth != null && (auth.uid === 'FI059sTQ5hXFSAYEqKefDyk3kBw2' || (auth.token.email === 'w.v.k.kalhara@gmail.com' && auth.token.email_verified === true) || root.child('users/' + auth.uid + '/role').val() === 'super' || root.child('users/' + auth.uid + '/role').val() === 'superadmin' || root.child('schools/' + $schoolId + '/members/' + auth.uid + '/role').val() === 'principal' || (root.child('schools/' + $schoolId + '/members/' + auth.uid + '/active').val() === true && root.child('schools/' + $schoolId + '/members/' + auth.uid + '/permissions/editBranding').val() === true))",
+            ".validate": "!newData.exists() || newData.val() === null || (newData.isString() && newData.val().length === 7 && newData.val().beginsWith('#'))"
           },
           "principalUid": {
             ".validate": "auth.uid === 'FI059sTQ5hXFSAYEqKefDyk3kBw2' || (auth.token.email === 'w.v.k.kalhara@gmail.com' && auth.token.email_verified === true) || root.child('users/' + auth.uid + '/role').val() === 'super' || root.child('users/' + auth.uid + '/role').val() === 'superadmin' || newData.val() === data.val()"

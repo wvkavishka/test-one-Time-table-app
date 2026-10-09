@@ -210,35 +210,9 @@ const Find = (()=>{
   }
 
   // --- AI call ---
-  async function ask(q, onProgress){
-    const key = (Scan.aiKey||"").trim() || localStorage.getItem("cf.aiKey")||"";
-    if(!key) throw new Error("Paste your free Google AI Studio key below (AIza…). Keys stay on this device only — they are never sent anywhere except Google.");
-    if(!navigator.onLine) throw new Error("AI answers need internet. Local search above works offline.");
-    const hits = search(q, 30);
-    const ctxBlocks = hits.slice(0,16).map((h,i)=>{
-      const label = {teacher:"Teacher",subject:"Subject",class:"Class",slot:"Lesson",attendance:"Attendance",member:"User",sheet:("Sheet: "+h.sourceLabel)}[h.kind]||h.kind;
-      return `[${i+1}] (${label}) ${h.title} — ${h.body}`;
-    });
-    const sheetStatus = sources().map(s=>`- ${s.label}: ${s.rows?s.rows.length-1:"0"} rows, fetched ${s.fetchedAt?new Date(s.fetchedAt).toLocaleString():"never"}${s.error?" (error: "+s.error+")":""}`).join("\n");
-    const sys = `You are the Find assistant inside CampusFlow, a school app. Answer briefly (3–6 sentences) and factually, in the same language the user asked. Use ONLY facts from the DATA block below. If the data does not contain the answer, say "I don't see that yet — add a public sheet with more data, or ask differently." End with one line "Sources:" listing the [n] numbers you used (comma-separated). No other commentary.
-
-School: ${state.settings.schoolName||"School"}.
-Teachers: ${(state.teachers||[]).length}, classes: ${(state.classes||[])}, subjects: ${(state.subjects||[])}.
-${sheetStatus?("Linked sheets:\n"+sheetStatus):"No linked sheets yet."}
-
-DATA:
-${ctxBlocks.join("\n")||"(no matching data)"}
-
-Question: ${q}`;
-    onProgress?.("asking…");
-    const r = await callGemini(sys, { key, temperature:0.2, maxTokens:1024 });
-    if(!r.text.trim()) throw new Error("The AI returned an empty answer. Try rephrasing.");
-    return { answer: r.text, hits: hits.slice(0,8), model: r.model };
-  }
-
   function refresh(){ _idx = buildDocs(); }
 
-  return { search, ask, sources, addSource, removeSource, fetchSource, refresh, sheetExportUrl, parseCSV, tokens, norm };
+  return { search, sources, addSource, removeSource, fetchSource, refresh, sheetExportUrl, parseCSV, tokens, norm, score };
 })();
 
 window.Find = Find;
