@@ -477,8 +477,8 @@ const LOGIN_V2_ENABLED=()=>safeStore.get("cf.flag.loginV2","1")!=="0";
 const I18N={
   en:{ "app.tagline":"Your school, beautifully orchestrated",
     "route.admin":"Schools","route.dashboard":"Dashboard","route.timetable":"Timetable","route.relief":"Relief Center",
-    "route.team":"Team","route.database":"Database","route.print":"Print Center",
-    "tab.admin":"Schools","tab.dashboard":"Home","tab.timetable":"Timetable","tab.relief":"Relief","tab.team":"Team","tab.database":"Data","tab.print":"Print",
+    "route.team":"Team","route.database":"Database","route.print":"Print Center","route.attendance":"Attendance",
+    "tab.admin":"Schools","tab.dashboard":"Home","tab.timetable":"Timetable","tab.relief":"Relief","tab.team":"Team","tab.database":"Data","tab.print":"Print","tab.attendance":"Attendance",
     "role.principal":"Principal","role.admin":"Admin","role.teacher":"Teacher","role.staff":"Staff",
     "login.user":"Username or email","login.pass":"Password","login.signin":"Sign in","login.forgot":"Forgot?",
     "login.hint":"Accounts are issued by your school's principal.","login.signing":"Signing in…",
@@ -486,11 +486,22 @@ const I18N={
     "act.generate":"Auto-generate","act.lock":"Lock","act.unlock":"Unlock","act.clear":"Clear…","act.copyday":"Copy day",
     "act.free":"Free teachers","act.signout":"Sign out","act.undo":"Undo","act.redo":"Redo","act.print":"Print",
     "sync.synced":"Synced","sync.syncing":"Syncing…","sync.offline":"Offline · saved locally","sync.connecting":"Connecting…",
-    "lang.name":"English" },
+    "att.clockin":"Clock in","att.clockout":"Clock out","att.today":"Today","att.in":"In","att.out":"Out","att.away":"Away",
+    "att.fingerprint":"Fingerprint / Face","att.addbio":"Add fingerprint","att.removebio":"Remove",
+    "att.fingerdesc":"Tap the button and touch your phone's fingerprint sensor. The browser never sees your fingerprint — your phone only confirms it is really you.",
+    "att.nobio":"This device has no fingerprint/face reader the browser can use. Clock in with a tap instead, or open this page on your phone and register a fingerprint there.",
+    "att.manualnote":"I'm at school (without a fingerprint)","att.mymanage":"My devices","att.registered":"Registered fingerprints",
+    "att.noregistered":"No fingerprints registered yet. Register one from your phone — the next clock-in takes one tap.","att.live":"Live today",
+    "att.devices":"Attendance devices","att.adddevice":"Add USB / wall device","att.adddevicedesc":"Create a key for a PC connected to a USB fingerprint reader, or a wall-mounted attendance machine. Copy the key once — it is never shown again.",
+    "att.revoke":"Revoke","att.keycopied":"Key copied. Paste it into your attendance device or companion app.","att.nokeys":"No paired devices yet.",
+    "att.printsheet":"Print attendance sheet","att.printrecent":"Print last 14 days","att.summary":"Daily summary","att.method.fingerprint":"Fingerprint","att.method.manual":"Manual sign-in","att.method.device":"Scanner device",
+    "att.registeredon":"Registered","att.lastused":"Last used","att.statusin":"Signed in","att.statusout":"Left","att.statusaway":"Not here yet",
+    "att.confirmremove":"Remove this fingerprint? You can register it again from the same phone later.",
+    "att.attaching":"Talking to the fingerprint sensor…","att.wholetime":"Live clock-ins appear here as teachers tap in.","lang.name":"English" },
   si:{ "app.tagline":"ඔබේ පාසල, පහසුවෙන් කළමනාකරණය",
     "route.admin":"පාසල්","route.dashboard":"උපකරණ පුවරුව","route.timetable":"කාල සටහන","route.relief":"ආදේශක මධ්‍යස්ථානය",
-    "route.team":"කාර්ය මණ්ඩලය","route.database":"දත්ත","route.print":"මුද්‍රණය",
-    "tab.admin":"පාසල්","tab.dashboard":"මුල් පිටුව","tab.timetable":"කාල සටහන","tab.relief":"ආදේශක","tab.team":"කණ්ඩායම","tab.database":"දත්ත","tab.print":"මුද්‍රණය",
+    "route.team":"කාර්ය මණ්ඩලය","route.database":"දත්ත","route.print":"මුද්‍රණය","route.attendance":"පැමිණීම",
+    "tab.admin":"පාසල්","tab.dashboard":"මුල් පිටුව","tab.timetable":"කාල සටහන","tab.relief":"ආදේශක","tab.team":"කණ්ඩායම","tab.database":"දත්ත","tab.print":"මුද්‍රණය","tab.attendance":"පැමිණීම",
     "role.principal":"විදුහල්පති","role.admin":"පරිපාලක","role.teacher":"ගුරුවරයා","role.staff":"කාර්ය මණ්ඩලය",
     "login.user":"පරිශීලක නාමය හෝ ඊමේල්","login.pass":"මුරපදය","login.signin":"ඇතුල් වන්න","login.forgot":"අමතකද?",
     "login.hint":"ගිණුම් ලබා දෙන්නේ ඔබේ පාසලේ විදුහල්පතිතුමා විසිනි.","login.signing":"ඇතුල් වෙමින්…",
@@ -498,11 +509,24 @@ const I18N={
     "act.generate":"ස්වයංක්‍රීයව සාදන්න","act.lock":"අගුළු දමන්න","act.unlock":"අගුළු හරින්න","act.clear":"මකන්න…","act.copyday":"දිනය පිටපත් කරන්න",
     "act.free":"නිදහස් ගුරුවරු","act.signout":"ඉවත් වන්න","act.undo":"පෙරලන්න","act.redo":"නැවත","act.print":"මුද්‍රණය",
     "sync.synced":"සුරැකිණි","sync.syncing":"සුරකිමින්…","sync.offline":"අන්තර්ජාලය නැත · දුරකථනයේ සුරැකිණි","sync.connecting":"සම්බන්ධ වෙමින්…",
+    "att.clockin":"පැමිණීම වාර්තා කරන්න","att.clockout":"පිටවීම වාර්තා කරන්න","att.today":"අද","att.in":"පැමිණි","att.out":"ගියා","att.away":"පැමිණ නැත",
+    "att.fingerprint":"ඇඟිලි සලකුණ / මුහුණ","att.addbio":"ඇඟිලි සලකුණ එක් කරන්න","att.removebio":"ඉවත් කරන්න",
+    "att.fingerdesc":"බොත්තම ඔබා ඔබේ දුරකථනයේ ඇඟිලි සලකුණු සංවේදකය ස්පර්ශ කරන්න. බ්‍රවුසරය කිසිවිටක ඔබේ ඇඟිලි සලකුණ නොදකී.",
+    "att.nobio":"මෙම උපාංගයේ බ්‍රවුසරයට භාවිත කළ හැකි ඇඟිලි සලකුණු කියවනය නැත. ඔබේ දුරකථනයෙන් පිවිස ලියාපදිංචි වන්න.",
+    "att.manualnote":"මම පාසලේ (ඇඟිලි සලකුණකින් තොරව)","att.mymanage":"මගේ උපාංග","att.registered":"ලියාපදිංචි ඇඟිලි සලකුණු",
+    "att.noregistered":"තවම ඇඟිලි සලකුණු ලියාපදිංචි කර නැත. ඔබේ දුරකථනයෙන් එක් කරන්න — ඉන්පසු එක් තට්ටුවකින් පැමිණීම සලකුණු කළ හැකිය.","att.live":"අද සජීවීව",
+    "att.devices":"පැමිණීම් උපාංග","att.adddevice":"USB / බිත්ති උපාංගය එක් කරන්න","att.adddevicedesc":"USB ඇඟිලි සලකුණු කියවනයකට සම්බන්ධ පරිගණකයක් හෝ බිත්ති යන්ත්‍රයක් සඳහා යතුරක් සාදන්න. වරක් පමණක් පෙන්වන බැවින් එකවර පිටපත් කරගන්න.",
+    "att.revoke":"අවලංගු කරන්න","att.keycopied":"යතුර පිටපත් විය. ඔබේ උපාංගයේ හෝ යෙදුමේ අලවන්න.","att.nokeys":"යුගලනය කළ උපාංග නැත.",
+    "att.printsheet":"පැමිණීම් පත්‍රය මුද්‍රණය කරන්න","att.printrecent":"දින 14 මුද්‍රණය කරන්න","att.summary":"දෛනික සාරාංශය",
+    "att.method.fingerprint":"ඇඟිලි සලකුණ","att.method.manual":"අතින් වාර්තා","att.method.device":"ස්කෑනර් උපාංගය",
+    "att.registeredon":"ලියාපදිංචිය","att.lastused":"අවසාන භාවිතය","att.statusin":"පැමිණ සිටී","att.statusout":"පිටව ගියේය","att.statusaway":"තවම පැමිණ නැත",
+    "att.confirmremove":"මෙම ඇඟිලි සලකුණ ඉවත් කරන්න ද? පසුව නැවත ලියාපදිංචි කළ හැකිය.",
+    "att.attaching":"ඇඟිලි සලකුණු සංවේදකය ඇමතෙමින්…",
     "lang.name":"සිංහල" },
   ta:{ "app.tagline":"உங்கள் பாடசாலை, எளிதாக நிர்வகிக்கப்படுகிறது",
     "route.admin":"பாடசாலைகள்","route.dashboard":"முகப்பு","route.timetable":"நேரசூசி","route.relief":"மாற்று ஆசிரியர்",
-    "route.team":"பணியாளர்கள்","route.database":"தரவு","route.print":"அச்சிடு",
-    "tab.admin":"பாடசாலை","tab.dashboard":"முகப்பு","tab.timetable":"நேரசூசி","tab.relief":"மாற்று","tab.team":"குழு","tab.database":"தரவு","tab.print":"அச்சு",
+    "route.team":"பணியாளர்கள்","route.database":"தரவு","route.print":"அச்சிடு","route.attendance":"வருகை",
+    "tab.admin":"பாடசாலை","tab.dashboard":"முகப்பு","tab.timetable":"நேரசூசி","tab.relief":"மாற்று","tab.team":"குழு","tab.database":"தரவு","tab.print":"அச்சு","tab.attendance":"வருகை",
     "role.principal":"அதிபர்","role.admin":"நிர்வாகி","role.teacher":"ஆசிரியர்","role.staff":"பணியாளர்",
     "login.user":"பயனர்பெயர் அல்லது மின்னஞ்சல்","login.pass":"கடவுச்சொல்","login.signin":"உள்நுழை","login.forgot":"மறந்ததா?",
     "login.hint":"கணக்குகள் உங்கள் அதிபரால் வழங்கப்படும்.","login.signing":"உள்நுழைகிறது…",
@@ -510,6 +534,19 @@ const I18N={
     "act.generate":"தானாக உருவாக்கு","act.lock":"பூட்டு","act.unlock":"திற","act.clear":"அழி…","act.copyday":"நாளை நகலெடு",
     "act.free":"காலியான ஆசிரியர்","act.signout":"வெளியேறு","act.undo":"திரும்பப்பெறு","act.redo":"மீண்டும்","act.print":"அச்சிடு",
     "sync.synced":"சேமிக்கப்பட்டது","sync.syncing":"சேமிக்கிறது…","sync.offline":"இணையம் இல்லை · சாதனத்தில் சேமிப்பு","sync.connecting":"இணைக்கிறது…",
+    "att.clockin":"உள்ளே வருகை","att.clockout":"வெளியேறு","att.today":"இன்று","att.in":"உள்ளே","att.out":"வெளியே","att.away":"வரவில்லை",
+    "att.fingerprint":"கைரேகை / முகம்","att.addbio":"கைரேகை சேர்","att.removebio":"நீக்கு",
+    "att.fingerdesc":"பொத்தானைத் தட்டி உங்கள் போனின் கைரேகை உணரியைத் தொடவும். உலாவி கைரேகையைப் பார்க்காது — நீங்கள்தான் என்பதை உறுதிப்படுத்துகிறது.",
+    "att.nobio":"இந்தச் சாதனத்தில் உலாவி பயன்படுத்தக்கூடிய கைரேகை வாசிப்பான் இல்லை.",
+    "att.manualnote":"நான் பாடசாலையில் இருக்கிறேன் (கைரேகை இல்லாமல்)","att.mymanage":"என் சாதனங்கள்","att.registered":"பதிவு செய்த கைரேகைகள்",
+    "att.noregistered":"இன்னும் கைரேகை பதிவாகவில்லை. உங்கள் போனில் பதிவு செய்யுங்கள்.","att.live":"இன்று நேரலை",
+    "att.devices":"வருகைச் சாதனங்கள்","att.adddevice":"USB / சுவர் சாதனம் சேர்","att.adddevicedesc":"USB கைரேகை வாசிப்பான் இணைக்கப்பட்ட கணினிக்கு ஒரு சாவியை உருவாக்கவும். ஒரு முறை மட்டும் காண்பிக்கப்படும்.",
+    "att.revoke":"ரத்து செய்","att.keycopied":"சாவி நகலெடுக்கப்பட்டது.","att.nokeys":"இணைக்கப்பட்ட சாதனங்கள் இல்லை.",
+    "att.printsheet":"வருகைத் தாளை அச்சிடு","att.printrecent":"கடந்த 14 நாட்களை அச்சிடு","att.summary":"தினசரி சுருக்கம்",
+    "att.method.fingerprint":"கைரேகை","att.method.manual":"கைமுறை","att.method.device":"ஸ்கேனர்",
+    "att.registeredon":"பதிவு","att.lastused":"கடைசிப் பயன்பாடு","att.statusin":"உள்ளே","att.statusout":"வெளியேறினார்","att.statusaway":"இன்னும் வரவில்லை",
+    "att.confirmremove":"இந்தக் கைரேகையை நீக்கவா? பின்னர் மீண்டும் பதிவு செய்யலாம்.",
+    "att.attaching":"கைரேகை உணரியுடன் பேசுகிறது…",
     "lang.name":"தமிழ்" }
 };
 let LANG = safeStore.get("cf.lang","en") || "en";
@@ -5037,6 +5074,265 @@ function renderScanner(){
 }
 
 /* =================================================================================
+   ATTENDANCE — fingerprint clock-in and live principal dashboard
+   ================================================================================= */
+let attendancePromise=null;
+function ensureAttendance(){
+  if(window.ATT) return Promise.resolve(ATT);
+  if(attendancePromise) return attendancePromise;
+  attendancePromise=loadScriptOnce("vendor/attendance.js",()=>typeof window.ATT!=="undefined").then(()=>ATT);
+  return attendancePromise;
+}
+
+function attMethodChip(method){
+  const map={fingerprint:["ph-fingerprint","att.method.fingerprint","bg-violet-50 text-violet-700 border-violet-200"],
+             manual:["ph-hand-pointing","att.method.manual","bg-amber-50 text-amber-700 border-amber-200"],
+             device:["ph-plugs-connected","att.method.device","bg-sky-50 text-sky-700 border-sky-200"]};
+  const [ic,k,cls] = map[method]||["ph-dot","?","bg-zinc-100 text-zinc-600 border-zinc-200"];
+  return `<span class="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-bold ${cls}"><i class="ph-fill ${ic}"></i>${esc(t(k))}</span>`;
+}
+function attStatusPill(s){
+  if(s==="in") return `<span class="chip !text-[10px] bg-emerald-50 text-emerald-700 border border-emerald-200"><i class="ph-fill ph-check-circle"></i>${esc(t("att.statusin"))}</span>`;
+  if(s==="out") return `<span class="chip !text-[10px] bg-zinc-100 text-zinc-600 border border-zinc-200"><i class="ph-fill ph-arrow-right"></i>${esc(t("att.statusout"))}</span>`;
+  return `<span class="chip !text-[10px] bg-rose-50 text-rose-600 border border-rose-200"><i class="ph-fill ph-clock"></i>${esc(t("att.statusaway"))}</span>`;
+}
+
+async function renderAttendance(){
+  const view=$("#view");
+  view.innerHTML=`<div class="space-y-4 view-in">
+    <div class="flex items-end justify-between gap-3 flex-wrap">
+      <div><div class="text-[11px] font-bold uppercase tracking-[.1em] text-violet-600">Biometric attendance</div>
+      <h2 class="font-display font-bold text-2xl sm:text-[28px] tracking-tight mt-0.5">${esc(t("route.attendance"))}</h2>
+      <p class="text-xs text-zinc-500 font-medium mt-1">${esc(t("att.wholetime"))}</p></div>
+      ${(isPrincipal()||isSuper())?`<div class="flex gap-2"><button class="btn btn-ghost" data-action="att-print-today"><i class="ph ph-printer"></i>${esc(t("att.printsheet"))}</button>
+        <button class="btn btn-ghost" data-action="att-print-recent"><i class="ph ph-calendar-check"></i>${esc(t("att.printrecent"))}</button>
+        <button class="btn btn-primary" data-action="att-add-device"><i class="ph ph-plugs-connected"></i>${esc(t("att.adddevice"))}</button></div>`:""}
+    </div>
+    <div id="att-body" class="grid lg:grid-cols-3 gap-4"><div class="lg:col-span-3 text-center text-zinc-400 text-sm py-10"><span class="spinner"></span></div></div>
+  </div>`;
+  try{ await ensureAttendance(); }catch(e){ view.querySelector("#att-body").innerHTML=`<div class="card p-6 text-rose-700">${esc(e.message||String(e))}</div>`; return; }
+
+  const canManage = isPrincipal() || Session.schoolRole==="admin" || isSuper();
+  async function paint(){
+    const mine = await ATT.todayForMe();
+    const mineStatus = ATT.latestStatus(mine);
+    // Registering a fingerprint only makes sense on a device that can actually prompt for one.
+    const bio = ATT.hasBiometric();
+    const creds = bio ? await ATT.listCredentials() : {};
+    const mineHtml = `
+      <div class="card p-5">
+        <div class="flex items-center justify-between gap-3">
+          <div>
+            <div class="text-[11px] font-bold uppercase tracking-[.1em] text-violet-500">${esc(state.settings.schoolName||"School")}</div>
+            <h3 class="font-display font-bold text-lg mt-0.5">${esc(Session.email||"You")}</h3>
+            <p class="text-[11px] text-zinc-500">${fmtRole(Session.schoolRole)} · ${esc(t("att.today"))}</p>
+          </div>
+          ${attStatusPill(mineStatus.status)}
+        </div>
+        <div class="grid grid-cols-2 gap-2 mt-5">
+          <button class="btn btn-primary !h-12 text-[14px]" data-action="att-clock" data-kind="in" ${mineStatus.status==="in"?"disabled":""}><i class="ph-fill ph-fingerprint text-lg"></i>${esc(t("att.clockin"))}</button>
+          <button class="btn btn-ghost !h-12 text-[14px]" data-action="att-clock" data-kind="out" ${mineStatus.status!=="in"?"disabled":""}><i class="ph ph-door-open"></i>${esc(t("att.clockout"))}</button>
+        </div>
+        ${bio?`<button class="btn btn-ghost w-full mt-2 !text-[12px]" data-action="att-manual" data-kind="${mineStatus.status==="in"?"out":"in"}"><i class="ph ph-hand-pointing"></i>${esc(t("att.manualnote"))}</button>`
+            :`<div class="mt-3 rounded-xl p-3 text-[11px] leading-relaxed text-amber-800 bg-amber-50 border border-amber-200 flex items-start gap-2"><i class="ph-fill ph-warning text-amber-500 mt-0.5 flex-none"></i><span>${esc(t("att.nobio"))}</span></div>`}
+        <div class="mt-5 pt-4 border-t border-zinc-100">
+          <div class="flex items-center justify-between mb-2"><b class="text-[13px]">${esc(t("att.registered"))}</b>
+            ${bio?`<button class="btn btn-ghost !h-8 !px-3 !text-[11px]" data-action="att-add-bio"><i class="ph ph-plus"></i>${esc(t("att.addbio"))}</button>`:""}</div>
+          ${bio?(Object.keys(creds).length?`<div class="space-y-2">${Object.entries(creds).map(([cid,c])=>`
+            <div class="flex items-center justify-between gap-2 rounded-xl border border-zinc-200 p-2.5">
+              <div class="min-w-0">
+                <div class="font-semibold text-[13px] truncate"><i class="ph-fill ph-fingerprint text-violet-500 mr-1"></i>${esc(c.label||"Phone")}</div>
+                <div class="text-[10px] text-zinc-500">${esc(t("att.registeredon"))} ${ATT.fmtWhen(c.createdAt)} · ${esc(t("att.lastused"))} ${c.lastUsedAt?ATT.fmtWhen(c.lastUsedAt):"—"}</div>
+              </div>
+              <button class="btn btn-ghost !h-8 !w-8 !px-0" data-action="att-remove-bio" data-cid="${esc(cid)}" title="${esc(t("att.removebio"))}"><i class="ph ph-trash"></i></button>
+            </div>`).join("")}</div>`
+            :`<p class="text-[11px] text-zinc-500 leading-relaxed rounded-xl bg-zinc-50 border border-zinc-200 p-3">${esc(t("att.noregistered"))}</p>`):""}
+        </div>
+        <p class="text-[10px] text-zinc-400 mt-3 leading-relaxed">${esc(t("att.fingerdesc"))}</p>
+      </div>`;
+
+    let schoolHtml="";
+    if(canManage){
+      const data = await ATT.todayForSchool();
+      const day = data.day;
+      const members = data.members;
+      const rows = Object.entries(members).filter(([uid,m])=>m && m.active && (m.role==="teacher"||m.role==="staff"||m.role==="admin"))
+        .map(([uid,m])=>{
+          const me = day?.byMember?.[uid];
+          const s = ATT.latestStatus(me);
+          return { uid, m, s };
+        }).sort((a,b)=>{
+          const o={in:0,out:1,away:2};
+          if(o[a.s.status]!==o[b.s.status]) return o[a.s.status]-o[b.s.status];
+          return (a.m.name||"").localeCompare(b.m.name||"");
+        });
+      const counts = rows.reduce((o,r)=>{o[r.s.status]=(o[r.s.status]||0)+1;return o;},{in:0,out:0,away:0});
+      schoolHtml = `<div class="lg:col-span-2 space-y-4">
+        <div class="grid sm:grid-cols-3 gap-3">
+          <div class="card p-4"><div class="text-[10px] font-bold uppercase text-emerald-600 tracking-wider">${esc(t("att.in"))}</div><div class="text-2xl font-extrabold mt-1">${counts.in}</div><div class="text-[11px] text-zinc-500">${esc(t("att.live"))}</div></div>
+          <div class="card p-4"><div class="text-[10px] font-bold uppercase text-zinc-500 tracking-wider">${esc(t("att.out"))}</div><div class="text-2xl font-extrabold mt-1">${counts.out}</div><div class="text-[11px] text-zinc-500">${esc(t("att.statusout"))}</div></div>
+          <div class="card p-4"><div class="text-[10px] font-bold uppercase text-rose-500 tracking-wider">${esc(t("att.away"))}</div><div class="text-2xl font-extrabold mt-1">${counts.away}</div><div class="text-[11px] text-zinc-500">${esc(t("att.statusaway"))}</div></div>
+        </div>
+        <div class="card p-0 overflow-hidden" id="att-print-today">
+          <div class="p-4 border-b border-zinc-100 flex items-center justify-between">
+            <div><h3 class="font-bold text-[15px]">${esc(state.settings.schoolName||"School")} · ${esc(t("att.today"))} ${ATT.todayKey()}</h3>
+              <p class="text-[11px] text-zinc-500">${esc(t("att.wholetime"))}</p></div>
+            <span class="text-[10px] text-zinc-400">${rows.length} staff</span>
+          </div>
+          <div class="overflow-x-auto">
+          <table class="w-full text-[13px]">
+            <thead class="bg-zinc-50 text-[11px] uppercase tracking-wider text-zinc-500"><tr>
+              <th class="text-left p-3">Name</th><th class="text-left p-3">Role</th><th class="text-left p-3">Status</th>
+              <th class="text-left p-3">In</th><th class="text-left p-3">Out</th><th class="text-left p-3">Device</th>
+            </tr></thead>
+            <tbody>
+              ${rows.map(r=>`<tr class="border-t border-zinc-100 hover:bg-zinc-50/60">
+                <td class="p-3 font-medium">${esc(r.m.name||r.m.email||r.uid)}</td>
+                <td class="p-3 text-zinc-500">${esc(fmtRole(r.m.role))}</td>
+                <td class="p-3">${attStatusPill(r.s.status)}</td>
+                <td class="p-3 tabular-nums">${r.s.inAt?ATT.fmtClock(r.s.inAt):"—"}</td>
+                <td class="p-3 tabular-nums">${r.s.outAt?ATT.fmtClock(r.s.outAt):"—"}</td>
+                <td class="p-3">${r.s.method?attMethodChip(r.s.method):'<span class="text-zinc-300 text-[10px]">—</span>'}</td>
+              </tr>`).join("")}
+            </tbody>
+          </table>
+          </div>
+        </div>
+        ${await renderAttendanceDevices()}
+      </div>`;
+    } else schoolHtml=`<div class="lg:col-span-2"></div>`;
+
+    view.querySelector("#att-body").innerHTML = mineHtml + schoolHtml;
+  }
+
+  view.addEventListener("click", attHandler, { once:true });
+  async function attHandler(ev){
+    const b=ev.target.closest("[data-action]");
+    view.addEventListener("click",attHandler,{once:true});
+    if(!b) return;
+    const act=b.dataset.action;
+    try{
+      if(act==="att-clock"){
+        const kind=b.dataset.kind;
+        b.disabled=true; const old=b.innerHTML; b.innerHTML=`<span class="spinner"></span>${esc(t("att.attaching"))}`;
+        try{
+          if(ATT.hasBiometric()){
+            await ATT.clockWithFinger(kind);
+            toast("success",kind==="in"?"Signed in with your fingerprint.":"Signed out.","");
+          } else {
+            await ATT.clockManual(kind);
+            toast("success",kind==="in"?"Signed in.":"Signed out.","");
+          }
+        }finally{ b.disabled=false; b.innerHTML=old; }
+        await paint();
+      } else if(act==="att-manual"){
+        await ATT.clockManual(b.dataset.kind); toast("info","Manual sign-in recorded.",""); await paint();
+      } else if(act==="att-add-bio"){
+        const label = prompt("Label for this device (e.g. My phone, Office laptop)","My phone");
+        if(!label) return;
+        b.disabled=true; const old=b.innerHTML; b.innerHTML=`<span class="spinner"></span>${esc(t("att.attaching"))}`;
+        try{ await ATT.registerFinger({label}); toast("success","Fingerprint saved. Future clock-ins are one tap.",""); await paint(); }
+        finally{ b.disabled=false; b.innerHTML=old; }
+      } else if(act==="att-remove-bio"){
+        if(!confirm(t("att.confirmremove"))) return;
+        await ATT.removeCredential(b.dataset.cid); await paint();
+      } else if(act==="att-add-device"){
+        openAddDevice();
+      } else if(act==="att-revoke-device"){
+        if(!confirm("Revoke this attendance device? It can no longer send clock-ins.")) return;
+        await callBackend("deviceKeyRevoke",{schoolId:Session.schoolId,deviceId:b.dataset.id});
+        toast("info","Device revoked.",""); await paint();
+      } else if(act==="att-print-today"){
+        printSheet("today");
+      } else if(act==="att-print-recent"){
+        await printSheet("recent");
+      }
+    }catch(e){ toast("error","Attendance",backendMessage(e)); }
+  }
+
+  async function renderAttendanceDevices(){
+    if(!canManage) return "";
+    const r = await callBackend("deviceKeyList",{schoolId:Session.schoolId});
+    const devs=r.devices||[];
+    return `<div class="card p-5">
+      <div class="flex items-center justify-between"><h3 class="font-bold text-[15px]"><i class="ph-fill ph-plugs-connected text-sky-500 mr-1"></i>${esc(t("att.devices"))}</h3>
+        <button class="btn btn-ghost !h-8 !px-3 !text-[11px]" data-action="att-add-device"><i class="ph ph-plus"></i>${esc(t("att.adddevice"))}</button></div>
+      <p class="text-[11px] text-zinc-500 mt-1 leading-relaxed">${esc(t("att.adddevicedesc"))}</p>
+      ${devs.length?`<div class="mt-3 space-y-2">${devs.map(d=>`
+        <div class="rounded-xl border border-zinc-200 p-2.5 flex items-center justify-between gap-2">
+          <div class="min-w-0"><div class="font-semibold text-[13px] truncate">${esc(d.label)}</div>
+            <div class="text-[10px] text-zinc-500">${d.active?'<span class="text-emerald-600 font-bold">Active</span>':'<span class="text-rose-500 font-bold">Revoked</span>'} · created ${ATT.fmtWhen(d.createdAt)} · last seen ${d.lastSeenAt?ATT.fmtWhen(d.lastSeenAt):"—"}</div></div>
+          ${d.active?`<button class="btn btn-ghost !h-8 !px-2 text-rose-600" data-action="att-revoke-device" data-id="${esc(d.deviceId)}"><i class="ph ph-prohibit"></i>${esc(t("att.revoke"))}</button>`:""}
+        </div>`).join("")}</div>`
+        :`<p class="text-[11px] text-zinc-500 mt-3 rounded-xl bg-zinc-50 border border-dashed border-zinc-200 p-3 text-center">${esc(t("att.nokeys"))}</p>`}
+      <div class="mt-4 rounded-xl bg-sky-50 border border-sky-200 p-3 text-[11px] text-sky-900/80 leading-relaxed">
+        <b><i class="ph-fill ph-info text-sky-500 mr-1"></i>For a USB fingerprint reader or wall scanner:</b> a small companion app on a PC at reception sends POSTs to <code class="font-mono text-sky-800 bg-white/60 rounded px-1">/attendancePush</code> with the device key, staff id and clock-in time. That feeds this same live list.
+      </div>
+    </div>`;
+  }
+
+  function openAddDevice(){
+    Modal.open({
+      title:t("att.adddevice"),
+      body:`<div class="space-y-3">
+        <label class="label">Label</label>
+        <input class="field" id="att-dev-label" placeholder="Reception scanner" value="Reception scanner">
+        <p class="text-[11px] text-zinc-500 leading-relaxed">${esc(t("att.adddevicedesc"))}</p>
+      </div>`,
+      actions:[
+        {label:"Cancel",kind:"ghost",action:()=>Modal.close()},
+        {label:"Create key",kind:"primary",action:async()=>{
+          const label=$("#att-dev-label").value||"Reception scanner";
+          const r = await callBackend("deviceKeyCreate",{schoolId:Session.schoolId,label});
+          Modal.close();
+          Modal.open({
+            title:"Device key created",
+            body:`<div class="space-y-3">
+              <p class="text-xs text-zinc-600 leading-relaxed">Copy this key now — it is shown exactly once and cannot be recovered.</p>
+              <textarea class="field font-mono !text-[11px] h-28" readonly id="att-dev-key">${esc(r.key)}</textarea>
+              <p class="text-[11px] text-zinc-500">Device id: <code class="font-mono">${esc(r.deviceId)}</code></p>
+            </div>`,
+            actions:[
+              {label:"Copy",kind:"primary",action:()=>{
+                navigator.clipboard?.writeText(r.key).catch(()=>{});
+                toast("success",t("att.keycopied"),"");
+                Modal.close();
+                paint();
+              }}
+            ]
+          });
+        }}
+      ]
+    });
+  }
+
+  function printSheet(which){
+    const node=view.querySelector("#att-print-today");
+    if(!node) return;
+    const win=window.open("","_blank","width=900,height=700");
+    const title = state.settings.schoolName+" · Attendance · "+ATT.todayKey();
+    win.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>${esc(title)}</title>
+      <style>
+        body{font:12px/1.45 Inter,system-ui,sans-serif;color:#18181b;padding:24px}
+        h1{font-size:18px;margin:0 0 4px} .muted{color:#71717a;font-size:11px;margin-bottom:16px}
+        table{width:100%;border-collapse:collapse} th,td{border-bottom:1px solid #e4e4e7;padding:8px 10px;text-align:left;font-size:12px}
+        th{background:#fafafa;font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:#71717a}
+        .pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:10px;font-weight:700}
+        .in{background:#dcfce7;color:#15803d} .out{background:#f4f4f5;color:#52525b} .away{background:#ffe4e6;color:#be123c}
+        @media print{body{padding:8mm} .noprint{display:none}}
+      </style></head><body>
+      <h1>${esc(state.settings.schoolName||"School")}</h1>
+      <div class="muted">${which==="recent"?"Last 14 days":"Today"} · ${ATT.todayKey()}</div>
+      ${node.querySelector("table").outerHTML}
+      <${"script"}>window.onload=()=>setTimeout(()=>window.print(),300);</${"script"}>
+      </body></html>`);
+    win.document.close();
+  }
+
+  paint().catch(e=>{ view.querySelector("#att-body").innerHTML=`<div class="card p-6 text-rose-700">${esc(e.message||String(e))}</div>`; });
+}
+
+/* =================================================================================
    CHROME / NAV / REFRESH
    ================================================================================= */
 const ROUTES={
@@ -5048,24 +5344,28 @@ const ROUTES={
   database: { title:"Database",      icon:"ph-database",       tab:"Data"     },
   print:    { title:"Print Center",  icon:"ph-printer",        tab:"Print"    },
   scanner:  { title:"Scanner",       icon:"ph-scan",           tab:"Scan"     },
+  attendance:{ title:"Attendance",   icon:"ph-fingerprint",    tab:"Attendance" },
   marketing:{ title:"Marketing Studio", icon:"ph-megaphone",  tab:"Promote"  }
 };
 function allowedRoutes(){
   if (isSuper()) return Session.schoolId ? Object.keys(ROUTES) : ["admin","marketing"];
-  const r=["dashboard","timetable","relief","database","print"];
+  const r=["dashboard","timetable","relief","database","print","attendance"];
   if (canViewUsers()) r.splice(3,0,"team");
   if (canEdit()) r.splice(r.indexOf("database")+1,0,"scanner");
   return r;
 }
 function navModel(){
   const r=allowedRoutes();
-  if (isSuper() && Session.schoolId) return { side:["admin",...r.filter(x=>x!=="admin")], tabs:["admin","dashboard","timetable","marketing","database"] };
+  if (isSuper() && Session.schoolId) return { side:["admin",...r.filter(x=>x!=="admin")], tabs:["admin","dashboard","timetable","attendance","marketing","database"] };
   if (isSuper()) return { side:["admin","marketing"], tabs:["admin","marketing"] };
   const tabs=(()=>{
-    if(r.includes("scanner")&&r.includes("team")) return ["dashboard","timetable","relief","scanner","team","database"];
-    if(r.includes("scanner")) return ["dashboard","timetable","relief","scanner","database"];
-    if(r.includes("team")) return ["dashboard","timetable","relief","team","database"];
-    return ["dashboard","timetable","relief","database","print"];
+    const base=["dashboard","timetable","relief"];
+    if(r.includes("scanner")&&r.includes("team")) base.push("scanner");
+    else if(r.includes("scanner")) base.push("scanner");
+    base.push("attendance");
+    if(r.includes("team")) base.push("team");
+    base.push("database");
+    return base;
   })();
   return { side:r, tabs };
 }
@@ -5132,7 +5432,7 @@ function refresh(){
     viewDirty=true;
   } else {
     viewDirty=false;
-    const renderer=({admin:renderAdmin, marketing:renderMarketing, dashboard:renderDashboard, timetable:renderTimetable, database:renderDatabase, relief:renderRelief, team:renderTeam, print:renderPrintCenter, scanner:renderScanner})[Store.raw.ui.route];
+    const renderer=({admin:renderAdmin, marketing:renderMarketing, dashboard:renderDashboard, timetable:renderTimetable, database:renderDatabase, relief:renderRelief, team:renderTeam, print:renderPrintCenter, scanner:renderScanner, attendance:renderAttendance})[Store.raw.ui.route];
     try{
       if(renderer) renderer();
       else throw new Error("No renderer for route "+Store.raw.ui.route);

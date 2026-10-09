@@ -55,8 +55,59 @@
             ".write": "auth != null && (auth.uid === 'FI059sTQ5hXFSAYEqKefDyk3kBw2' || (auth.token.email === 'w.v.k.kalhara@gmail.com' && auth.token.email_verified === true) || root.child('users/' + auth.uid + '/role').val() === 'super' || root.child('users/' + auth.uid + '/role').val() === 'superadmin' || (root.child('schools/' + $schoolId + '/members/' + auth.uid + '/active').val() === true && root.child('schools/' + $schoolId + '/members/' + auth.uid + '/role').val() === 'principal' && $memberUid !== auth.uid && (!newData.exists() || (newData.child('role').val() !== 'principal' && newData.child('role').val() !== 'superadmin'))))",
             ".validate": "!newData.exists() || (newData.hasChildren(['name','email','role','active']) && (newData.child('role').val() === 'principal' || newData.child('role').val() === 'admin' || newData.child('role').val() === 'teacher' || newData.child('role').val() === 'staff'))"
           }
+        },
+
+        /* Biometric credentials: only the member can read or write their own keys.
+           The cloud function runs as admin when it needs to sign a clock-in. */
+        "bioCreds": {
+          "$uid": {
+            ".read": "auth != null && auth.uid === $uid",
+            ".write": "auth != null && auth.uid === $uid",
+            "$cid": {
+              ".validate": "!newData.exists() || (newData.hasChildren(['credId','pubJwk','alg','createdAt']) && newData.child('credId').isString() && (newData.child('alg').val() === 'ES256' || newData.child('alg').val() === 'RS256'))"
+            }
+          }
+        },
+
+        /* Short-lived WebAuthn challenges: only the owning UID can read them, and
+           the cloud function (admin) creates and consumes them. */
+        "_challenges": {
+          "$uid": {
+            ".read": "auth != null && auth.uid === $uid",
+            ".write": "auth != null && auth.uid === $uid",
+            "$rid": {
+              ".validate": "!newData.exists() || (newData.hasChildren(['kind','challenge','expiresAt']) && newData.child('challenge').isString())"
+            }
+          }
+        },
+
+        /* Attendance log: members can read the whole day for their school if they
+           are allowed to view users (principal/admin), or only their own record. */
+        "attendance": {
+          "$date": {
+            ".read": "auth != null && (root.child('schools/' + $schoolId + '/members/' + auth.uid + '/active').val() === true && (root.child('schools/' + $schoolId + '/members/' + auth.uid + '/role').val() === 'principal' || root.child('schools/' + $schoolId + '/members/' + auth.uid + '/role').val() === 'admin' || root.child('schools/' + $schoolId + '/members/' + auth.uid + '/permissions/viewUsers').val() === true))",
+            "byMember": {
+              "$uid": {
+                ".read": "auth != null && (root.child('schools/' + $schoolId + '/members/' + auth.uid + '/active').val() === true && (auth.uid === $uid || root.child('schools/' + $schoolId + '/members/' + auth.uid + '/role').val() === 'principal' || root.child('schools/' + $schoolId + '/members/' + auth.uid + '/role').val() === 'admin' || root.child('schools/' + $schoolId + '/members/' + auth.uid + '/permissions/viewUsers').val() === true))",
+                ".write": "auth != null && auth.uid === $uid && root.child('schools/' + $schoolId + '/members/' + auth.uid + '/active').val() === true",
+                "events": {
+                  "$eid": {
+                    ".validate": "!newData.exists() || (newData.hasChildren(['at','kind','method']) && (newData.child('kind').val() === 'in' || newData.child('kind').val() === 'out') && newData.child('at').isNumber())"
+                  }
+                }
+              }
+            }
+          }
         }
       }
+    },
+
+    "deviceKeys": {
+      /* Written only by cloud functions (admin). Listed by principal to see what
+         devices are paired. The key itself is only readable by the function in
+         admin mode; principals only see label/schoolId/active/lastSeenAt. */
+      ".read": "auth != null && (auth.uid === 'FI059sTQ5hXFSAYEqKefDyk3kBw2' || (auth.token.email === 'w.v.k.kalhara@gmail.com' && auth.token.email_verified === true) || root.child('users/' + auth.uid + '/role').val() === 'super' || root.child('users/' + auth.uid + '/role').val() === 'superadmin')",
+      ".write": false
     },
 
     "users": {
