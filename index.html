@@ -1173,6 +1173,16 @@ function toast(type,title,msg=""){
 const Modal={
   current:null, skipNext:false, _closeTimer:null, _returnFocus:null,
   open(renderFn,opts={}){
+    /* Object form: { title, body, actions:[{label, kind, action}] }. Actions run through
+       data-action="modal-run" and may throw 0 to keep the dialog open (e.g. validation). */
+    if (typeof renderFn!=="function"){
+      const cfg=renderFn||{}, acts=Array.isArray(cfg.actions)?cfg.actions:[];
+      Modal._cfgActions=acts;
+      opts={reactive:false,...opts};
+      renderFn=()=>`<div class="p-6"><h3 class="font-display font-bold text-lg tracking-tight">${esc(cfg.title||"")}</h3>
+        <div class="mt-4">${cfg.body||""}</div>
+        <div class="mt-5 flex flex-wrap gap-2 justify-end">${acts.map((a,i)=>`<button class="btn ${a.kind==="primary"?"btn-primary":"btn-ghost"}" data-action="modal-run" data-idx="${i}">${esc(a.label)}</button>`).join("")}</div></div>`;
+    } else Modal._cfgActions=null;
     clearTimeout(Modal._closeTimer); Modal._closeTimer=null;   /* never let an old close wipe a new modal */
     Modal.skipNext=false;
     if (!Modal.current) Modal._returnFocus=document.activeElement;
@@ -5576,7 +5586,8 @@ function kindChip(kind){
              slot:["ph-clock","find.slot","bg-zinc-50 text-zinc-700 border-zinc-200"],
              attendance:["ph-fingerprint","find.attendance","bg-violet-50 text-violet-700 border-violet-200"],
              member:["ph-user-circle","find.member","bg-amber-50 text-amber-700 border-amber-200"],
-             sheet:["ph-file-spreadsheet","find.sheet","bg-rose-50 text-rose-700 border-rose-200"]};
+             sheet:["ph-file-spreadsheet","find.sheet","bg-rose-50 text-rose-700 border-rose-200"],
+             database:["ph-database","route.database","bg-zinc-50 text-zinc-700 border-zinc-200"]};
   const [ic,key,cls] = map[kind]||["ph-dot","?","bg-zinc-100 text-zinc-600"];
   return `<span class="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-bold ${cls}"><i class="ph-fill ${ic}"></i>${esc(t(key))}</span>`;
 }
@@ -5596,7 +5607,7 @@ function renderFindResults(){
       </button>`).join("")}</div>`;
 }
 async function renderFind(){
-  await Promise.all([ensureFind(), ensureAssistant()]);
+  await Promise.allSettled([ensureFind(), ensureAssistant()]);   /* offline first-load must not blank the screen */
   const view=$("#view");
   const online=navigator.onLine;
   view.innerHTML=`<div class="space-y-5 view-in">
@@ -5644,8 +5655,11 @@ async function renderFind(){
   q.addEventListener("keydown",e=>{ if(e.key==="Enter"){ e.preventDefault(); renderAnswer(q.value,true); } });
   q.focus();
 
+  if(view._findClick) view.removeEventListener("click",view._findClick);
+  view._findClick=findHandler;
   view.addEventListener("click",findHandler);
   function findHandler(ev){
+    if(!document.getElementById("find-q")) return;      /* not on the Find screen */
     const b=ev.target.closest("[data-action]");
     if(!b) return;
     const a=b.dataset.action;
@@ -5663,8 +5677,9 @@ async function renderFind(){
     const qq=(text||"").trim();
     if(!out) return;
     if(!qq){ out.innerHTML=""; return; }
-    // Only show the answer card for questions/phrases of 2+ words, or when forced (Enter).
-    if(!force && qq.split(/\s+/).length<2 && !/\?$/.test(qq)){ out.innerHTML=""; return; }
+    // Live card only for real questions; Enter / arrow always answers.
+    const looksLikeQuestion = /\?\s*$|^(who|what|where|when|which|how|is|are|does|do|list|show|count|ගුරු|කවුද|எங்கே|யார்)\b/i.test(qq);
+    if(!force && !looksLikeQuestion){ out.innerHTML=""; return; }
     let r;
     try{ r = Assistant.answer(qq); }catch(e){ r={text:"Something went wrong reading your data. Try a simpler question.",sources:[]}; }
     const lines=(r.text||"").split("\n").map(l=>`<div class="leading-relaxed">${esc(l)}</div>`).join("");
@@ -7192,6 +7207,11 @@ const actions={
   "cell-show-all": ()=>{ cellEditor.showAll=!cellEditor.showAll; Modal.rerender(); },
   "clear-cell": el=>{ if(!needEdit()) return; setCell(el.dataset.cid,+el.dataset.d,+el.dataset.p,null); toast("info","Period cleared","The slot is now a free period."); Modal.close(); },
   "modal-close": ()=>Modal.close(),
+  "modal-run": async el=>{
+    const a=(Modal._cfgActions||[])[+el.dataset.idx]; if(!a) return;
+    try{ await a.action(); }
+    catch(e){ if(e) toast("error","Couldn't finish that",e.message||String(e)); }
+  },
   "modal-backdrop": (el,e)=>{ if(e.target===el) Modal.close(); },
   "confirm-respond": el=>{ const r=confirmResolver; confirmResolver=null; Modal.close(); setTimeout(()=>r?.(el.dataset.val==="1"),200); },
   "db-tab": el=>{ Store.raw.ui.dbTab=el.dataset.tab; Store.flush(); Store.requestRender(); },
